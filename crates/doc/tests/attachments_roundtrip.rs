@@ -16,6 +16,7 @@ fn run_request_attachments_survive_command_round_trip() {
         sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: vec!["/tmp/a.png".into()],
+        mcp_servers: Vec::new(),
         resume: None,
     };
     doc.queue_command(&SessionCommandEntry {
@@ -26,6 +27,8 @@ fn run_request_attachments_survive_command_round_trip() {
         },
         issued_by: "d".into(),
         issued_at: 1,
+        user_id: None,
+        origin: None,
         based_on: None,
         expires_at: None,
         status: SessionCommandStatus::Pending,

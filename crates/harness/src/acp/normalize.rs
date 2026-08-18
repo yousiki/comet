@@ -415,7 +415,6 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
         .collect()
 }
 
-
 /// `session/request_permission` options (`{optionId, name, kind}`) → the
 /// preferred auto-approve choice: `allow_always` > `allow_once` > first.
 pub(crate) fn preferred_allow_option(options: &[Value]) -> Option<String> {

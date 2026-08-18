@@ -49,6 +49,21 @@ tid=$(rid "$turnline")
 
 case "$turnline" in
 
+*scenario:mcp*)
+  # MCP config belongs to the thread's private JSON-RPC config override, not
+  # app-server argv. It must also be re-supplied when resuming a thread.
+  for want in '"method":"thread/resume"' '"threadId":"resume-ok"' \
+    '"config":{"mcp_servers":{"zeron"' \
+    '"command":"/opt/zeron bin/comet"' \
+    '"args":["mcp-bridge","--literal=$HOME"]' \
+    '"ZERON_CHAT_ID":"chat-a"' '"ZERON_IPC_PORT":"12345"'; do
+    has "$thread_line" "$want" || { fail_turn "$tid" "thread MCP config missing: $want"; exit 0; }
+  done
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-mcp\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-mcp"}}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-mcp"}}}'
+  ;;
+
 *scenario:happy*)
   # Verify the turn/start + thread/start params the harness must send.
   for want in '"method":"turn/start"' '"effort":"ultra"' '"model":"gpt-5.6-sol"' \

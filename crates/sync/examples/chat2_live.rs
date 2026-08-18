@@ -49,6 +49,9 @@ impl ChatDocSink for DocSink {
     fn advance_cursor(&self, cursor: u64) {
         self.cursor.store(cursor, Relaxed);
     }
+    fn reset_cursor(&self, cursor: u64) {
+        self.cursor.store(cursor, Relaxed);
+    }
 }
 
 struct HttpFetcher {

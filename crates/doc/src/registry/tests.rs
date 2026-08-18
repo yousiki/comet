@@ -272,6 +272,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         space_id: None,
         last_seen_at: None,
         room_gen: None,
+        user_id: None,
     }
 }
 
@@ -516,7 +517,13 @@ fn late_create_chat_config_survives_a_prior_claim() {
     // claims trail by whole seconds; the sleep keeps the HLCs out of the
     // same-millisecond device-id tiebreak.)
     std::thread::sleep(std::time::Duration::from_millis(2));
-    host.claim_chat("chat-race", Some("/tmp/repo"), Some("space-1"), ts(9_000));
+    host.claim_chat(
+        "chat-race",
+        Some("/tmp/repo"),
+        Some("space-1"),
+        None,
+        ts(9_000),
+    );
 
     let mut server = HashMap::new();
     let mut seq = 0u64;
@@ -662,6 +669,53 @@ fn state_frames_delta_replace_and_reseed() {
     assert_eq!(outcome, StateOutcome::Reseeded);
     assert!(fresh.pending_len() > 0);
     assert_eq!(fresh.read_chats().unwrap().len(), 1);
+}
+
+#[test]
+fn stale_delta_and_rows_cannot_regress_frontier_or_row_truth() {
+    let row = |title: &str, at: i64, seq: u64| {
+        let mut row = applied(
+            None,
+            &RowOp {
+                kind: "chats".into(),
+                id: "chat-foreign".into(),
+                op: OpKind::Upsert,
+                set: Some(
+                    [
+                        ("id".to_string(), json!("chat-foreign")),
+                        ("deviceId".to_string(), json!("dev-b")),
+                        ("createdAt".to_string(), json!(1)),
+                        ("title".to_string(), json!(title)),
+                    ]
+                    .into(),
+                ),
+                hlc: hlc_by(at, "dev-b"),
+                clocks: None,
+            },
+        );
+        row.seq = seq;
+        row
+    };
+    let mut doc = RegistryDoc::new("dev-a");
+    assert_eq!(
+        doc.apply_state(12, false, 7, vec![row("newer", 12, 12)]),
+        StateOutcome::Delta
+    );
+    let generation = doc.generation();
+
+    assert_eq!(
+        doc.apply_state(10, false, 3, vec![row("older", 10, 10)]),
+        StateOutcome::Stale
+    );
+    doc.apply_rows(11, vec![row("also older", 11, 11)]);
+
+    assert_eq!(doc.cursor(), 12);
+    assert_eq!(doc.generation(), generation);
+    assert_eq!(
+        doc.chat("chat-foreign").unwrap().unwrap().title.as_deref(),
+        Some("newer")
+    );
+    assert_eq!(doc.gc_floor, 7);
 }
 
 #[test]

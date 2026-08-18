@@ -512,6 +512,10 @@ pub enum RowKind {
         badges: Arc<Vec<crate::badges::MessageBadge>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
+        /// Authoring user from the doc entry (org-shared sessions; None on
+        /// pre-attribution rows). `agent:{chatId}` marks agent-to-agent
+        /// sends. Rendered as a chip when it differs from the local user.
+        author: Option<SharedString>,
     },
     /// One top-level markdown block of a completed message.
     Markdown {
@@ -696,9 +700,12 @@ pub fn rows_for_entry(
             Some((display, spans)) => (display, spans),
             None => (body, Vec::new()),
         };
+        let author_len = entry.user_id.as_ref().map(String::len).unwrap_or(0);
         return vec![Row {
             id: entry.id.clone().into(),
-            version: (raw.len() as u64) << 1 | pending as u64,
+            // Author folded into the version: the optimistic echo (no author)
+            // must re-render once the doc entry (authored) replaces it.
+            version: ((raw.len() + author_len) as u64) << 1 | pending as u64,
             turn_start: true,
             kind: RowKind::User {
                 text: text.into(),
@@ -706,6 +713,7 @@ pub fn rows_for_entry(
                 attachments: Arc::new(parsed.attachments),
                 badges: Arc::new(badges),
                 pending,
+                author: entry.user_id.clone().map(SharedString::from),
             },
             entry_id,
             // User rows always carry the strip (chat-view.tsx: whenever
@@ -2925,16 +2933,37 @@ impl Transcript {
                 attachments,
                 badges,
                 pending,
+                author,
             } => {
                 let attachments = attachments.clone();
                 let badges = badges.clone();
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
+                // Author chip (org-shared sessions): shown when the entry
+                // names a user other than the signed-in one — a teammate or
+                // an `agent:{chatId}` send. Informational, muted, above the
+                // bubble.
+                let author_chip = author.clone().filter(|a| {
+                    self.state
+                        .read(cx)
+                        .auth_user()
+                        .is_none_or(|me| me.id != a.as_ref())
+                });
                 // Attachment thumbnails ride ABOVE the bubble, right-aligned
                 // (chat-view.tsx RowView: UserAttachmentStrip then the text
                 // HStack); image-only sends show no bubble at all.
                 let mut column = div().w_full().flex().flex_col();
+                if let Some(author) = author_chip {
+                    column = column.child(
+                        div().w_full().flex().justify_end().pb(px(2.0)).child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(author),
+                        ),
+                    );
+                }
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
                 }
@@ -4101,15 +4130,17 @@ fn chip_header_row(
             // The sidebar working-row spinner, in the chip's trailing slot —
             // paint-local (fixed footprint), so it never moves the layout.
             row.child(
-                div().flex_none().child(crate::loaders::mini_gradient_spinner(
-                    format!(
-                        "subagent-chip-{}",
-                        tool.subagent_ref.as_deref().unwrap_or_default()
-                    ),
-                    2.0,
-                    view,
-                    cx,
-                )),
+                div()
+                    .flex_none()
+                    .child(crate::loaders::mini_gradient_spinner(
+                        format!(
+                            "subagent-chip-{}",
+                            tool.subagent_ref.as_deref().unwrap_or_default()
+                        ),
+                        2.0,
+                        view,
+                        cx,
+                    )),
             )
         })
         .when_some(chevron, |row, open| {
@@ -4608,6 +4639,7 @@ mod tests {
             parts,
             created_at: 0,
             device_id: "dev".into(),
+            user_id: None,
             status: Some(status),
             continuation_of: None,
         }
@@ -5279,6 +5311,7 @@ mod tests {
             parts: vec![text_part("p1", "hi")],
             created_at: ms,
             device_id: "dev".into(),
+            user_id: None,
             status: None,
             continuation_of: None,
         };

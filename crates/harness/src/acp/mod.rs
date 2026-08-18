@@ -1544,7 +1544,6 @@ fn handle_server_request_live(
     Vec::new()
 }
 
-
 /// Await a setup request while draining incoming messages, so a `session/load`
 /// whose replay outruns the incoming channel's capacity can't deadlock the
 /// reader. Replayed `session/update`s are dropped (the doc already holds the
@@ -1612,7 +1611,6 @@ fn track_turn_signals(
     }
 }
 
-
 /// A mid-turn `_session/steering` call. `idleBehavior: promptRequired`
 /// covers the turn-ended race: the agent hands the text back instead of
 /// firing an untracked turn.
@@ -1665,7 +1663,21 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
+        // Engine-provided MCP servers (the zeron agent bridge): ACP shape
+        // `[{name, command, args, env: [{name, value}]}]`.
+        let mcp_servers: Vec<Value> = request
+            .mcp_servers
+            .iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "command": s.command,
+                    "args": s.args,
+                    "env": s.env.iter().map(|(name, value)| json!({ "name": name, "value": value })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let session_params = json!({ "cwd": request.cwd, "mcpServers": mcp_servers });
         let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
@@ -1867,8 +1879,7 @@ async fn run_session(session: Session) {
         prompt_stall.map(|d| tokio::time::Instant::now() + d);
     let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
         prompt_seq += 1;
-        current_prompt_id =
-            prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
+        current_prompt_id = prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
         prompt_turn(
             client.clone(),
             session_id.clone(),

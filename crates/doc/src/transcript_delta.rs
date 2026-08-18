@@ -264,6 +264,7 @@ mod tests {
             }],
             created_at: 0,
             device_id: "dev".into(),
+            user_id: None,
             status: None,
             continuation_of: None,
         }

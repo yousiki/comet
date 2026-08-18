@@ -19,7 +19,7 @@
  *   POST /append/:chatId              — repair: merge-import a Loro update
  *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss; legacy clients)
  *   GET  /workspace/:orgId/tail       — workspace-doc tail JSON
- *   GET  /registry/:orgId/ws          — workspace registry room `reg1/{orgId}/{user}` (wss)
+ *   GET  /registry/:orgId/ws          — org-shared registry room `reg2/{orgId}` (wss)
  *   GET  /registry/:orgId/stats       — registry seq/rows/attribution
  *   GET  /registry/:orgId/rows        — registry full-table repair read
  *   POST /registry/:orgId/reset       — registry operator wipe (self-healing)
@@ -31,14 +31,18 @@
  *   GET  /blob/:chatId/:partId
  *   GET  /chat2/:chatId/ws            — chat2 log-relay room (wss, chat2-sync B)
  *   GET|POST /chat2/:chatId/checkpoint — client-built doc snapshot (Range-resumable GET)
+ *   GET|POST /chat2/:chatId/rows      — plain-HTTPS log pull/push
  *   GET|PUT  /chat2/:chatId/tail      — host-published sidecars, served verbatim
  *   GET|PUT  /chat2/:chatId/diff
  *   GET  /chat2/:chatId/stats
  *   POST /chat2/:chatId/reset
+ *   /chat3/:chatId/*                  — same surface as /chat2, org-shared:
+ *                                       room `chat3/{orgId}/{chatId}`, member
+ *                                       reads/writes, host-user checkpoint
  */
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
-import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
@@ -76,21 +80,25 @@ const forward = (
   userId: string,
   path: string,
   search?: string,
-  roomKind?: "workspace"
+  roomKind?: "workspace" | "org-chat",
+  orgId?: string
 ): Promise<Response> => {
   const stub = ns.get(ns.idFromName(name));
   const url = new URL(request.url);
   url.pathname = path;
   if (search !== undefined) url.search = search;
   const headers = new Headers(request.headers);
-  // room-kind is a Worker-controlled signal (the DO relaxes owner gating for
-  // workspace rooms): clear any inbound value so only the explicit set below —
-  // reached solely on workspace forwards, after the org-membership check —
-  // can assert it. Do not drop this line; passthrough would let a caller
-  // choose their own room kind.
+  // room-kind and auth-org are Worker-controlled signals (the DO relaxes
+  // owner gating for workspace/org-chat rooms; the device room compares org
+  // claims): clear any inbound value so only the explicit set below — reached
+  // solely after the org-membership check — can assert them. Do not drop
+  // these lines; passthrough would let a caller choose their own room kind
+  // or org.
   headers.delete(ROOM_KIND_HEADER);
+  headers.delete(AUTH_ORG_HEADER);
   headers.set(AUTH_USER_HEADER, userId);
   if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
+  if (orgId) headers.set(AUTH_ORG_HEADER, orgId);
   return stub.fetch(new Request(url.toString(), { ...requestInit(request), headers }));
 };
 
@@ -233,6 +241,56 @@ export default {
       return json({ error: "not found" }, 404);
     }
 
+    // ── chat3 rooms: org-shared sessions. Same ChatRoom DO and routes as
+    //    chat2, but the room name carries the caller's VERIFIED org claim
+    //    (authz-by-room-name, the registry-room shape) and the DO switches to
+    //    host-user discipline: every org member may join/push/read; only the
+    //    host user (claimed via `?role=host` on join or bootstrap checkpoint)
+    //    may checkpoint, publish sidecars, or reset. ─────────────────────────
+    if (parts[0] === "chat3" && parts[1] && ID_RE.test(parts[1]) && parts[2]) {
+      if (!auth.orgId) return json({ error: "forbidden" }, 403);
+      const room = `chat3/${auth.orgId}/${parts[1]}`;
+      if (parts[2] === "ws" && parts.length === 3) {
+        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return json({ error: "expected websocket" }, 426);
+        }
+        // `role` is caller-asserted intent, not authority: the DO only honors
+        // it when the host-user slot is unclaimed or already the caller's.
+        const role = url.searchParams.get("role") === "host" ? "&role=host" : "";
+        return forward(
+          env.CHAT_ROOMS,
+          room,
+          request,
+          auth.userId,
+          "/ws",
+          `?chatId=${parts[1]}${deviceParam(url)}${role}`,
+          "org-chat",
+          auth.orgId
+        );
+      }
+      const routes: Record<string, string[]> = {
+        checkpoint: ["GET", "POST"],
+        rows: ["GET", "POST"],
+        tail: ["GET", "PUT"],
+        diff: ["GET", "PUT"],
+        stats: ["GET"],
+        reset: ["POST"]
+      };
+      if (parts.length === 3 && routes[parts[2]]?.includes(request.method)) {
+        return forward(
+          env.CHAT_ROOMS,
+          room,
+          request,
+          auth.userId,
+          `/${parts[2]}`,
+          url.search,
+          "org-chat",
+          auth.orgId
+        );
+      }
+      return json({ error: "not found" }, 404);
+    }
+
     // ── workspace rooms (ARCHITECTURE §2.2/§6.1): same SessionRoom DO class;
     //    the caller's WorkOS org claim (`org_id`) must equal the URL's orgId,
     //    and the room itself is derived from the caller's OWN user id — the
@@ -296,13 +354,17 @@ export default {
     }
 
     // ── registry rooms (docs/registry-sync.md): the row-table replacement for
-    //    the Loro workspace doc. Same trust shape as /workspace: org claim
-    //    must match the URL, room derived from the caller's OWN user id, DO
-    //    trusts the stamped header. `reg1` = first registry generation. ─────
+    //    the Loro workspace doc. Org claim must match the URL; the DO trusts
+    //    the stamped header. `reg2` = the org-shared generation: ONE room per
+    //    org (was `reg1/{orgId}/{userId}` per-user) — every member reads and
+    //    writes the same table, which is what makes shared sessions visible in
+    //    every member's sidebar. Old reg1 rooms orphan (hibernated, ~zero
+    //    cost); clients detect the seq regression on their next hello and
+    //    re-seed the new room from local rows, automatically. ───────────────
     if (parts[0] === "registry" && parts[1] && ID_RE.test(parts[1])) {
       const orgId = parts[1];
       if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
-      const room = `reg1/${orgId}/${auth.userId}`;
+      const room = `reg2/${orgId}`;
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
           return json({ error: "expected websocket" }, 426);
@@ -348,14 +410,18 @@ export default {
         }
         const role = url.searchParams.get("role") === "host" ? "host" : "client";
         const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
-        // `d2/` — same staging→prod identity break as `s2/` above.
+        // `d2/` — same staging→prod identity break as `s2/` above. The org
+        // claim rides along so the room can record its owner's org (the
+        // /nudge gate below compares against it for org-member senders).
         return forward(
           env.DEVICE_ROOMS,
           `d2/${deviceId}`,
           request,
           auth.userId,
           "/ws",
-          `?role=${role}&connId=${encodeURIComponent(connId)}`
+          `?role=${role}&connId=${encodeURIComponent(connId)}`,
+          undefined,
+          auth.orgId
         );
       }
       if (parts[2] === "sidecar" && parts[3] && /^[a-z0-9-]{1,64}$/.test(parts[3])) {
@@ -366,9 +432,20 @@ export default {
       }
       // Durable command nudge (§7): "chat X has pending commands — open its
       // doc". Delivered live if the host is connected, else queued in the DO
-      // and replayed on the host's next join.
+      // and replayed on the host's next join. Org-shared sessions: any member
+      // of the owner's org may nudge (the payload is only a chat id; the host
+      // validates against its own doc before executing anything).
       if (parts[2] === "nudge" && request.method === "POST") {
-        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, "/nudge", "");
+        return forward(
+          env.DEVICE_ROOMS,
+          `d2/${deviceId}`,
+          request,
+          auth.userId,
+          "/nudge",
+          "",
+          undefined,
+          auth.orgId
+        );
       }
     }
 
@@ -386,7 +463,12 @@ export default {
       if (partId === undefined || !PART_RE.test(partId)) {
         return json({ error: "bad part id" }, 400);
       }
-      const key = `blob/${auth.userId}/${parts[1]}/${partId}`;
+      // Org-scoped keyspace (`blob3/`) so every member of a shared session
+      // resolves the same tool outputs; org-less (dev, no-org) callers keep
+      // the per-user prefix. Reads fall back to the caller's own legacy
+      // per-user key so pre-migration outputs keep resolving (miss-path only).
+      const legacyKey = `blob/${auth.userId}/${parts[1]}/${partId}`;
+      const key = auth.orgId ? `blob3/${auth.orgId}/${parts[1]}/${partId}` : legacyKey;
       if (request.method === "PUT") {
         const body = await request.arrayBuffer();
         // Outputs are 4KiB-capped at the harness boundary; diffs can run
@@ -400,8 +482,14 @@ export default {
         return json({ ok: true, bytes: body.byteLength });
       }
       if (request.method === "GET" || request.method === "HEAD") {
-        const object =
+        let object =
           request.method === "GET" ? await env.BLOBS.get(key) : await env.BLOBS.head(key);
+        if (!object && key !== legacyKey) {
+          object =
+            request.method === "GET"
+              ? await env.BLOBS.get(legacyKey)
+              : await env.BLOBS.head(legacyKey);
+        }
         if (!object) return json({ error: "not_found" }, 404);
         const headers = new Headers();
         object.writeHttpMetadata(headers);

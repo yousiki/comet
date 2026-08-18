@@ -42,6 +42,124 @@ impl BinConnector for ChanConnector {
     }
 }
 
+struct ErrorConnector {
+    error: SyncError,
+}
+
+impl BinConnector for ErrorConnector {
+    fn connect(&self) -> BoxFuture<'static, Result<BinPipe, SyncError>> {
+        let error = self.error.clone();
+        Box::pin(async move { Err(error) })
+    }
+}
+
+struct ErrorTransport {
+    error: SyncError,
+}
+
+#[derive(Default)]
+struct ScriptedTransport {
+    push_results: Mutex<VecDeque<Result<String, SyncError>>>,
+    fetch_results: Mutex<VecDeque<Result<Vec<u8>, SyncError>>>,
+    pushes: Mutex<Vec<(String, Vec<u8>)>>,
+    fetch_after: Mutex<Vec<u64>>,
+}
+
+impl ChatTransport for ScriptedTransport {
+    fn fetch_rows(&self, after: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
+        lock(&self.fetch_after).push(after);
+        let result = lock(&self.fetch_results)
+            .pop_front()
+            .unwrap_or(Err(SyncError::Closed));
+        Box::pin(async move { result })
+    }
+
+    fn push(
+        &self,
+        batch_id: String,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<String, SyncError>> {
+        lock(&self.pushes).push((batch_id, bytes));
+        let result = lock(&self.push_results)
+            .pop_front()
+            .unwrap_or(Err(SyncError::Closed));
+        Box::pin(async move { result })
+    }
+}
+
+struct GatedPullFailureTransport {
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+    fetch_after: Mutex<Vec<u64>>,
+}
+
+struct GatedRowsTransport {
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+    started: Mutex<Option<oneshot::Sender<()>>>,
+    body: Vec<u8>,
+    push_results: Mutex<VecDeque<Result<String, SyncError>>>,
+}
+
+impl ChatTransport for GatedRowsTransport {
+    fn fetch_rows(&self, _after: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
+        let release = lock(&self.release).take().expect("one pull only");
+        let started = lock(&self.started).take().expect("one pull only");
+        let body = self.body.clone();
+        Box::pin(async move {
+            let _ = started.send(());
+            let _ = release.await;
+            Ok(body)
+        })
+    }
+
+    fn push(
+        &self,
+        _batch_id: String,
+        _bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<String, SyncError>> {
+        let result = lock(&self.push_results)
+            .pop_front()
+            .unwrap_or(Err(SyncError::Closed));
+        Box::pin(async move { result })
+    }
+}
+
+impl ChatTransport for GatedPullFailureTransport {
+    fn fetch_rows(&self, after: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
+        lock(&self.fetch_after).push(after);
+        let release = lock(&self.release).take().expect("one pull only");
+        Box::pin(async move {
+            let _ = release.await;
+            Err(SyncError::Protocol("injected pull failure".into()))
+        })
+    }
+
+    fn push(
+        &self,
+        batch_id: String,
+        _bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<String, SyncError>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({"batchId": batch_id, "seq": 1, "dup": false}).to_string())
+        })
+    }
+}
+
+impl ChatTransport for ErrorTransport {
+    fn fetch_rows(&self, _after: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
+        let error = self.error.clone();
+        Box::pin(async move { Err(error) })
+    }
+
+    fn push(
+        &self,
+        _batch_id: String,
+        _bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<String, SyncError>> {
+        let error = self.error.clone();
+        Box::pin(async move { Err(error) })
+    }
+}
+
 // ── sink + fetcher doubles ──────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -49,6 +167,7 @@ struct RecordingSink {
     rows: Mutex<Vec<(Vec<u8>, u64)>>,
     checkpoints: Mutex<Vec<(Vec<u8>, u64)>>,
     cursor_advances: Mutex<Vec<u64>>,
+    cursor_resets: Mutex<Vec<u64>>,
     frontier_contained: std::sync::atomic::AtomicBool,
     /// Global apply order across rows and checkpoints — the overlap test
     /// pins "checkpoint imports before any row that buffered during it".
@@ -71,6 +190,9 @@ impl ChatDocSink for RecordingSink {
     }
     fn advance_cursor(&self, cursor: u64) {
         lock(&self.cursor_advances).push(cursor);
+    }
+    fn reset_cursor(&self, cursor: u64) {
+        lock(&self.cursor_resets).push(cursor);
     }
 }
 
@@ -103,6 +225,43 @@ async fn expect_kind(end: &mut ServerEnd, kind: u8) -> wire::WireFrame {
 
 async fn send(end: &ServerEnd, kind: u8, header: serde_json::Value, payload: &[u8]) {
     end.tx.send(encode(kind, &header, payload)).await.unwrap();
+}
+
+fn http_rows_body(frames: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
+    let mut body = Vec::new();
+    for frame in frames {
+        body.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        body.extend_from_slice(&frame);
+    }
+    body
+}
+
+fn http_rows_response(head_seq: u64, rows: &[(u64, &str, &[u8])]) -> Vec<u8> {
+    let mut frames = vec![encode(
+        frame_type::STATE,
+        &serde_json::json!({
+            "headSeq": head_seq,
+            "seqFloor": 0,
+            "checkpointSeq": 0,
+            "checkpointSize": 0,
+            "rowCount": rows.len(),
+            "rowBytes": rows.iter().map(|(_, _, bytes)| bytes.len()).sum::<usize>(),
+        }),
+        &[],
+    )];
+    for (seq, batch_id, payload) in rows {
+        frames.push(encode(
+            frame_type::ROW,
+            &serde_json::json!({"seq": seq, "device": "dev-b", "batchId": batch_id}),
+            payload,
+        ));
+    }
+    frames.push(encode(
+        frame_type::ROWS_DONE,
+        &serde_json::json!({"headSeq": head_seq}),
+        &[],
+    ));
+    http_rows_body(frames)
 }
 
 /// Answer hello with `state`, then serve the rows request with `rows`.
@@ -159,7 +318,879 @@ fn fetcher(bytes: &[u8]) -> (Arc<FixedFetcher>, Arc<std::sync::atomic::AtomicU64
     )
 }
 
+fn frame_actor(shared: Arc<Mutex<Shared>>, sink: Arc<RecordingSink>) -> Actor {
+    let (fetch, _) = fetcher(b"");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (nudge, nudge_rx) = mpsc::channel(1);
+    let (_probe, probe_rx) = mpsc::channel(1);
+    let (_redial, redial_rx) = mpsc::channel(1);
+    let (_presence, presence_rx) = mpsc::channel(1);
+    let (events, _) = broadcast::channel(1);
+    Actor {
+        shared,
+        sink,
+        fetcher: fetch,
+        device_id: "dev-a".into(),
+        connector: Arc::new(ErrorConnector {
+            error: SyncError::Closed,
+        }),
+        tuning: ChatTuning::default(),
+        events,
+        shutdown: shutdown_rx,
+        nudge,
+        nudge_rx,
+        probe_rx,
+        redial_rx,
+        presence_rx,
+        flags: Arc::new(Flags::default()),
+        cursor_amnesty_done: std::sync::atomic::AtomicBool::new(false),
+        transport: None,
+        sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        resumed: true,
+    }
+}
+
+fn ws_http_error(status: u16) -> WsError {
+    let response = tokio_tungstenite::tungstenite::http::Response::builder()
+        .status(status)
+        .body(Some(Vec::new()))
+        .unwrap();
+    WsError::Http(response)
+}
+
 // ── plan_catch_up (pure) ────────────────────────────────────────────────────
+
+#[test]
+fn websocket_403_is_typed_without_reclassifying_other_handshake_failures() {
+    assert!(matches!(
+        map_ws_connect_error(ws_http_error(403)),
+        SyncError::AccessDenied(_)
+    ));
+    assert!(matches!(
+        map_ws_connect_error(ws_http_error(401)),
+        SyncError::WebSocket(_)
+    ));
+    assert!(matches!(
+        map_ws_connect_error(ws_http_error(500)),
+        SyncError::WebSocket(_)
+    ));
+}
+
+#[tokio::test]
+async fn access_denied_signal_is_sticky_and_broadcasts_once() {
+    let flags = Flags::default();
+    let (events, _) = broadcast::channel(4);
+    let mut receiver = events.subscribe();
+
+    signal_access_denied(&flags, &events);
+    assert!(
+        flags
+            .access_denied
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert_eq!(receiver.recv().await.unwrap(), ChatEvent::AccessDenied);
+
+    signal_access_denied(&flags, &events);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_first_websocket_denial_is_visible_to_a_late_subscriber() {
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let client = ChatClient::connect_with_transport(
+        Arc::new(ErrorConnector {
+            error: SyncError::AccessDenied("websocket handshake HTTP 403".into()),
+        }),
+        sink,
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+        Some(Arc::new(ErrorTransport {
+            error: SyncError::Closed,
+        })),
+    )
+    .await
+    .expect("local-first construction succeeds before network I/O");
+
+    for _ in 0..16 {
+        if client.access_denied() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        client.access_denied(),
+        "403 verdict must latch on the client"
+    );
+
+    // Subscribe deliberately after the one-shot event. The accessor is the
+    // race-free source of truth for this pre-subscription case.
+    let _late_receiver = client.events();
+    assert!(client.access_denied());
+    client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_updates_can_be_recovered_before_parking_the_client() {
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let client = ChatClient::connect_with_transport(
+        Arc::new(ErrorConnector {
+            error: SyncError::Closed,
+        }),
+        sink,
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+        Some(Arc::new(ErrorTransport {
+            error: SyncError::Closed,
+        })),
+    )
+    .await
+    .unwrap();
+    client.enqueue_update(vec![1, 2]);
+    client.enqueue_update(vec![3, 4]);
+
+    assert_eq!(client.into_pending_updates(), vec![vec![1, 2], vec![3, 4]]);
+}
+
+#[tokio::test]
+async fn offline_push_pulls_from_the_pre_ack_cursor_before_retiring() {
+    let transport = Arc::new(ScriptedTransport::default());
+    lock(&transport.push_results).push_back(Ok(
+        serde_json::json!({"batchId": "local", "seq": 2, "dup": false}).to_string(),
+    ));
+    lock(&transport.fetch_results).push_back(Ok(http_rows_response(
+        2,
+        &[(1, "foreign", b"foreign-row"), (2, "local", b"local-row")],
+    )));
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 0,
+        pending: VecDeque::from([PendingPush {
+            batch_id: "local".into(),
+            bytes: b"local-row".to_vec(),
+        }]),
+        ..Shared::default()
+    }));
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, mut nudge_rx) = mpsc::channel(1);
+
+    offline_sync_once(
+        transport.clone(),
+        shared.clone(),
+        sink.clone(),
+        fetch,
+        events,
+        Arc::new(Flags::default()),
+        nudge.clone(),
+    )
+    .await;
+
+    assert_eq!(*lock(&transport.fetch_after), vec![0]);
+    assert_eq!(
+        *lock(&sink.rows),
+        vec![(b"foreign-row".to_vec(), 1), (b"local-row".to_vec(), 2)],
+        "the foreign predecessor must land before the local ack retires"
+    );
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 2);
+    assert!(shared.pending.is_empty());
+    drop(shared);
+    assert_eq!(*lock(&sink.cursor_advances), vec![2]);
+    assert!(matches!(
+        nudge_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn offline_push_followed_by_server_reset_keeps_pending_and_resets_cursor() {
+    let transport = Arc::new(ScriptedTransport::default());
+    lock(&transport.push_results).push_back(Ok(
+        serde_json::json!({"batchId": "pre-reset", "seq": 42, "dup": false}).to_string(),
+    ));
+    // This GET was correctly issued with after=41. Once the room reports
+    // head=1, it cannot contain rows for the new namespace in this response;
+    // the self-nudge retries from the exact reset cursor.
+    lock(&transport.fetch_results).push_back(Ok(http_rows_response(1, &[])));
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 41,
+        pending: VecDeque::from([PendingPush {
+            batch_id: "pre-reset".into(),
+            bytes: vec![9],
+        }]),
+        ..Shared::default()
+    }));
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, mut nudge_rx) = mpsc::channel(1);
+    let flags = Arc::new(Flags::default());
+
+    offline_sync_once(
+        transport.clone(),
+        shared.clone(),
+        sink.clone(),
+        fetch,
+        events,
+        flags.clone(),
+        nudge,
+    )
+    .await;
+
+    assert_eq!(*lock(&transport.fetch_after), vec![41]);
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 0);
+    assert_eq!(shared.pending.len(), 1, "pre-reset ack stays replayable");
+    drop(shared);
+    assert_eq!(*lock(&sink.cursor_resets), vec![0]);
+    assert!(lock(&sink.cursor_advances).is_empty());
+    assert_eq!(
+        flags
+            .server_resets
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    nudge_rx
+        .recv()
+        .await
+        .expect("reset must schedule a fresh pull/push");
+}
+
+#[tokio::test]
+async fn websocket_ack_racing_a_failed_http_push_is_staged_until_reset_pull() {
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 0,
+        pending: VecDeque::from([PendingPush {
+            batch_id: "racing".into(),
+            bytes: b"must-replay".to_vec(),
+        }]),
+        ..Shared::default()
+    }));
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let transport = Arc::new(GatedRowsTransport {
+        release: Mutex::new(Some(release_rx)),
+        started: Mutex::new(Some(started_tx)),
+        body: http_rows_response(0, &[]),
+        push_results: Mutex::new(VecDeque::from([Err(SyncError::Protocol(
+            "injected push failure".into(),
+        ))])),
+    });
+    let sink = Arc::new(RecordingSink::default());
+    let actor = frame_actor(shared.clone(), sink.clone());
+    let (fetch, _) = fetcher(b"");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, _) = mpsc::channel(1);
+    let task = tokio::spawn(offline_sync_once(
+        transport,
+        shared.clone(),
+        sink.clone(),
+        fetch,
+        events,
+        Arc::new(Flags::default()),
+        nudge,
+    ));
+
+    started_rx.await.unwrap();
+    // Exact race under audit: HTTP could not confirm its POST, while the old
+    // socket's ack lands after the round captured its replay snapshot and
+    // before the GET exposes the replacement room's empty head.
+    let ack = decode(&encode(
+        frame_type::ACK,
+        &serde_json::json!({"batchId": "racing", "seq": 1, "dup": false}),
+        &[],
+    ))
+    .unwrap();
+    assert!(actor.handle_frame(ack, 0));
+    {
+        let shared = lock(&shared);
+        assert_eq!(shared.cursor, 0, "a staged ack is not a pull frontier");
+        assert_eq!(shared.pending.len(), 1, "keep the only replay copy");
+        assert_eq!(shared.offline_ws_acks.get("racing"), Some(&1));
+    }
+    assert!(lock(&sink.cursor_advances).is_empty());
+    release_tx.send(()).unwrap();
+    task.await.unwrap();
+
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 0);
+    assert_eq!(shared.pending.len(), 1);
+    assert_eq!(shared.pending[0].batch_id, "racing");
+    assert_eq!(shared.pending[0].bytes, b"must-replay");
+    assert!(shared.offline_snapshot_ids.is_empty());
+    assert!(shared.offline_ws_acks.is_empty());
+    assert!(shared.permanent_rejections.is_empty());
+    drop(shared);
+    assert!(lock(&sink.cursor_advances).is_empty());
+    assert_eq!(*lock(&sink.cursor_resets), vec![0]);
+}
+
+#[tokio::test]
+async fn aba_ack_reset_reanchors_from_zero_instead_of_the_captured_cursor() {
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 10,
+        pending: VecDeque::from([PendingPush {
+            batch_id: "aba-race".into(),
+            bytes: b"must-replay".to_vec(),
+        }]),
+        ..Shared::default()
+    }));
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let transport = Arc::new(GatedRowsTransport {
+        release: Mutex::new(Some(release_rx)),
+        started: Mutex::new(Some(started_tx)),
+        body: http_rows_response(
+            12,
+            &[(11, "new-11", b"new-row-11"), (12, "new-12", b"new-row-12")],
+        ),
+        push_results: Mutex::new(VecDeque::from([Err(SyncError::Protocol(
+            "injected push failure".into(),
+        ))])),
+    });
+    let sink = Arc::new(RecordingSink::default());
+    let actor = frame_actor(shared.clone(), sink.clone());
+    let (fetch, _) = fetcher(b"");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, _) = mpsc::channel(1);
+    let task = tokio::spawn(offline_sync_once(
+        transport,
+        shared.clone(),
+        sink.clone(),
+        fetch,
+        events,
+        Arc::new(Flags::default()),
+        nudge,
+    ));
+
+    started_rx.await.unwrap();
+    let ack = decode(&encode(
+        frame_type::ACK,
+        &serde_json::json!({"batchId": "aba-race", "seq": 13, "dup": false}),
+        &[],
+    ))
+    .unwrap();
+    assert!(actor.handle_frame(ack, 0));
+    assert_eq!(lock(&shared).offline_ws_acks.get("aba-race"), Some(&13));
+    release_tx.send(()).unwrap();
+    task.await.unwrap();
+
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 0);
+    assert_eq!(shared.pending.len(), 1);
+    assert_eq!(shared.pending[0].batch_id, "aba-race");
+    assert_eq!(shared.pending[0].bytes, b"must-replay");
+    drop(shared);
+    assert!(
+        lock(&sink.rows).is_empty(),
+        "rows 11..12 cannot fill the new incarnation's missing 1..10"
+    );
+    assert_eq!(*lock(&sink.cursor_resets), vec![0]);
+}
+
+#[tokio::test]
+async fn ack_sequence_reused_by_a_foreign_batch_forces_zero_reanchor() {
+    let transport = Arc::new(ScriptedTransport::default());
+    lock(&transport.push_results).push_back(Ok(
+        serde_json::json!({"batchId": "old-local", "seq": 13, "dup": false}).to_string(),
+    ));
+    lock(&transport.fetch_results).push_back(Ok(http_rows_response(
+        14,
+        &[
+            (11, "new-11", b"new-row-11"),
+            (12, "new-12", b"new-row-12"),
+            (13, "foreign", b"foreign-row-13"),
+            (14, "new-14", b"new-row-14"),
+        ],
+    )));
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 10,
+        pending: VecDeque::from([PendingPush {
+            batch_id: "old-local".into(),
+            bytes: b"must-replay".to_vec(),
+        }]),
+        ..Shared::default()
+    }));
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, _) = mpsc::channel(1);
+
+    offline_sync_once(
+        transport.clone(),
+        shared.clone(),
+        sink.clone(),
+        fetch,
+        events,
+        Arc::new(Flags::default()),
+        nudge,
+    )
+    .await;
+
+    assert_eq!(*lock(&transport.fetch_after), vec![10]);
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 0);
+    assert_eq!(shared.pending.len(), 1);
+    assert_eq!(shared.pending[0].batch_id, "old-local");
+    drop(shared);
+    assert!(lock(&sink.rows).is_empty());
+    assert_eq!(*lock(&sink.cursor_resets), vec![0]);
+}
+
+#[tokio::test]
+async fn contained_checkpoint_does_not_prove_a_staged_ack_identity() {
+    let body = http_rows_body([
+        encode(
+            frame_type::STATE,
+            &serde_json::json!({
+                "headSeq": 14,
+                "seqFloor": 12,
+                "checkpointSeq": 12,
+                "checkpointSize": 128,
+                "rowCount": 2,
+                "rowBytes": 20,
+            }),
+            b"contained-frontier",
+        ),
+        encode(
+            frame_type::ROW,
+            &serde_json::json!({"seq": 13, "device": "dev-b", "batchId": "new-13"}),
+            b"new-row-13",
+        ),
+        encode(
+            frame_type::ROW,
+            &serde_json::json!({"seq": 14, "device": "dev-b", "batchId": "new-14"}),
+            b"new-row-14",
+        ),
+        encode(
+            frame_type::ROWS_DONE,
+            &serde_json::json!({"headSeq": 14}),
+            &[],
+        ),
+    ]);
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 10,
+        pending: VecDeque::from([PendingPush {
+            batch_id: "pruned-old-local".into(),
+            bytes: b"must-replay".to_vec(),
+        }]),
+        ..Shared::default()
+    }));
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let transport = Arc::new(GatedRowsTransport {
+        release: Mutex::new(Some(release_rx)),
+        started: Mutex::new(Some(started_tx)),
+        body,
+        push_results: Mutex::new(VecDeque::from([Err(SyncError::Protocol(
+            "injected push failure".into(),
+        ))])),
+    });
+    let sink = Arc::new(RecordingSink::default());
+    sink.frontier_contained
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let actor = frame_actor(shared.clone(), sink.clone());
+    let (fetch, fetch_calls) = fetcher(b"unused-checkpoint");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, _) = mpsc::channel(1);
+    let task = tokio::spawn(offline_sync_once(
+        transport,
+        shared.clone(),
+        sink.clone(),
+        fetch,
+        events,
+        Arc::new(Flags::default()),
+        nudge,
+    ));
+
+    started_rx.await.unwrap();
+    let ack = decode(&encode(
+        frame_type::ACK,
+        &serde_json::json!({
+            "batchId": "pruned-old-local",
+            "seq": 8,
+            "dup": true,
+        }),
+        &[],
+    ))
+    .unwrap();
+    assert!(actor.handle_frame(ack, 0));
+    release_tx.send(()).unwrap();
+    task.await.unwrap();
+
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 12, "only the trusted checkpoint may anchor");
+    assert_eq!(
+        shared.pending.len(),
+        1,
+        "missing batch identity must replay"
+    );
+    assert_eq!(shared.pending[0].batch_id, "pruned-old-local");
+    assert!(shared.offline_ws_acks.is_empty());
+    drop(shared);
+    assert!(lock(&sink.rows).is_empty());
+    assert_eq!(*lock(&sink.cursor_resets), vec![12]);
+    assert_eq!(
+        fetch_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the contained frontier avoids download but does not confirm the ack"
+    );
+}
+
+#[tokio::test]
+async fn pull_failure_after_a_sibling_reset_still_restores_the_round_snapshot() {
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 41,
+        pending: VecDeque::from([PendingPush {
+            batch_id: "failed-pull".into(),
+            bytes: b"must-replay".to_vec(),
+        }]),
+        ..Shared::default()
+    }));
+    let (release_tx, release_rx) = oneshot::channel();
+    let transport = Arc::new(GatedPullFailureTransport {
+        release: Mutex::new(Some(release_rx)),
+        fetch_after: Mutex::new(Vec::new()),
+    });
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, _) = mpsc::channel(1);
+    let task = tokio::spawn(offline_sync_once(
+        transport.clone(),
+        shared.clone(),
+        sink,
+        fetch,
+        events,
+        Arc::new(Flags::default()),
+        nudge,
+    ));
+    while lock(&transport.fetch_after).is_empty() {
+        tokio::task::yield_now().await;
+    }
+    {
+        let mut shared = lock(&shared);
+        // A sibling accepted the old ack, then independently observed/reset
+        // the room before this HTTP pull failed.
+        shared.pending.clear();
+        shared.cursor = 0;
+        shared.reset_version = 1;
+    }
+    release_tx.send(()).unwrap();
+    task.await.unwrap();
+
+    let shared = lock(&shared);
+    assert_eq!(shared.pending.len(), 1);
+    assert_eq!(shared.pending[0].batch_id, "failed-pull");
+    assert_eq!(shared.pending[0].bytes, b"must-replay");
+    assert!(shared.offline_snapshot_ids.is_empty());
+}
+
+#[tokio::test]
+async fn reset_restoration_does_not_resurrect_a_permanently_rejected_head() {
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 41,
+        pending: VecDeque::from([
+            PendingPush {
+                batch_id: "bad-full".into(),
+                bytes: b"oversized".to_vec(),
+            },
+            PendingPush {
+                batch_id: "small".into(),
+                bytes: b"small-delta".to_vec(),
+            },
+        ]),
+        ..Shared::default()
+    }));
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let transport = Arc::new(GatedRowsTransport {
+        release: Mutex::new(Some(release_rx)),
+        started: Mutex::new(Some(started_tx)),
+        body: http_rows_response(1, &[]),
+        push_results: Mutex::new(VecDeque::from([
+            Err(SyncError::PushRejected("too_large".into())),
+            Ok(serde_json::json!({"batchId": "small", "seq": 42, "dup": false}).to_string()),
+        ])),
+    });
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, _) = mpsc::channel(1);
+    let task = tokio::spawn(offline_sync_once(
+        transport,
+        shared.clone(),
+        sink,
+        fetch,
+        events,
+        Arc::new(Flags::default()),
+        nudge,
+    ));
+
+    started_rx.await.unwrap();
+    {
+        let mut shared = lock(&shared);
+        assert!(
+            shared.permanent_rejections.contains("bad-full"),
+            "HTTP verdict must be visible to reset restoration"
+        );
+        shared.pending.retain(|push| push.batch_id != "small");
+        shared.cursor = 42;
+    }
+    release_tx.send(()).unwrap();
+    task.await.unwrap();
+
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 0);
+    assert_eq!(shared.pending.len(), 1);
+    assert_eq!(shared.pending[0].batch_id, "small");
+    assert_eq!(shared.pending[0].bytes, b"small-delta");
+    assert!(shared.offline_snapshot_ids.is_empty());
+    assert!(shared.permanent_rejections.is_empty());
+}
+
+#[test]
+fn stale_websocket_ack_cannot_retire_work_after_http_reset() {
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 0,
+        reset_version: 1,
+        pending: VecDeque::from([PendingPush {
+            batch_id: "pre-reset".into(),
+            bytes: vec![9],
+        }]),
+        ..Shared::default()
+    }));
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (nudge, nudge_rx) = mpsc::channel(1);
+    let (_probe, probe_rx) = mpsc::channel(1);
+    let (_redial, redial_rx) = mpsc::channel(1);
+    let (_presence, presence_rx) = mpsc::channel(1);
+    let (events, _) = broadcast::channel(1);
+    let actor = Actor {
+        shared: shared.clone(),
+        sink: sink.clone(),
+        fetcher: fetch,
+        device_id: "dev-a".into(),
+        connector: Arc::new(ErrorConnector {
+            error: SyncError::Closed,
+        }),
+        tuning: ChatTuning::default(),
+        events,
+        shutdown: shutdown_rx,
+        nudge,
+        nudge_rx,
+        probe_rx,
+        redial_rx,
+        presence_rx,
+        flags: Arc::new(Flags::default()),
+        cursor_amnesty_done: std::sync::atomic::AtomicBool::new(false),
+        transport: None,
+        sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        resumed: true,
+    };
+    let ack = decode(&encode(
+        frame_type::ACK,
+        &serde_json::json!({"batchId": "pre-reset", "seq": 42, "dup": false}),
+        &[],
+    ))
+    .unwrap();
+
+    assert!(!actor.handle_frame(ack, 0), "old session must reconnect");
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 0);
+    assert_eq!(shared.pending.len(), 1);
+    drop(shared);
+    assert!(lock(&sink.cursor_advances).is_empty());
+}
+
+#[tokio::test]
+async fn malformed_http_pull_never_retires_a_staged_ack() {
+    let transport = Arc::new(ScriptedTransport::default());
+    lock(&transport.push_results).push_back(Ok(
+        serde_json::json!({"batchId": "local", "seq": 1, "dup": false}).to_string(),
+    ));
+    let mut truncated = http_rows_response(1, &[(1, "local", b"row")]);
+    truncated.pop();
+    lock(&transport.fetch_results).push_back(Ok(truncated));
+    let shared = Arc::new(Mutex::new(Shared {
+        pending: VecDeque::from([PendingPush {
+            batch_id: "local".into(),
+            bytes: b"row".to_vec(),
+        }]),
+        ..Shared::default()
+    }));
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, mut nudge_rx) = mpsc::channel(1);
+
+    offline_sync_once(
+        transport,
+        shared.clone(),
+        sink.clone(),
+        fetch,
+        events,
+        Arc::new(Flags::default()),
+        nudge,
+    )
+    .await;
+
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 0);
+    assert_eq!(shared.pending.len(), 1);
+    drop(shared);
+    assert!(lock(&sink.rows).is_empty());
+    assert!(lock(&sink.cursor_advances).is_empty());
+    nudge_rx.recv().await.expect("invalid pull must retry");
+}
+
+#[tokio::test]
+async fn permanent_http_rejection_does_not_wedge_the_following_delta() {
+    let transport = Arc::new(ScriptedTransport::default());
+    lock(&transport.push_results).push_back(Err(SyncError::PushRejected("too_large".into())));
+    lock(&transport.push_results).push_back(Ok(
+        serde_json::json!({"batchId": "small", "seq": 1, "dup": false}).to_string(),
+    ));
+    lock(&transport.fetch_results)
+        .push_back(Ok(http_rows_response(1, &[(1, "small", b"small-delta")])));
+    let shared = Arc::new(Mutex::new(Shared {
+        pending: VecDeque::from([
+            PendingPush {
+                batch_id: "full".into(),
+                bytes: vec![0; 8],
+            },
+            PendingPush {
+                batch_id: "small".into(),
+                bytes: b"small-delta".to_vec(),
+            },
+        ]),
+        ..Shared::default()
+    }));
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, _) = mpsc::channel(1);
+    let flags = Arc::new(Flags::default());
+
+    offline_sync_once(
+        transport.clone(),
+        shared.clone(),
+        sink,
+        fetch,
+        events,
+        flags.clone(),
+        nudge,
+    )
+    .await;
+
+    assert_eq!(
+        lock(&transport.pushes)
+            .iter()
+            .map(|(batch, _)| batch.as_str())
+            .collect::<Vec<_>>(),
+        vec!["full", "small"]
+    );
+    assert!(lock(&shared).pending.is_empty());
+    assert_eq!(lock(&shared).cursor, 1);
+    assert_eq!(flags.rejected.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_http_pull_self_nudges_a_steady_socket_to_repush() {
+    let (pipe, mut end) = pipe_pair();
+    let shared = Arc::new(Mutex::new(Shared {
+        pending: VecDeque::from([PendingPush {
+            batch_id: "retry-me".into(),
+            bytes: vec![7],
+        }]),
+        ..Shared::default()
+    }));
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (release_tx, release_rx) = oneshot::channel();
+    let transport = Arc::new(GatedPullFailureTransport {
+        release: Mutex::new(Some(release_rx)),
+        fetch_after: Mutex::new(Vec::new()),
+    });
+    let (events, _) = broadcast::channel(8);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (nudge_tx, nudge_rx) = mpsc::channel(1);
+    let (_probe_tx, probe_rx) = mpsc::channel(1);
+    let (_redial_tx, redial_rx) = mpsc::channel(1);
+    let (_presence_tx, presence_rx) = mpsc::channel(1);
+    let mut actor = Actor {
+        shared: shared.clone(),
+        sink,
+        fetcher: fetch,
+        device_id: "dev-a".into(),
+        connector: Arc::new(ErrorConnector {
+            error: SyncError::Closed,
+        }),
+        tuning: ChatTuning::default(),
+        events,
+        shutdown: shutdown_rx,
+        nudge: nudge_tx,
+        nudge_rx,
+        probe_rx,
+        redial_rx,
+        presence_rx,
+        flags: Arc::new(Flags::default()),
+        cursor_amnesty_done: std::sync::atomic::AtomicBool::new(false),
+        transport: Some(transport),
+        sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        resumed: false,
+    };
+    actor.spawn_offline_sync();
+    let actor_task = tokio::spawn(async move {
+        let mut ready = None;
+        actor.run_session(pipe, &mut ready).await
+    });
+
+    let _hello = expect_kind(&mut end, frame_type::HELLO).await;
+    send(
+        &end,
+        frame_type::STATE,
+        serde_json::json!({"headSeq": 0, "seqFloor": 0, "checkpointSeq": 0,
+            "checkpointSize": 0, "rowCount": 0, "rowBytes": 0}),
+        &[],
+    )
+    .await;
+    let _rows = expect_kind(&mut end, frame_type::ROWS_REQ).await;
+    let first = expect_kind(&mut end, frame_type::PUSH).await;
+    send(
+        &end,
+        frame_type::ROWS_DONE,
+        serde_json::json!({"headSeq": 0}),
+        &[],
+    )
+    .await;
+    tokio::task::yield_now().await;
+    release_tx.send(()).unwrap();
+
+    let replay = expect_kind(&mut end, frame_type::PUSH).await;
+    assert_eq!(replay.header["batchId"], first.header["batchId"]);
+    assert_eq!(replay.payload, first.payload);
+    assert_eq!(
+        lock(&shared).pending.len(),
+        1,
+        "failed pull keeps replay copy"
+    );
+
+    shutdown_tx.send(true).unwrap();
+    drop(end);
+    let _ = actor_task.await.unwrap();
+}
 
 #[test]
 fn catch_up_plan_covers_the_decision_table() {
@@ -519,6 +1550,64 @@ async fn permanent_rejection_retires_transient_keeps_and_retries() {
     client.shutdown().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn permanent_rejection_rearms_an_already_queued_successor() {
+    let (pipe, mut end) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (head_seen_tx, head_seen_rx) = oneshot::channel();
+    let (reject_tx, reject_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_join(
+            &mut end,
+            serde_json::json!({"headSeq": 0, "seqFloor": 0, "checkpointSeq": 0,
+                "checkpointSize": 0, "rowCount": 0, "rowBytes": 0}),
+            &[],
+            vec![],
+            false,
+        )
+        .await;
+        let head = expect_kind(&mut end, frame_type::PUSH).await;
+        let head_id = head.header["batchId"].as_str().unwrap().to_string();
+        head_seen_tx.send(head_id.clone()).unwrap();
+        reject_rx.await.unwrap();
+        send(
+            &end,
+            frame_type::ERROR,
+            serde_json::json!({"code": "too_large", "message": "no", "batchId": head_id}),
+            &[],
+        )
+        .await;
+        let successor = expect_kind(&mut end, frame_type::PUSH).await;
+        assert_eq!(successor.header["batchId"], "successor");
+        assert_eq!(successor.payload, vec![2]);
+        end
+    });
+
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        sink,
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+    )
+    .await
+    .unwrap();
+    client.enqueue_update(vec![1]);
+    let _head_id = head_seen_rx.await.unwrap();
+    // Queue work without sending a nudge: this pins that handling the permanent
+    // verdict itself advances queue liveness.
+    lock(&client.shared).pending.push_back(PendingPush {
+        batch_id: "successor".into(),
+        bytes: vec![2],
+    });
+    reject_tx.send(()).unwrap();
+
+    let _keep = server.await.unwrap();
+    client.shutdown().await;
+}
+
 /// F2: batches over the row cap never enter the replay queue.
 #[tokio::test(start_paused = true)]
 async fn oversized_enqueue_is_refused_at_the_door() {
@@ -533,7 +1622,7 @@ async fn oversized_enqueue_is_refused_at_the_door() {
     });
     let client = ChatClient::connect_with_tuned(
         connector(vec![pipe]),
-        sink,
+        sink.clone(),
         fetch,
         "dev-a",
         0,
@@ -628,7 +1717,7 @@ async fn server_reset_is_counted_and_head_seq_stays_honest() {
     });
     let client = ChatClient::connect_with_tuned(
         connector(vec![pipe]),
-        sink,
+        sink.clone(),
         fetch,
         "dev-a",
         50, // persisted cursor from before the room was wiped
@@ -642,6 +1731,11 @@ async fn server_reset_is_counted_and_head_seq_stays_honest() {
     assert_eq!(stats.server_resets, 1, "reset visible to the host");
     assert_eq!(stats.head_seq, 3, "server view not masked by the cursor");
     assert_eq!(stats.cursor, 3, "cursor re-anchored by the backfill");
+    assert_eq!(
+        *lock(&sink.cursor_resets),
+        vec![0],
+        "the backward move must be persisted explicitly before new rows"
+    );
     client.shutdown().await;
 }
 
@@ -788,7 +1882,13 @@ async fn checkpoint_fetch_overlaps_row_backfill() {
             b"r7",
         )
         .await;
-        send(&end, frame_type::ROWS_DONE, serde_json::json!({"headSeq": 7}), &[]).await;
+        send(
+            &end,
+            frame_type::ROWS_DONE,
+            serde_json::json!({"headSeq": 7}),
+            &[],
+        )
+        .await;
         // Only now does the "download" complete.
         let _ = gate_tx.send(());
         end
@@ -849,7 +1949,13 @@ async fn pending_push_flushes_before_backfill_completes() {
             &[],
         )
         .await;
-        send(&end_b, frame_type::ROWS_DONE, serde_json::json!({"headSeq": 1}), &[]).await;
+        send(
+            &end_b,
+            frame_type::ROWS_DONE,
+            serde_json::json!({"headSeq": 1}),
+            &[],
+        )
+        .await;
         end_b
     });
 
@@ -871,7 +1977,11 @@ async fn pending_push_flushes_before_backfill_completes() {
         let _ = events.recv().await;
     }
     let _end = server.await.unwrap();
-    assert_eq!(client.stats().cursor, 1, "early replay acked before ROWS_DONE");
+    assert_eq!(
+        client.stats().cursor,
+        1,
+        "early replay acked before ROWS_DONE"
+    );
     client.shutdown().await;
 }
 

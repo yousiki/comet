@@ -111,6 +111,25 @@ pub struct RunRequest {
     /// content blocks. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// MCP servers the harness should attach to the session. `#[serde(skip)]`:
+    /// computed by the EXECUTING host at dispatch time (binary path, IPC
+    /// port), never trusted off the wire — a remote sender must not dictate
+    /// what the host spawns.
+    #[serde(skip)]
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// One MCP stdio server for a harness session (ACP `mcpServers[]` shape).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// (name, value) pairs.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 /// The session-scoped singleton id for the live plan/todo chip. ACP plan

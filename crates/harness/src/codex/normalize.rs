@@ -5,8 +5,8 @@
 //! (`delta`/`textDelta`, `exitCode`/`exit_code`, camelCase/snake_case item
 //! types) are accepted, and unknown item types map to nothing.
 
-use zeron_proto::{AgentEvent, TodoItem, ToolCall};
 use serde_json::Value;
+use zeron_proto::{AgentEvent, TodoItem, ToolCall};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -511,10 +511,16 @@ mod tests {
             Some("th-c".into())
         );
         assert_eq!(
-            notification_thread_id("turn/completed", &json!({"threadId": "th-1", "turn": {"id": "t"}})),
+            notification_thread_id(
+                "turn/completed",
+                &json!({"threadId": "th-1", "turn": {"id": "t"}})
+            ),
             Some("th-1".into())
         );
-        assert_eq!(notification_thread_id("error", &json!({"message": "x"})), None);
+        assert_eq!(
+            notification_thread_id("error", &json!({"message": "x"})),
+            None
+        );
     }
 
     #[test]

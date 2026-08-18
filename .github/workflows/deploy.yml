@@ -5,8 +5,8 @@ name: deploy
 # gracefully until the CLOUDFLARE_API_TOKEN secret is configured (until then:
 # `npm -C edge run deploy` from a wrangler-authenticated machine).
 #
-# The token needs: Workers Scripts (edit), Workers Routes (edit) on zeron.sh,
-# Workers R2 Storage (edit). Account id is pinned in edge/wrangler.jsonc.
+# The token needs Workers Scripts, Workers Routes, and R2 Storage edit access
+# on this fork's Cloudflare account. Account id is pinned in edge/wrangler.jsonc.
 
 on:
   push:
@@ -68,6 +68,8 @@ jobs:
 
   # Static landing page (zeron.sh) — assets-only worker, no build step.
   landing:
+    # The fork only owns edge.siki.moe; never deploy upstream's zeron.sh zone.
+    if: github.repository == 'zeronsh/comet'
     runs-on: ubuntu-latest
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -100,6 +102,8 @@ jobs:
 
   # www.zeron.sh → zeron.sh 301 (see apps/www-redirect/wrangler.jsonc).
   www-redirect:
+    # The fork does not own upstream's zeron.sh redirect zone.
+    if: github.repository == 'zeronsh/comet'
     runs-on: ubuntu-latest
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

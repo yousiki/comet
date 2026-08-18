@@ -154,6 +154,7 @@ fn run_request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        mcp_servers: Vec::new(),
         resume: None,
     }
 }
@@ -188,6 +189,8 @@ fn queue_run_with(
             },
             issued_by: VIEWER.into(),
             issued_at: now,
+            user_id: None,
+            origin: None,
             based_on: None::<CommandBasedOn>,
             expires_at: None,
             status: SessionCommandStatus::Pending,
@@ -660,6 +663,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 created_at: now,
                 harness_session_id: Some("hs-9".into()),
                 room_gen: None,
+                user_id: None,
                 harness_session_cwd: Some("/tmp/legacy".into()),
                 space_id: Some("space-legacy".into()),
                 last_seen_at: Some(now),

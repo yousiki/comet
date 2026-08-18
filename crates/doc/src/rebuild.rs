@@ -184,6 +184,7 @@ mod tests {
             ],
             created_at: 5,
             device_id: "dev-a".into(),
+            user_id: None,
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         }
@@ -195,6 +196,8 @@ mod tests {
             payload: SessionCommandPayload::Interrupt {},
             issued_by: "dev-b".into(),
             issued_at: 9,
+            user_id: None,
+            origin: None,
             based_on: None,
             expires_at: None,
             status,

@@ -211,7 +211,7 @@ async fn target_device_id_routes_over_the_relay() {
     // Seed a transcript on B only — proves reads come from B, not A's (empty) doc.
     let handle_b = core_b.doc_host.open("chat-remote").expect("open chat on B");
     handle_b
-        .write_user_message("m-b-1", "hello from B", 1_000)
+        .write_user_message("m-b-1", "hello from B", 1_000, None)
         .expect("write user message");
 
     let client = zeron_rpc::memory_client(core_a.rpc_service());
@@ -307,6 +307,7 @@ async fn target_device_id_routes_over_the_relay() {
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
             attachments: Vec::new(),
+            mcp_servers: Vec::new(),
             resume: None,
         },
         message_id: "m-a-1".into(),

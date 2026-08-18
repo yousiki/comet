@@ -4562,6 +4562,7 @@ impl Composer {
             }],
             created_at,
             device_id: "local".into(),
+            user_id: None,
             status: None,
             continuation_of: None,
         };
@@ -4751,6 +4752,7 @@ impl Composer {
                         }],
                         created_at,
                         device_id: "local".into(),
+                        user_id: None,
                         status: None,
                         continuation_of: None,
                     };
@@ -4783,6 +4785,7 @@ impl Composer {
                             auto_approve: false,
                             resume: None,
                             attachments: attachment_paths,
+                            mcp_servers: Vec::new(),
                         },
                         message_id: message_id.clone(),
                     }
@@ -6428,6 +6431,7 @@ mod tests {
             parts,
             created_at: 0,
             device_id: "d".into(),
+            user_id: None,
             status,
             continuation_of: None,
         };
@@ -6464,6 +6468,7 @@ mod tests {
                 }],
                 created_at: 2,
                 device_id: "d".into(),
+                user_id: None,
                 status: Some(MessageStatus::Complete),
                 continuation_of: None,
             },
@@ -6496,6 +6501,7 @@ mod tests {
             }],
             created_at: 1,
             device_id: "d".into(),
+            user_id: None,
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         };

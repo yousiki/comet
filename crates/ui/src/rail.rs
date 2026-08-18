@@ -586,6 +586,7 @@ mod tests {
             }],
             created_at: 0,
             device_id: "d".into(),
+            user_id: None,
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         }

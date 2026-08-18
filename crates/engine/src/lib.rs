@@ -204,6 +204,7 @@ impl EngineCore {
             store.clone(),
             DocHostConfig {
                 device_id: device_id.clone(),
+                user_id: profile.user_id().to_string(),
                 default_harness,
                 edge: edge.clone(),
             },
@@ -797,6 +798,9 @@ impl Engine {
             stop_tx,
         });
         let server = serve_ipc(config.ipc_port, service).await?;
+        // The listener is bound: agent sessions may now get the MCP bridge
+        // that dials back to it.
+        runtime.core().sessions.set_mcp_port(config.ipc_port);
 
         tokio::select! {
             result = shutdown_signal() => result?,
@@ -969,6 +973,14 @@ async fn read_stdin_line() -> Option<String> {
 /// one → auto-join; several → numbered picker. Success flips the auth state to
 /// `SignedIn`, which ends [`wait_for_sign_in`]'s wait (and aborts this task).
 async fn run_org_onboarding(auth: Auth) {
+    // Zero memberships → a personal workspace is minted automatically; the
+    // prompts below then only handle the pick-one / create-another cases.
+    if let Err(err) = auth.ensure_default_org().await {
+        tracing::warn!(error = %err, "default workspace creation failed; falling back to prompt");
+    }
+    if auth.state().is_signed_in() {
+        return; // ensure_default_org created + selected the personal org
+    }
     let orgs = match auth.list_orgs().await {
         Ok(orgs) => orgs,
         Err(err) => {

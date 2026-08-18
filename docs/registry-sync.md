@@ -1,6 +1,6 @@
 # Registry sync — the workspace index without a CRDT
 
-**Status: shipped behind the `reg1/` room namespace; replaces the `ws4/` Loro workspace doc.**
+**Status: shipped behind the `reg2/` ORG-SHARED room namespace (was per-user `reg1/`); replaces the `ws4/` Loro workspace doc.** One room per org — every member reads and writes the same table. Consequences for N users: the tombstone-GC horizon and `/reset` re-seed assumption now span all members (one member's re-seed restores only their subset).
 
 ## Why
 

@@ -147,7 +147,7 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
         core.doc_host
             .open("local-chat")
             .expect("open local chat doc")
-            .write_user_message("local-message", "Private local transcript", 1)
+            .write_user_message("local-message", "Private local transcript", 1, None)
             .expect("write local transcript");
         core.uploads
             .append("local-upload", "cHJpdmF0ZQ==", Some(0))
@@ -568,7 +568,7 @@ async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
         .doc_host
         .open("still-local-chat")
         .expect("open local chat doc")
-        .write_user_message("message-1", "This stays local", 1)
+        .write_user_message("message-1", "This stays local", 1, None)
         .expect("write local message");
     runtime
         .core()

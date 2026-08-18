@@ -29,7 +29,14 @@ export interface Env {
 export const AUTH_USER_HEADER = "x-zeron-auth-user";
 
 /** Header the Worker stamps on requests forwarded into workspace-doc rooms
- * (`ws/{orgId}`). Membership (JWT org claim == orgId) is enforced at the
- * Worker; the SessionRoom DO sees this and skips its per-chat
- * claim-on-first-join ownership discipline for the room. */
+ * (`ws/{orgId}`) and org-shared chat rooms (`chat3/{orgId}/{chatId}`).
+ * Membership (JWT org claim == orgId) is enforced at the Worker; the DO sees
+ * "workspace" (SessionRoom skips per-chat ownership) or "org-chat" (ChatRoom
+ * uses host-user discipline instead of single-owner). */
 export const ROOM_KIND_HEADER = "x-zeron-room-kind";
+
+/** Header the Worker stamps with the caller's verified WorkOS org claim on
+ * forwards that need an org-scoped decision inside the DO (device-room nudge
+ * gate). Same trust rule as AUTH_USER_HEADER: Worker-controlled, deleted from
+ * inbound requests before being set. */
+export const AUTH_ORG_HEADER = "x-zeron-auth-org";

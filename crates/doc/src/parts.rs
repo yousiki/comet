@@ -414,7 +414,6 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     }
 }
 
-
 /// Stamp sidecar keys onto resolved tool parts that have sidecar content.
 ///
 /// Separate from the fold because the fold is chat-agnostic and pure; the

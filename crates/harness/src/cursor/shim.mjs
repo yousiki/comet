@@ -11,7 +11,8 @@
 //
 // Protocol: JSONL, one frame per line.
 //   stdin  (engine → shim):
-//     {"op":"run","prompt","cwd","model"?,"resume"?}   start / first turn
+//     {"op":"run","prompt","cwd","model"?,"resume"?,
+//      "mcpServers"?}                                      start / first turn
 //     {"op":"user","prompt"}                            next turn (parked)
 //     {"op":"interrupt"}                                cancel the live run
 //   stdout (shim → engine):
@@ -169,6 +170,12 @@ async function start(msg) {
     disallowedTools: ["askQuestion", "generateImage"],
     local: { cwd: msg.cwd || process.cwd(), enableAgentRetries: true },
   };
+  // @cursor/sdk 1.0.28 AgentOptions accepts this map for both create and
+  // resume. Omit the property entirely when zeron has no session bridge so
+  // the SDK's ambient project/user MCP resolution remains unchanged.
+  if (msg.mcpServers && Object.keys(msg.mcpServers).length > 0) {
+    options.mcpServers = msg.mcpServers;
+  }
   try {
     agent = msg.resume
       ? await Agent.resume(msg.resume, options)

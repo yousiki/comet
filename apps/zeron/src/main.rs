@@ -4,6 +4,7 @@
 
 mod auth_cli;
 mod daemon;
+mod mcp_bridge;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -39,6 +40,11 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// MCP stdio server for agent sessions (engine-spawned; not for direct
+    /// use). Exposes list_sessions / send_to_session, dialing back to the
+    /// engine named by ZERON_IPC_PORT as the session in ZERON_CHAT_ID.
+    #[command(hide = true)]
+    McpBridge,
 }
 
 #[derive(Subcommand)]
@@ -57,15 +63,15 @@ enum DaemonCommand {
     Status,
 }
 
-/// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
-/// `ZERON_EDGE_URL` overrides (local dev / self-hosting).
-const DEFAULT_EDGE_URL: &str = "https://edge.zeron.sh";
+/// Production edge (this fork's Cloudflare Worker + Durable Objects on the
+/// siki.moe zone). `ZERON_EDGE_URL` overrides (local dev / self-hosting).
+const DEFAULT_EDGE_URL: &str = "https://edge.siki.moe";
 
 /// Production WorkOS AuthKit client id — public knowledge (it appears in every
 /// authorize URL), so baking it in is safe. Overridden by `ZERON_WORKOS_CLIENT_ID`;
 /// set it to the empty string — or set a dev bearer via `ZERON_EDGE_TOKEN` — to
 /// force dev-mode auth instead.
-const DEFAULT_WORKOS_CLIENT_ID: &str = "client_01KWD0EAKZKD50YCQJNYSRE4BY";
+const DEFAULT_WORKOS_CLIENT_ID: &str = "client_01M09AJF16TCBRA7H3BJC9PXEB";
 
 fn edge_url_from_env() -> String {
     std::env::var("ZERON_EDGE_URL")
@@ -169,6 +175,10 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
+        }
+        Some(Command::McpBridge) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(mcp_bridge::run())
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),

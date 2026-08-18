@@ -302,6 +302,7 @@ impl EngineHandle {
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
         let service_for_boot = assembled_service.clone();
+        let ipc_bound = ipc_task.is_some();
         // The instance lock rides into the boot task and is consumed by
         // assembly — held through sign-in onboarding too, because this process
         // owns the data dir from the moment it decided to embed.
@@ -311,6 +312,21 @@ impl EngineHandle {
                 None => {
                     let mut auth_state = auth.watch_state();
                     while !auth_state.borrow().is_signed_in() {
+                        // First sign-in with zero memberships: mint the
+                        // personal workspace so the org gate never appears on
+                        // the solo path (idempotent; the gate stays as the
+                        // fallback if this fails).
+                        let needs_org = matches!(
+                            &*auth_state.borrow(),
+                            zeron_engine::AuthState::NeedsOrganization { .. }
+                        );
+                        if needs_org && let Err(err) = auth.ensure_default_org().await {
+                            tracing::warn!(error = %err,
+                                "default workspace creation failed; org gate remains");
+                        }
+                        if auth_state.borrow().is_signed_in() {
+                            break;
+                        }
                         if auth_state.changed().await.is_err() {
                             state_tx.send_replace(DeferredEngineState::Failed(
                                 "authentication state closed before workspace onboarding".into(),
@@ -336,6 +352,15 @@ impl EngineHandle {
 
             match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
                 Ok(engine_runtime) => {
+                    // Agent MCP bridge dials the IPC port — only when this
+                    // window actually won the bind (a lost race would hand
+                    // the bridge to a DIFFERENT engine's sessions).
+                    if ipc_bound {
+                        engine_runtime
+                            .core()
+                            .sessions
+                            .set_mcp_port(engine_config.ipc_port);
+                    }
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
                     *runtime_for_boot.lock().await = Some(engine_runtime);
                     if service_for_boot.set(service).is_err() {
@@ -510,12 +535,19 @@ pub use zeron_proto::view::{
 // ---------------------------------------------------------------------------
 
 /// One org membership row (tolerant local mirror of the engine's ListOrgs
-/// reply — `{orgs: [{id, organizationId, name}]}`).
+/// reply — `{orgs: [{id, organizationId, name, role}]}`).
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrgRow {
     pub organization_id: String,
     pub name: String,
+    /// The caller's role in this org; absent on pre-role engines.
+    #[serde(default = "default_member_role")]
+    pub role: String,
+}
+
+fn default_member_role() -> String {
+    "member".into()
 }
 
 /// Parse a ListOrgs reply tolerantly (accepts a bare array too).
@@ -2197,6 +2229,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            user_id: None,
         }
     }
 
@@ -2238,6 +2271,7 @@ mod tests {
             parts: Vec::new(),
             created_at: 0,
             device_id: "dev".into(),
+            user_id: None,
             status: None,
             continuation_of: None,
         }
@@ -2585,6 +2619,7 @@ mod tests {
             parts: vec![],
             created_at: 0,
             device_id: "local".into(),
+            user_id: None,
             status: None,
             continuation_of: None,
         };

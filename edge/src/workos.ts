@@ -37,6 +37,17 @@ export interface OrgMembership {
   readonly id: string;
   readonly organizationId: string;
   readonly name: string;
+  /** The caller's role in this org ("admin" | "member"). */
+  readonly role: string;
+}
+
+/** One member of an organization (the team-management surface). */
+export interface OrgMember {
+  readonly membershipId: string;
+  readonly userId: string;
+  readonly email: string;
+  readonly name: string | null;
+  readonly role: string;
 }
 
 interface WireUser {
@@ -56,6 +67,8 @@ interface WireMembership {
   id: string;
   organization_id: string;
   organization_name?: string | null;
+  user_id?: string;
+  role?: { slug?: string } | null;
 }
 
 const failed = async (res: Response): Promise<never> => {
@@ -140,8 +153,136 @@ export const listOrgs = async (apiKey: string, userId: string): Promise<OrgMembe
   return r.data.map((m) => ({
     id: m.id,
     organizationId: m.organization_id,
-    name: m.organization_name ?? m.organization_id
+    name: m.organization_name ?? m.organization_id,
+    role: m.role?.slug ?? "member"
   }));
+};
+
+const get = async (apiKey: string, path: string): Promise<Response> =>
+  fetch(`${API}${path}`, { headers: { authorization: `Bearer ${apiKey}` } });
+
+/** The caller's active membership in one org — the admin gate's evidence.
+ * `undefined` = not a member. */
+export const membershipOf = async (
+  apiKey: string,
+  orgId: string,
+  userId: string
+): Promise<{ membershipId: string; role: string } | undefined> => {
+  const params = new URLSearchParams({
+    user_id: userId,
+    organization_id: orgId,
+    statuses: "active",
+    limit: "1"
+  });
+  const res = await get(apiKey, `/user_management/organization_memberships?${params}`);
+  if (!res.ok) return failed(res);
+  const r = (await res.json()) as { data: WireMembership[] };
+  const m = r.data[0];
+  return m ? { membershipId: m.id, role: m.role?.slug ?? "member" } : undefined;
+};
+
+/** Every active member of an org, with user identity resolved (the members
+ * list is small — team scale — so the per-user lookups are fine). */
+export const listMembers = async (apiKey: string, orgId: string): Promise<OrgMember[]> => {
+  const params = new URLSearchParams({ organization_id: orgId, statuses: "active", limit: "100" });
+  const res = await get(apiKey, `/user_management/organization_memberships?${params}`);
+  if (!res.ok) return failed(res);
+  const r = (await res.json()) as { data: WireMembership[] };
+  const members = await Promise.all(
+    r.data.map(async (m): Promise<OrgMember> => {
+      let email = m.user_id ?? "";
+      let name: string | null = null;
+      if (m.user_id) {
+        const userRes = await get(apiKey, `/user_management/users/${m.user_id}`);
+        if (userRes.ok) {
+          const u = (await userRes.json()) as WireUser;
+          email = u.email;
+          name = [u.first_name, u.last_name].filter(Boolean).join(" ") || null;
+        }
+      }
+      return {
+        membershipId: m.id,
+        userId: m.user_id ?? "",
+        email,
+        name,
+        role: m.role?.slug ?? "member"
+      };
+    })
+  );
+  return members;
+};
+
+/** Add a user to an org by EMAIL: an already-registered user gets an active
+ * membership immediately; an unknown email gets a WorkOS invitation instead.
+ * Role slugs are per-environment config — fall back to the default role
+ * rather than failing (same recovery as createOrg). */
+export const addMemberByEmail = async (
+  apiKey: string,
+  orgId: string,
+  email: string,
+  role: string
+): Promise<{ added: boolean; invited: boolean }> => {
+  const userRes = await get(
+    apiKey,
+    `/user_management/users?${new URLSearchParams({ email, limit: "1" })}`
+  );
+  if (!userRes.ok) return failed(userRes);
+  const users = (await userRes.json()) as { data: WireUser[] };
+  const user = users.data[0];
+  if (user) {
+    const withRole = await post(apiKey, "/user_management/organization_memberships", {
+      user_id: user.id,
+      organization_id: orgId,
+      role_slug: role
+    });
+    if (!withRole.ok) {
+      const fallback = await post(apiKey, "/user_management/organization_memberships", {
+        user_id: user.id,
+        organization_id: orgId
+      });
+      if (!fallback.ok) return failed(fallback);
+    }
+    return { added: true, invited: false };
+  }
+  const invite = await post(apiKey, "/user_management/invitations", {
+    email,
+    organization_id: orgId,
+    ...(role === "admin" ? { role_slug: "admin" } : {})
+  });
+  if (!invite.ok) return failed(invite);
+  return { added: false, invited: true };
+};
+
+/** Change a member's role ("admin" | "member"). */
+export const setMemberRole = async (
+  apiKey: string,
+  membershipId: string,
+  role: string
+): Promise<void> => {
+  const res = await fetch(`${API}/user_management/organization_memberships/${membershipId}`, {
+    method: "PUT",
+    headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ role_slug: role })
+  });
+  if (!res.ok) return failed(res);
+};
+
+/** Remove a member from an org. */
+export const removeMember = async (apiKey: string, membershipId: string): Promise<void> => {
+  const res = await fetch(`${API}/user_management/organization_memberships/${membershipId}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${apiKey}` }
+  });
+  if (!res.ok) return failed(res);
+};
+
+/** Delete an organization outright. */
+export const deleteOrg = async (apiKey: string, orgId: string): Promise<void> => {
+  const res = await fetch(`${API}/organizations/${orgId}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${apiKey}` }
+  });
+  if (!res.ok) return failed(res);
 };
 
 /** Create an organization and make the user its first (admin) member. */

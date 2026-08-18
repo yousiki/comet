@@ -6,6 +6,35 @@ import XCTest
 @testable import Zeron
 
 final class ChatFramesTests: XCTestCase {
+    private func httpBody(_ frames: [Data]) -> Data {
+        var body = Data()
+        for frame in frames {
+            var length = UInt32(frame.count).littleEndian
+            withUnsafeBytes(of: &length) { body.append(contentsOf: $0) }
+            body.append(frame)
+        }
+        return body
+    }
+
+    private func state(_ head: UInt64, checkpointSeq: UInt64 = 0,
+                       checkpointSize: UInt64 = 0) -> Data {
+        ChatWire.encode(ChatFrameType.state,
+                        header: ["headSeq": head, "seqFloor": checkpointSeq,
+                                 "checkpointSeq": checkpointSeq,
+                                 "checkpointSize": checkpointSize,
+                                 "rowCount": head, "rowBytes": 100])
+    }
+
+    private func row(_ seq: UInt64, batchId: String) -> Data {
+        ChatWire.encode(ChatFrameType.row,
+                        header: ["seq": seq, "device": "dev-b", "batchId": batchId],
+                        payload: Data([UInt8(truncatingIfNeeded: seq)]))
+    }
+
+    private func done(_ head: UInt64) -> Data {
+        ChatWire.encode(ChatFrameType.rowsDone, header: ["headSeq": head])
+    }
+
     func testPinsTheWireLayout() {
         // Must match the Rust/TS vector: [type][headerLen u32 LE][header][payload].
         let frame = ChatWire.encode(ChatFrameType.push,
@@ -80,5 +109,219 @@ final class ChatFramesTests: XCTestCase {
         // must not be misread as "no checkpoint" (2026-08-10 cutover gauntlet).
         XCTAssertEqual(chatPlanCatchUp(cursor: 0, state: state(0, 0, 5_000), frontierContained: false),
                        .checkpointThenRows(after: 0))
+    }
+
+    func testHTTPPushAckIsStrictAndBatchBound() {
+        XCTAssertEqual(chatDecodeHTTPPushAck(Data(#"{"batchId":"b1","seq":7,"dup":false}"#.utf8),
+                                             expectedBatchId: "b1"),
+                       ChatHTTPPushAck(batchId: "b1", seq: 7))
+        XCTAssertNil(chatDecodeHTTPPushAck(Data(#"{"batchId":"other","seq":7}"#.utf8),
+                                           expectedBatchId: "b1"))
+        XCTAssertNil(chatDecodeHTTPPushAck(Data(#"{"batchId":"b1","seq":true}"#.utf8),
+                                           expectedBatchId: "b1"))
+        XCTAssertNil(chatDecodeHTTPPushAck(Data(#"{"batchId":"b1","seq":-1}"#.utf8),
+                                           expectedBatchId: "b1"))
+        XCTAssertNil(chatDecodeHTTPPushAck(Data(#"{"batchId":"b1","seq":1.5}"#.utf8),
+                                           expectedBatchId: "b1"))
+        XCTAssertNil(chatDecodeHTTPPushAck(Data(#"{"batchId":"b1","seq":0}"#.utf8),
+                                           expectedBatchId: "b1"))
+    }
+
+    func testHTTPPullRequiresCompleteOrderedFrameStream() {
+        let valid = httpBody([state(3), row(1, batchId: "foreign"),
+                              row(2, batchId: "own"), row(3, batchId: "later"), done(3)])
+        let pull = chatDecodeHTTPPull(valid)
+        XCTAssertEqual(pull?.headSeq, 3)
+        XCTAssertEqual(pull?.rows.map(\.seq), [1, 2, 3])
+        XCTAssertTrue(chatHTTPPullCoversFrontier(capturedCursor: 0, pull: pull!))
+
+        var trailing = valid
+        trailing.append(0xff)
+        XCTAssertNil(chatDecodeHTTPPull(trailing))
+        XCTAssertNil(chatDecodeHTTPPull(Data(valid.dropLast())))
+        let gap = chatDecodeHTTPPull(httpBody([state(3), row(1, batchId: "b1"),
+                                               row(3, batchId: "b3"), done(3)]))!
+        XCTAssertFalse(chatHTTPPullCoversFrontier(capturedCursor: 0, pull: gap))
+        XCTAssertNil(chatDecodeHTTPPull(httpBody([state(1), done(2)])))
+        XCTAssertNil(chatDecodeHTTPPull(httpBody([state(1),
+                                                  ChatWire.encode(ChatFrameType.probeOk,
+                                                                  header: [:]), done(1)])))
+    }
+
+    func testHTTPFrontierCoverageAccountsForCheckpoint() {
+        let body = httpBody([state(8, checkpointSeq: 5, checkpointSize: 500),
+                             row(6, batchId: "b6"), row(7, batchId: "b7"),
+                             row(8, batchId: "b8"), done(8)])
+        let pull = chatDecodeHTTPPull(body)!
+        XCTAssertTrue(chatHTTPPullCoversFrontier(capturedCursor: 2, pull: pull))
+
+        let gap = chatDecodeHTTPPull(httpBody([
+            state(8, checkpointSeq: 5, checkpointSize: 500),
+            row(7, batchId: "b7"), row(8, batchId: "b8"), done(8),
+        ]))!
+        XCTAssertFalse(chatHTTPPullCoversFrontier(capturedCursor: 2, pull: gap))
+    }
+
+    func testHTTPAckDecisionTableDefersUntilAppliedAndChecksRowIdentity() {
+        let pull = chatDecodeHTTPPull(httpBody([
+            state(7), row(6, batchId: "foreign"), row(7, batchId: "ours"), done(7),
+        ]))!
+        let ours = ChatHTTPPushAck(batchId: "ours", seq: 7)
+        XCTAssertEqual(chatHTTPPushDisposition(prePushCursor: 5, pullSince: 5,
+                                               pull: pull, pullApplied: false,
+                                               ack: ours), .retry)
+        XCTAssertEqual(chatHTTPPushDisposition(prePushCursor: 5, pullSince: 5,
+                                               pull: pull, pullApplied: true,
+                                               ack: ours), .retire)
+        XCTAssertEqual(chatHTTPPushDisposition(
+            prePushCursor: 5, pullSince: 5, pull: pull, pullApplied: true,
+            ack: ChatHTTPPushAck(batchId: "ours", seq: 6)), .reset(cursor: 0))
+        XCTAssertEqual(chatHTTPPushDisposition(
+            prePushCursor: 5, pullSince: 5, pull: pull, pullApplied: true,
+            ack: ChatHTTPPushAck(batchId: "ours", seq: 8)), .reset(cursor: 0))
+
+        // A dedupe ack already covered by the request cursor has no row in
+        // this response, so its identity is not proven without a checkpoint.
+        XCTAssertEqual(chatHTTPPushDisposition(
+            prePushCursor: 5, pullSince: 5, pull: pull, pullApplied: true,
+            ack: ChatHTTPPushAck(batchId: "old", seq: 4)), .reset(cursor: 0))
+
+        // Even a confirmed checkpoint frontier cannot prove that this numeric
+        // sequence still belongs to our batch after an ABA room reset.
+        let checkpointed = chatDecodeHTTPPull(httpBody([
+            state(7, checkpointSeq: 5, checkpointSize: 500),
+            row(6, batchId: "b6"), row(7, batchId: "b7"), done(7),
+        ]))!
+        XCTAssertEqual(chatHTTPPushDisposition(
+            prePushCursor: 5, pullSince: 3, pull: checkpointed, pullApplied: true,
+            ack: ChatHTTPPushAck(batchId: "old", seq: 4)), .reset(cursor: 5))
+    }
+
+    func testHTTPAckIdentityDetectsABARoomResetBeforeRowsApply() {
+        let pull = chatDecodeHTTPPull(httpBody([
+            state(14), row(11, batchId: "new-11"), row(12, batchId: "new-12"),
+            row(13, batchId: "foreign"), row(14, batchId: "new-14"), done(14),
+        ]))!
+        let oldIncarnationAck = ChatHTTPPushAck(batchId: "ours", seq: 13)
+
+        XCTAssertTrue(chatHTTPPullCoversFrontier(capturedCursor: 10, pull: pull))
+        XCTAssertTrue(chatAcknowledgementsRequireReset(
+            pullSince: 10, pull: pull,
+            acknowledgements: [oldIncarnationAck]))
+        XCTAssertEqual(chatHTTPPushDisposition(
+            prePushCursor: 10, pullSince: 10, pull: pull, pullApplied: false,
+            ack: oldIncarnationAck), .reset(cursor: 0))
+    }
+
+    func testRememberedWSAckRequiresIdentityProofWhenHTTPStagedNone() {
+        let pull = chatDecodeHTTPPull(httpBody([
+            state(4), row(3, batchId: "foreign"), row(4, batchId: "new-4"), done(4),
+        ]))!
+        let rememberedOnly = [ChatHTTPPushAck(batchId: "ws-acked", seq: 3)]
+
+        XCTAssertTrue(chatAcknowledgementsRequireReset(
+            pullSince: 2, pull: pull,
+            acknowledgements: rememberedOnly))
+    }
+
+    func testHTTPPullSinceBacktracksBehindEveryProofAckWithoutUnderflow() {
+        XCTAssertEqual(chatHTTPPullSince(
+            prePushCursor: 10,
+            acknowledgements: [ChatHTTPPushAck(batchId: "old", seq: 4),
+                               ChatHTTPPushAck(batchId: "new", seq: 12)]), 3)
+        XCTAssertEqual(chatHTTPPullSince(
+            prePushCursor: 10,
+            acknowledgements: [ChatHTTPPushAck(batchId: "malformed", seq: 0)]), 0)
+        XCTAssertEqual(chatHTTPPullSince(prePushCursor: 10, acknowledgements: []), 10)
+    }
+
+    func testHTTPProofCleanupClearsOnlySnapshotTuplesAndAvoidsResetLoop() {
+        let pull = chatDecodeHTTPPull(httpBody([
+            state(7), row(4, batchId: "http"), row(5, batchId: "foreign-5"),
+            row(6, batchId: "remembered"), row(7, batchId: "late"), done(7),
+        ]))!
+        let staged = ChatHTTPPushAck(batchId: "http", seq: 4)
+        let remembered = ChatHTTPPushAck(batchId: "remembered", seq: 6)
+        let proofSnapshot = [staged, remembered]
+        let pullSince = chatHTTPPullSince(prePushCursor: 7,
+                                          acknowledgements: proofSnapshot)
+
+        XCTAssertEqual(pullSince, 3)
+        XCTAssertTrue(chatHTTPPullCoversFrontier(capturedCursor: pullSince, pull: pull))
+        XCTAssertFalse(chatAcknowledgementsRequireReset(
+            pullSince: pullSince, pull: pull, acknowledgements: proofSnapshot))
+        XCTAssertEqual(chatHTTPPushDisposition(
+            prePushCursor: 7, pullSince: pullSince, pull: pull,
+            pullApplied: true, ack: staged), .retire)
+        let proven = chatHTTPProvenAcknowledgements(
+            pullSince: pullSince, pull: pull, acknowledgements: proofSnapshot)
+        XCTAssertEqual(Set(proven), Set(proofSnapshot))
+
+        // The staged tuple may arrive through WS after dispatch; its exact
+        // proof clears that late copy too. An unrelated post-dispatch ACK stays.
+        let late = ChatHTTPPushAck(batchId: "late", seq: 7)
+        XCTAssertEqual(chatHTTPRetainedAcknowledgements(
+            current: [remembered, staged, late], proven: proven), [late])
+
+        // A pure-HTTP proof creates no journal entry, so the next cycle keeps
+        // its real cursor and has no acknowledgement that can force a reset.
+        let noJournal = chatHTTPRetainedAcknowledgements(current: [], proven: [staged])
+        XCTAssertTrue(noJournal.isEmpty)
+        XCTAssertEqual(chatHTTPPullSince(prePushCursor: 7,
+                                         acknowledgements: noJournal), 7)
+        XCTAssertFalse(chatAcknowledgementsRequireReset(
+            pullSince: 7,
+            pull: chatDecodeHTTPPull(httpBody([state(7), done(7)]))!,
+            acknowledgements: noJournal))
+    }
+
+    func testHTTPResetKeepsPreResetAckAndChoosesSafeCursor() {
+        let emptyReset = chatDecodeHTTPPull(httpBody([state(0), done(0)]))!
+        XCTAssertEqual(chatHTTPPushDisposition(
+            prePushCursor: 10, pullSince: 10, pull: emptyReset, pullApplied: true,
+            ack: ChatHTTPPushAck(batchId: "ours", seq: 11)), .reset(cursor: 0))
+
+        let checkpointReset = chatDecodeHTTPPull(httpBody([
+            state(5, checkpointSeq: 3, checkpointSize: 100),
+            row(4, batchId: "b4"), row(5, batchId: "b5"), done(5),
+        ]))!
+        XCTAssertEqual(chatHTTPPushDisposition(
+            prePushCursor: 10, pullSince: 10,
+            pull: checkpointReset, pullApplied: true,
+            ack: ChatHTTPPushAck(batchId: "ours", seq: 11)), .reset(cursor: 3))
+    }
+
+    func testAckPastHeadConfirmsResetEvenAtZeroCursor() {
+        let empty = ChatStateHeader([
+            "headSeq": 0, "seqFloor": 0, "checkpointSeq": 0, "checkpointSize": 0,
+        ])!
+        XCTAssertEqual(chatHTTPResetCursor(
+            capturedCursor: 0, state: empty,
+            stagedAcks: [ChatHTTPPushAck(batchId: "old-incarnation", seq: 1)]), 0)
+        XCTAssertNil(chatHTTPResetCursor(capturedCursor: 0, state: empty))
+    }
+
+    func testResetReplayRestoresAckedSnapshotButNeverPermanentReject() {
+        XCTAssertEqual(
+            chatResetReplayOrder(
+                acknowledgedBatchIds: ["acked-before-reset"],
+                snapshotBatchIds: ["acked-before-reset", "permanent", "still-pending"],
+                pendingBatchIds: ["still-pending", "new-during-await"],
+                permanentlyRejected: ["permanent"]),
+            ["acked-before-reset", "still-pending", "new-during-await"])
+    }
+
+    func testWSResetUsesExactSafeCursorAndInvalidatesOldSession() {
+        let bare = ChatStateHeader([
+            "headSeq": 4, "seqFloor": 0, "checkpointSeq": 0, "checkpointSize": 0,
+        ])!
+        XCTAssertEqual(chatHTTPResetCursor(capturedCursor: 9, state: bare), 0)
+
+        let checkpointed = ChatStateHeader([
+            "headSeq": 4, "seqFloor": 2, "checkpointSeq": 2, "checkpointSize": 100,
+        ])!
+        XCTAssertEqual(chatHTTPResetCursor(capturedCursor: 9, state: checkpointed), 2)
+        XCTAssertTrue(chatSessionVersionIsCurrent(7, currentVersion: 7))
+        XCTAssertFalse(chatSessionVersionIsCurrent(7, currentVersion: 8))
     }
 }

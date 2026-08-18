@@ -3,5 +3,6 @@
 declare module "cloudflare:test" {
   interface ProvidedEnv {
     TEST_LOG: DurableObjectNamespace;
+    CHAT_ROOM: DurableObjectNamespace;
   }
 }

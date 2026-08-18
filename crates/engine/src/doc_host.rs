@@ -25,9 +25,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use zeron_doc::{
-    COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
-    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
-    SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
+    COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, CommandOrigin, DocError,
+    EvaluationContext, MessagePart, MessageRole, MessageStatus, SessionCommandEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries,
 };
 use zeron_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
@@ -121,11 +121,22 @@ impl EdgeConfig {
     /// the bearer is re-fetched before every connect, so reconnects after a
     /// token expiry present a fresh `?token=` instead of the boot-time one.
     pub fn room_url(&self, path: impl Into<String>) -> Arc<dyn zeron_sync::UrlProvider> {
+        self.room_url_with(path, "")
+    }
+
+    /// [`Self::room_url`] with extra query params appended after the token
+    /// and device (e.g. `"&role=host"` for a chat3 host claim).
+    pub fn room_url_with(
+        &self,
+        path: impl Into<String>,
+        extra_query: impl Into<String>,
+    ) -> Arc<dyn zeron_sync::UrlProvider> {
         let ws_base = self.url.replacen("http", "ws", 1);
         Arc::new(EdgeRoomUrl {
             base: format!("{}{}", ws_base.trim_end_matches('/'), path.into()),
             token: self.token.clone(),
             device_id: self.device_id.clone(),
+            extra_query: extra_query.into(),
         })
     }
 }
@@ -134,6 +145,7 @@ struct EdgeRoomUrl {
     base: String,
     token: Arc<dyn zeron_rpc::TokenSource>,
     device_id: String,
+    extra_query: String,
 }
 
 impl zeron_sync::UrlProvider for EdgeRoomUrl {
@@ -141,6 +153,7 @@ impl zeron_sync::UrlProvider for EdgeRoomUrl {
         let token = self.token.clone();
         let base = self.base.clone();
         let device = self.device_id.clone();
+        let extra = self.extra_query.clone();
         Box::pin(async move {
             let token = token.token().await.ok_or_else(|| {
                 zeron_sync::SyncError::Auth("no access token (signed out)".into())
@@ -149,14 +162,33 @@ impl zeron_sync::UrlProvider for EdgeRoomUrl {
             if !device.is_empty() {
                 url.push_str(&format!("&device={device}"));
             }
+            url.push_str(&extra);
             Ok(url)
         })
     }
 }
 
+/// Room-path prefix for a chat's sync generation: 2 = `chat2` (single-owner),
+/// 3 = `chat3` (org-shared). Gen 1 never dials a room.
+fn room_prefix(room_gen: u32) -> &'static str {
+    if room_gen >= 3 { "chat3" } else { "chat2" }
+}
+
+/// A 403 is terminal only for a foreign legacy room: chat2 is intentionally
+/// single-owner, so a non-owner can do nothing until the registry flips the
+/// chat to org-shared chat3. A host denial or any chat3 denial may be a token,
+/// claim, or deployment problem and must keep the normal retry path alive.
+fn should_park_access_denied(room_gen: u32, is_host: bool) -> bool {
+    room_gen < 3 && !is_host
+}
+
 #[derive(Debug, Clone)]
 pub struct DocHostConfig {
     pub device_id: String,
+    /// The signed-in user — stamped on command entries this engine queues so
+    /// shared sessions can render "who sent this". Empty when unknown (dev
+    /// setups without auth); empty stamps nothing.
+    pub user_id: String,
     /// Harness for doc-command runs on chats without a workspace `config` row.
     pub default_harness: HarnessId,
     /// When present, each opened chat joins its edge session room. `None` = fully
@@ -180,6 +212,11 @@ struct DocHostInner {
     /// Tracks every spawned worker so `shutdown_workers` can await them.
     tasks: TaskTracker,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
+    /// Local room updates waiting for a client, keyed outside the handle so
+    /// they survive chat2 -> chat3 handle replacement. This is the in-memory
+    /// handoff queue, not a second CRDT authority; bytes stay until installed
+    /// into a client's ack-backed pending queue.
+    chat2_pending_local: Mutex<HashMap<String, Vec<Vec<u8>>>>,
     /// chat2 seeds in flight (one per chat — reopen storms must not race
     /// duplicate rebuild+checkpoint POSTs; benign server-side, wasteful).
     seeding: Mutex<HashSet<String>>,
@@ -190,6 +227,12 @@ struct DocHostInner {
     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
     /// discipline — diff_sync's untimed client hung on dead links).
     http: reqwest::Client,
+    /// chat_id → the live turn's agent-send hop depth (from the executed
+    /// command's `origin`; 0 for human sends). `send_to_session` reads it to
+    /// stamp `hops + 1` on outgoing sends — the A→B→A ping-pong breaker.
+    turn_origins: Mutex<HashMap<String, u32>>,
+    /// chat_id → sends spent this turn (reset when a new turn dispatches).
+    send_budgets: Mutex<HashMap<String, u32>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -235,11 +278,6 @@ pub struct ChatDocHandle {
     /// chat2 relay client (docs/chat2-sync.md C3) — populated once the
     /// registry names roomGen 2 for this chat and the join resolves.
     chat2: Mutex<Option<zeron_sync::ChatClient>>,
-    /// Local commits made before the relay connects (the dial can take up
-    /// to a minute; offline, forever): buffered here by the subscription
-    /// below and drained into the client on join (review B3 — a user
-    /// message typed during the dial must not silently never sync).
-    chat2_pending_local: Mutex<Vec<Vec<u8>>>,
     /// Local-update feed into the chat2 client (drop = unsubscribe).
     chat2_local_sub: Mutex<Option<loro::Subscription>>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
@@ -293,11 +331,14 @@ impl ChatDocHandle {
 
     /// Write a complete user message entry, idempotent by id (the client-minted message
     /// id — a re-executed command or optimistic echo never duplicates the entry).
+    /// `author` is the issuing user (from the command entry) — `agent:{chatId}`
+    /// for agent-to-agent sends; None on entries from pre-attribution writers.
     pub fn write_user_message(
         &self,
         message_id: &str,
         text: &str,
         created_at: i64,
+        author: Option<&str>,
     ) -> Result<(), DocError> {
         if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
             return Ok(());
@@ -311,6 +352,7 @@ impl ChatDocHandle {
             }],
             created_at,
             device_id: self.device_id.clone(),
+            user_id: author.map(str::to_owned),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         })
@@ -390,14 +432,72 @@ impl DocHost {
                 shutdown: CancellationToken::new(),
                 tasks: TaskTracker::new(),
                 handles: Mutex::new(HashMap::new()),
+                chat2_pending_local: Mutex::new(HashMap::new()),
                 seeding: Mutex::new(HashSet::new()),
                 seed_waiting: Mutex::new(HashSet::new()),
                 http: reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new()),
+                turn_origins: Mutex::new(HashMap::new()),
+                send_budgets: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    fn buffer_chat2_update(inner: &DocHostInner, chat_id: &str, bytes: Vec<u8>) {
+        lock(&inner.chat2_pending_local)
+            .entry(chat_id.to_string())
+            .or_default()
+            .push(bytes);
+    }
+
+    fn prepend_chat2_update(inner: &DocHostInner, chat_id: &str, bytes: Vec<u8>) {
+        lock(&inner.chat2_pending_local)
+            .entry(chat_id.to_string())
+            .or_default()
+            .insert(0, bytes);
+    }
+
+    /// Install a room client and atomically hand it every update buffered for
+    /// this chat, including updates carried across an older generation's
+    /// handle. The local-update callback takes the same client lock before
+    /// choosing client vs host-level queue, closing the install/enqueue gap.
+    fn install_chat2_client(
+        &self,
+        handle: &ChatDocHandle,
+        client: zeron_sync::ChatClient,
+    ) -> usize {
+        let mut client_slot = lock(&handle.chat2);
+        let pending = lock(&self.inner.chat2_pending_local)
+            .remove(&handle.chat_id)
+            .unwrap_or_default();
+        let count = pending.len();
+        for update in pending {
+            client.enqueue_update(update);
+        }
+        *client_slot = Some(client);
+        count
+    }
+
+    /// Park an access-denied room client without dropping local work. Pending
+    /// bytes move to the host-level queue so they survive eviction and the
+    /// chat2 -> chat3 replacement; later local updates see `None` under the
+    /// same client lock and append to that queue too.
+    fn park_chat2_client(&self, handle: &ChatDocHandle) -> usize {
+        let mut client_slot = lock(&handle.chat2);
+        let pending = client_slot
+            .take()
+            .map(zeron_sync::ChatClient::into_pending_updates)
+            .unwrap_or_default();
+        let count = pending.len();
+        if !pending.is_empty() {
+            lock(&self.inner.chat2_pending_local)
+                .entry(handle.chat_id.clone())
+                .or_default()
+                .extend(pending);
+        }
+        count
     }
 
     /// Every background task rides the tracker, raced against the shutdown
@@ -512,18 +612,36 @@ impl DocHost {
                     return; // edge-less engine: nothing to migrate onto
                 };
                 let Some(ws) = host.workspace() else { continue };
+                let minted = host.minted_room_gen();
                 let chats: Vec<zeron_proto::Chat> = ws.watch_chats().borrow().clone();
                 let device = host.inner.config.device_id.clone();
                 let now = now_ms();
                 let candidate = chats.into_iter().find(|c| {
                     c.device_id == device
-                        && c.room_gen.unwrap_or(1) < 2
+                        && c.room_gen.unwrap_or(1) < minted
                         && !attempted
                             .get(&c.id)
                             .is_some_and(|t| now - *t <= RETRY_GAP_MS)
                 });
                 let Some(chat) = candidate else { continue };
                 attempted.insert(chat.id.clone(), now);
+                // chat2 → chat3 needs NO rebuild: the doc lineage is already
+                // thin and unchanged, only the room moves. Flip the row; the
+                // cutover watcher retires the stale handle and the reopen
+                // dials chat3 with role=host, where the bootstrap-checkpoint
+                // heal seeds the fresh room from the same lineage. (Rebuilding
+                // would mint a NEW lineage and duplicate transcripts on every
+                // reader that already holds the chat2 one.)
+                if chat.room_gen.unwrap_or(1) >= 2 {
+                    match ws.set_chat_room_gen(&chat.id, minted) {
+                        Ok(true) => tracing::info!(chat = %chat.id, gen = minted,
+                            "migration sweep: flipped chat2 room to org-shared chat3"),
+                        Ok(false) => {}
+                        Err(err) => tracing::warn!(chat = %chat.id, error = %err,
+                            "migration sweep: gen flip failed"),
+                    }
+                    continue;
+                }
                 // A cached (warm) handle never re-enters open()'s build path,
                 // so arm the quiet-waiter directly; a cold chat opens, which
                 // arms it on the way up.
@@ -562,11 +680,11 @@ impl DocHost {
                 if chats.changed().await.is_err() {
                     return; // workspace host gone (shutdown)
                 }
-                let flipped: Vec<String> = chats
+                let flipped: Vec<(String, u32)> = chats
                     .borrow_and_update()
                     .iter()
                     .filter(|c| c.room_gen.unwrap_or(1) >= 2)
-                    .map(|c| c.id.clone())
+                    .map(|c| (c.id.clone(), c.room_gen.unwrap_or(1)))
                     .collect();
                 if flipped.is_empty() {
                     continue;
@@ -575,14 +693,21 @@ impl DocHost {
                 let mut stuck_live: Vec<(String, Arc<ChatDocHandle>)> = Vec::new();
                 {
                     let mut handles = lock(&host.inner.handles);
-                    for chat_id in flipped {
+                    for (chat_id, row_gen) in flipped {
                         let Some(handle) = handles.get(&chat_id) else {
                             continue;
                         };
-                        if handle.room_gen >= 2 {
-                            continue; // already chat2-mode
+                        if handle.room_gen >= row_gen {
+                            continue; // already on (or past) the named room
                         }
                         let live_writer = Arc::strong_count(&handle.doc) > 1;
+                        if live_writer && handle.room_gen >= 2 {
+                            // chat2 → chat3 under a live run: same lineage,
+                            // no seed needed — leave the run writing (local
+                            // persistence is unaffected); the next open after
+                            // it quiesces dials the chat3 room.
+                            continue;
+                        }
                         if live_writer {
                             // A run is writing into this s2 doc while the
                             // registry already says chat2 — the born-gen2
@@ -645,6 +770,17 @@ impl DocHost {
         &self.inner.config.device_id
     }
 
+    /// The room generation this engine mints for new/migrated chats: 3
+    /// (org-shared chat3) whenever an edge is configured — synced and dev
+    /// profiles always carry an org — else 2 (edge-less chats never dial).
+    fn minted_room_gen(&self) -> u32 {
+        if self.inner.config.edge.is_some() {
+            3
+        } else {
+            2
+        }
+    }
+
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -669,12 +805,14 @@ impl DocHost {
         // (2026-08-11).
         let registry_gen = match chat_row.as_ref() {
             Some(row) => row.room_gen.unwrap_or(1),
-            None => 2,
+            None => self.minted_room_gen(),
         };
         {
             let mut handles = lock(&self.inner.handles);
             if let Some(handle) = handles.get(chat_id) {
-                let stale = registry_gen >= 2 && handle.room_gen < 2;
+                // Stale = built for an older room generation than the registry
+                // names (s2→chat2 seed, or the chat2→chat3 org-share flip).
+                let stale = registry_gen >= 2 && handle.room_gen < registry_gen;
                 if (stale || handle.retired.load(Ordering::Relaxed)) && !self.pinned(handle) {
                     // A seed flipped this chat under a cached fat handle
                     // (review B1): drop it so this open converges onto the
@@ -701,25 +839,56 @@ impl DocHost {
         let stored = self.inner.store.load_snapshot_with_cursor(chat_id)?;
         let stored_epoch = stored.as_ref().map(|(_, _, e)| *e).unwrap_or(0);
         let room_gen = if stored_epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
-            if registry_gen < 2
-                && let Some(ws) = self.workspace()
-            {
-                let _ = ws.set_chat_room_gen(chat_id, 2);
-                tracing::info!(chat = %chat_id,
-                    "completed interrupted chat2 flip (local epoch 2, registry said s2)");
+            if registry_gen < 2 {
+                let minted = self.minted_room_gen().max(stored_epoch);
+                if let Some(ws) = self.workspace() {
+                    let _ = ws.set_chat_room_gen(chat_id, minted);
+                    tracing::info!(chat = %chat_id, room_gen = minted, stored_epoch,
+                        "completed interrupted room-gen flip (local synced epoch ahead of registry)");
+                }
+                minted
+            } else if stored_epoch > registry_gen {
+                // The registry projection can lag a completed local cutover.
+                // Never reconnect a generation-3 cursor to the generation-2
+                // room; repair the row best-effort and stay on the newer
+                // cursor namespace recorded with the snapshot.
+                if let Some(ws) = self.workspace() {
+                    let _ = ws.set_chat_room_gen(chat_id, stored_epoch);
+                }
+                stored_epoch
+            } else {
+                registry_gen
             }
-            2
         } else {
             registry_gen
         };
         let mut snapshot_len = 0usize;
         let mut chat2_cursor = 0u64;
+        // Until an own batch is acked in a newer room, retain the minimum
+        // thin-lineage epoch. Remote catch-up alone must not suppress the
+        // crash-time full-local replay.
+        let mut chat2_epoch = stored_epoch
+            .max(crate::chat2_host::CHAT2_DOC_EPOCH)
+            .min(room_gen);
         let mut requeue_commands: Vec<SessionCommandEntry> = Vec::new();
         let doc = if room_gen >= 2 {
             match stored {
                 Some((bytes, cursor, epoch)) if epoch >= crate::chat2_host::CHAT2_DOC_EPOCH => {
                     snapshot_len = bytes.len();
-                    chat2_cursor = cursor;
+                    // A room generation owns its own seq namespace. Moving a
+                    // thin doc from chat2 to a fresh chat3 room must not carry
+                    // the chat2 cursor across: start at zero and enqueue the
+                    // complete local update log, including work that was
+                    // parked while chat2 still rejected this foreign device.
+                    chat2_cursor = if room_gen > epoch {
+                        tracing::info!(chat = %chat_id, from_gen = epoch, to_gen = room_gen,
+                            old_cursor = cursor,
+                            "room generation advanced; resetting cursor and requeueing full local doc");
+                        0
+                    } else {
+                        cursor
+                    };
+                    chat2_epoch = epoch;
                     let raw = loro::LoroDoc::new();
                     raw.import(&bytes)
                         .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
@@ -773,8 +942,8 @@ impl DocHost {
                     SessionDoc::init(chat_id)?
                 }
                 None => {
-                    // Born on chat2 (or a cold reader's first open): stamp
-                    // the epoch-2 lineage NOW. Plain snapshot saves preserve
+                    // Born on a thin room (or a cold reader's first open):
+                    // stamp its cursor namespace NOW. Plain snapshot saves preserve
                     // an existing row's epoch but default a NEW row to 0 —
                     // without this stamp, the next open reads "pre-chat2
                     // doc" and the M3 adopt DISCARDS everything written
@@ -827,7 +996,6 @@ impl DocHost {
             retired: AtomicBool::new(false),
             checkpointing: Arc::new(AtomicBool::new(false)),
             chat2: Mutex::new(None),
-            chat2_pending_local: Mutex::new(Vec::new()),
             chat2_local_sub: Mutex::new(None),
             _sub: sub,
         });
@@ -856,6 +1024,8 @@ impl DocHost {
                 // pending buffer the join drains — nothing composed during
                 // (or before) the dial is lost to the room.
                 let weak_push = Arc::downgrade(&handle);
+                let weak_host = Arc::downgrade(&self.inner);
+                let pending_chat = chat_id.to_string();
                 let sub = doc
                     .doc()
                     .subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
@@ -867,7 +1037,15 @@ impl DocHost {
                             let client_guard = lock(&handle.chat2);
                             match &*client_guard {
                                 Some(client) => client.enqueue_update(bytes.clone()),
-                                None => lock(&handle.chat2_pending_local).push(bytes.clone()),
+                                None => {
+                                    if let Some(inner) = weak_host.upgrade() {
+                                        DocHost::buffer_chat2_update(
+                                            &inner,
+                                            &pending_chat,
+                                            bytes.clone(),
+                                        );
+                                    }
+                                }
                             }
                         }
                         true
@@ -895,12 +1073,20 @@ impl DocHost {
                 // first batch; once acked the cursor moves and this never
                 // re-arms.
                 if chat2_cursor == 0 {
+                    // Serialize with the local-update callback. The full log
+                    // subsumes every delta buffered before this point, but the
+                    // individual deltas remain useful if the full batch is
+                    // permanently rejected at the row-size boundary. Prepend
+                    // the full log and preserve the carry-over suffix: on
+                    // success the repeats are idempotent; on rejection the
+                    // small deltas can still drain after an owner seed.
+                    let _client_guard = lock(&handle.chat2);
                     match doc
                         .doc()
                         .export(loro::ExportMode::updates(&loro::VersionVector::default()))
                     {
                         Ok(bytes) if !bytes.is_empty() => {
-                            lock(&handle.chat2_pending_local).push(bytes);
+                            Self::prepend_chat2_update(&self.inner, chat_id, bytes);
                         }
                         Ok(_) => {}
                         Err(err) => {
@@ -909,7 +1095,7 @@ impl DocHost {
                         }
                     }
                 }
-                self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor);
+                self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor, chat2_epoch);
             } else {
                 // Straggler gen-1 chat (the s2 client is gone — post-cutover,
                 // no device reads or writes an s2 room). The local fat doc
@@ -935,27 +1121,50 @@ impl DocHost {
     /// capped jittered backoff, wake redial — and the client resolves only
     /// after full catch-up (checkpoint + rows), so "joined" here means
     /// "transcript converged".
-    fn spawn_chat2_join(&self, edge: EdgeConfig, handle: &Arc<ChatDocHandle>, cursor: u64) {
+    fn spawn_chat2_join(
+        &self,
+        edge: EdgeConfig,
+        handle: &Arc<ChatDocHandle>,
+        cursor: u64,
+        cursor_epoch: u32,
+    ) {
         let chat = handle.chat_id.clone();
         let doc = handle.doc.clone();
         let store = self.inner.store.clone();
         let http = self.inner.http.clone();
         let device = self.inner.config.device_id.clone();
+        let room_gen = handle.room_gen;
         let weak = Arc::downgrade(handle);
         let host = self.clone();
         let mut token_changes = edge.token_changes();
         self.spawn_worker(async move {
-            let sink = Arc::new(crate::chat2_host::EngineChatSink::new(&doc, store, chat.clone()));
+            let sink = Arc::new(crate::chat2_host::EngineChatSink::new(
+                &doc,
+                store,
+                chat.clone(),
+                room_gen,
+                cursor,
+                cursor_epoch,
+            ));
             // The sink holds only a Weak doc ref (a strong one made every
             // chat2 handle read as perma-pinned — LRU eviction dead); this
             // task's own strong ref dies when the join resolves.
             drop(doc);
+            let prefix = room_prefix(room_gen);
             let fetcher = Arc::new(crate::chat2_host::EdgeCheckpointFetcher::new(
                 http,
                 edge.clone(),
                 chat.clone(),
+                room_gen,
             ));
-            let url = edge.room_url(format!("/chat2/{chat}/ws"));
+            // chat3 host claim rides the join: the DO's host-user slot gates
+            // checkpoint/tail/diff/reset to whoever first joins with role=host.
+            let host_query = if room_gen >= 3 && host.is_host(&chat) {
+                "&role=host"
+            } else {
+                ""
+            };
+            let url = edge.room_url_with(format!("/{prefix}/{chat}/ws"), host_query);
             let mut wake = zeron_sync::wake::subscribe();
             let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
             loop {
@@ -972,6 +1181,7 @@ impl DocHost {
                     edge.clone(),
                     chat.clone(),
                     device.clone(),
+                    room_gen,
                 ));
                 let dial = tokio::time::timeout(
                     std::time::Duration::from_secs(60),
@@ -995,20 +1205,18 @@ impl DocHost {
                         };
                         let mut events = client.events();
                         let mut lifecycle_events = client.events();
+                        // Subscribe first, then read the sticky verdict: a
+                        // pull-first 403 can land before connect returns, in
+                        // the subscribe/read gap, or later. The event+latch
+                        // pair covers all three without string matching.
+                        if should_park_access_denied(room_gen, host.is_host(&chat))
+                            && client.access_denied()
                         {
-                            // Store + drain under ONE client-lock critical
-                            // section: the subscription pushes to the buffer
-                            // while holding this same lock, so every commit
-                            // is either drained here or enqueued directly
-                            // after — never dropped between (verify pass).
-                            let mut client_slot = lock(&handle.chat2);
-                            let pending: Vec<Vec<u8>> =
-                                std::mem::take(&mut *lock(&handle.chat2_pending_local));
-                            for update in pending {
-                                client.enqueue_update(update);
-                            }
-                            *client_slot = Some(client);
+                            tracing::info!(chat = %chat,
+                                "chat2 join forbidden (foreign single-owner room); parked until registry flips");
+                            return;
                         }
+                        host.install_chat2_client(&handle, client);
                         tracing::info!(chat = %chat, "chat2 room joined (converged)");
                         // Bootstrap heal: a room with NO checkpoint can't
                         // cover its rows' causal deps for cold readers — a
@@ -1086,10 +1294,23 @@ impl DocHost {
                             });
                         }
                         drop(handle);
-                        if token_changes.is_none() {
-                            return;
-                        }
                         loop {
+                            // The event wakes this loop; the sticky bit is
+                            // authoritative. Re-checking it before every wait
+                            // also covers a broadcast lag without reopening a
+                            // pre-subscription race.
+                            if should_park_access_denied(room_gen, host.is_host(&chat)) {
+                                let Some(handle) = weak.upgrade() else { return };
+                                let denied = lock(&handle.chat2)
+                                    .as_ref()
+                                    .is_some_and(zeron_sync::ChatClient::access_denied);
+                                if denied {
+                                    let pending = host.park_chat2_client(&handle);
+                                    tracing::info!(chat = %chat, pending_updates = pending,
+                                        "chat2 join forbidden (foreign single-owner room); client parked until registry flips");
+                                    return;
+                                }
+                            }
                             tokio::select! {
                                 event = lifecycle_events.recv() => match event {
                                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -1210,7 +1431,7 @@ impl DocHost {
             lock(&host.inner.seeding).remove(&chat);
             match outcome {
                 Ok(()) => {
-                    tracing::info!(chat = %chat, "chat2 seeded; registry flipped to roomGen 2");
+                    tracing::info!(chat = %chat, "thin room seeded; registry generation flipped");
                 }
                 Err(err) => {
                     tracing::warn!(chat = %chat, error = %err,
@@ -1244,9 +1465,13 @@ impl DocHost {
         let snapshot = rebuilt.doc.export_snapshot().map_err(|e| e.to_string())?;
         let frontier = rebuilt.doc.doc().oplog_vv().encode();
         let bearer = edge.bearer().await.ok_or("signed out")?;
+        let target_gen = self.minted_room_gen();
+        // role=host claims the chat3 host-user slot when this bootstrap
+        // checkpoint precedes the ws join (harmless on chat2 rooms).
         let url = format!(
-            "{}/chat2/{}/checkpoint?seqCovered=0",
+            "{}/{}/{}/checkpoint?seqCovered=0&role=host",
             edge.url.trim_end_matches('/'),
+            room_prefix(target_gen),
             chat_id
         );
         let res = self
@@ -1297,13 +1522,13 @@ impl DocHost {
         }
         self.inner
             .store
-            .save_snapshot_with_cursor(chat_id, &snapshot, 0, crate::chat2_host::CHAT2_DOC_EPOCH)
+            .save_snapshot_with_cursor(chat_id, &snapshot, 0, target_gen)
             .map_err(|e| e.to_string())?;
         // Registry flip LAST — the cutover signal every device dials by.
         let flipped = self
             .workspace()
             .ok_or("no workspace host")?
-            .set_chat_room_gen(chat_id, 2)
+            .set_chat_room_gen(chat_id, target_gen)
             .map_err(|e| e.to_string())?;
         if !flipped {
             return Err("chat row vanished during seed".into());
@@ -1454,13 +1679,15 @@ impl DocHost {
             let http = self.inner.http.clone();
             let edge_tail = edge.clone();
             let chat = chat_id.clone();
+            let prefix = room_prefix(handle.room_gen);
             self.spawn_worker(async move {
                 let Some(bearer) = edge_tail.bearer().await else {
                     return;
                 };
                 let url = format!(
-                    "{}/chat2/{}/tail",
+                    "{}/{}/{}/tail",
                     edge_tail.url.trim_end_matches('/'),
+                    prefix,
                     chat
                 );
                 let _ = http
@@ -1511,14 +1738,18 @@ impl DocHost {
         let seq_covered = stats.cursor;
         let http = self.inner.http.clone();
         let weak_note = Arc::downgrade(handle);
+        let prefix = room_prefix(handle.room_gen);
         self.spawn_worker(async move {
             let Some(bearer) = edge.bearer().await else {
                 in_flight.store(false, Ordering::Release);
                 return;
             };
+            // role=host: claims the chat3 host-user slot if the ws join's
+            // claim hasn't landed yet (no-op for the established host).
             let url = format!(
-                "{}/chat2/{}/checkpoint?seqCovered={}",
+                "{}/{}/{}/checkpoint?seqCovered={}&role=host",
                 edge.url.trim_end_matches('/'),
+                prefix,
                 chat_id,
                 seq_covered
             );
@@ -1706,6 +1937,23 @@ impl DocHost {
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
+        let user = match self.inner.config.user_id.as_str() {
+            "" => None,
+            u => Some(u.to_string()),
+        };
+        self.queue_command_as(chat_id, payload, user, None)
+    }
+
+    /// [`Self::queue_command`] with explicit attribution: `user_id` names the
+    /// issuing user (`agent:{chatId}` for agent-to-agent sends), `origin`
+    /// carries send-chain provenance for hop limiting.
+    pub fn queue_command_as(
+        &self,
+        chat_id: &str,
+        payload: SessionCommandPayload,
+        user_id: Option<String>,
+        origin: Option<CommandOrigin>,
+    ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
         let id = new_id();
         let now = now_ms();
@@ -1722,6 +1970,8 @@ impl DocHost {
             payload,
             issued_by: self.inner.config.device_id.clone(),
             issued_at: now,
+            user_id,
+            origin,
             based_on,
             expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
             status: SessionCommandStatus::Pending,
@@ -1748,6 +1998,67 @@ impl DocHost {
         // for any other reason still executes it).
         self.nudge_remote_host(chat_id);
         Ok(id)
+    }
+
+    /// Agent-to-agent send: queue a Steer into `target_chat`'s doc, attributed
+    /// `agent:{from_chat}`, delivered by the target's host through the normal
+    /// command plane (offline-queued, nudged, deduped). Loop protection:
+    /// hop depth (from the live turn's origin) capped at [`MAX_AGENT_HOPS`],
+    /// plus a per-turn send budget per source chat.
+    pub fn send_to_session(
+        &self,
+        from_chat: &str,
+        target_chat: &str,
+        message: &str,
+    ) -> Result<String, EngineError> {
+        const MAX_AGENT_HOPS: u32 = 4;
+        const MAX_SENDS_PER_TURN: u32 = 8;
+        if from_chat == target_chat {
+            return Err(EngineError::Other("cannot send to the own session".into()));
+        }
+        if message.trim().is_empty() {
+            return Err(EngineError::Other("empty message".into()));
+        }
+        let hops = lock(&self.inner.turn_origins)
+            .get(from_chat)
+            .copied()
+            .unwrap_or(0)
+            + 1;
+        if hops > MAX_AGENT_HOPS {
+            return Err(EngineError::Other(format!(
+                "agent send chain too deep (>{MAX_AGENT_HOPS} hops) — refusing to ping-pong"
+            )));
+        }
+        // ponytail: per-turn counter; per-target token bucket if abuse shows up
+        {
+            let mut budgets = lock(&self.inner.send_budgets);
+            let spent = budgets.entry(from_chat.to_string()).or_insert(0);
+            if *spent >= MAX_SENDS_PER_TURN {
+                return Err(EngineError::Other(format!(
+                    "send budget exhausted ({MAX_SENDS_PER_TURN} per turn)"
+                )));
+            }
+            *spent += 1;
+        }
+        self.queue_command_as(
+            target_chat,
+            SessionCommandPayload::Steer {
+                prompt: message.to_string(),
+                message_id: Some(new_id()),
+            },
+            Some(format!("agent:{from_chat}")),
+            Some(CommandOrigin {
+                from_chat_id: from_chat.to_string(),
+                hops,
+            }),
+        )
+    }
+
+    /// Test seam: pretend `chat_id`'s live turn originated from an agent send
+    /// chain `hops` deep (what `execute` records for real turns).
+    #[cfg(test)]
+    pub(crate) fn set_turn_origin_for_test(&self, chat_id: &str, hops: u32) {
+        lock(&self.inner.turn_origins).insert(chat_id.to_string(), hops);
     }
 
     /// POST `{edge}/device/{host}/nudge {chatId}` when the chat's workspace row names
@@ -2041,6 +2352,43 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        // Attribution: pre-write the user entry with the command's issuing
+        // user (write_user_message is idempotent by id, so the dispatch/steer
+        // path's own write becomes a no-op). Keeps the sessions dispatch
+        // plumbing author-free.
+        if entry.user_id.is_some() {
+            let prewrite = match &entry.payload {
+                SessionCommandPayload::Run {
+                    request,
+                    message_id,
+                } => Some((message_id.as_str(), request.prompt.as_str())),
+                SessionCommandPayload::Steer {
+                    prompt,
+                    message_id: Some(message_id),
+                } => Some((message_id.as_str(), prompt.as_str())),
+                _ => None,
+            };
+            if let Some((message_id, prompt)) = prewrite {
+                handle.write_user_message(
+                    message_id,
+                    prompt,
+                    now_ms(),
+                    entry.user_id.as_deref(),
+                )?;
+            }
+        }
+        // The live turn's agent-send depth: what send_to_session increments.
+        // A new turn also resets the chat's per-turn send budget.
+        if matches!(
+            entry.payload,
+            SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+        ) {
+            lock(&self.inner.turn_origins).insert(
+                chat_id.clone(),
+                entry.origin.as_ref().map(|o| o.hops).unwrap_or(0),
+            );
+            lock(&self.inner.send_budgets).remove(chat_id);
+        }
         match &entry.payload {
             SessionCommandPayload::Run {
                 request,
@@ -2221,6 +2569,7 @@ impl DocHost {
                 .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
             auto_approve: false,
             attachments: Vec::new(),
+            mcp_servers: Vec::new(),
             resume: None,
         })
     }
@@ -2364,5 +2713,391 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 host.evict_over_budget();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_send_tests {
+    use super::*;
+    use futures::future::BoxFuture;
+    use zeron_proto::HarnessId;
+    use zeron_sync::chat_client::{ChatDocSink, ChatTransport, CheckpointFetcher};
+
+    use crate::workspace_host::WorkspaceHostConfig;
+
+    struct NoopChatSink;
+
+    impl ChatDocSink for NoopChatSink {
+        fn apply_row(&self, _bytes: &[u8], _cursor: u64) {}
+        fn apply_checkpoint(&self, _bytes: &[u8], _cursor: u64) -> Result<(), String> {
+            Ok(())
+        }
+        fn contains_frontier(&self, _frontier: &[u8]) -> bool {
+            true
+        }
+        fn advance_cursor(&self, _cursor: u64) {}
+        fn reset_cursor(&self, _cursor: u64) {}
+    }
+
+    struct ClosedFetcher;
+
+    impl CheckpointFetcher for ClosedFetcher {
+        fn fetch(&self) -> BoxFuture<'static, Result<Vec<u8>, zeron_sync::SyncError>> {
+            Box::pin(async { Err(zeron_sync::SyncError::Closed) })
+        }
+    }
+
+    struct ClosedTransport;
+
+    impl ChatTransport for ClosedTransport {
+        fn fetch_rows(
+            &self,
+            _after: u64,
+        ) -> BoxFuture<'static, Result<Vec<u8>, zeron_sync::SyncError>> {
+            Box::pin(async { Err(zeron_sync::SyncError::Closed) })
+        }
+
+        fn push(
+            &self,
+            _batch_id: String,
+            _bytes: Vec<u8>,
+        ) -> BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
+            Box::pin(async { Err(zeron_sync::SyncError::Closed) })
+        }
+    }
+
+    fn host() -> (tempfile::TempDir, DocHost) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        (dir, host)
+    }
+
+    fn queued_commands(host: &DocHost, chat: &str) -> Vec<SessionCommandEntry> {
+        host.open(chat).unwrap().doc.read_commands().unwrap()
+    }
+
+    async fn local_first_chat_client() -> zeron_sync::ChatClient {
+        zeron_sync::ChatClient::connect_via_transport(
+            Arc::new(zeron_sync::StaticUrl("ws://127.0.0.1:9".into())),
+            Arc::new(NoopChatSink),
+            Arc::new(ClosedFetcher),
+            "dev-a",
+            0,
+            Arc::new(ClosedTransport),
+        )
+        .await
+        .expect("local-first client constructs before I/O")
+    }
+
+    #[test]
+    fn only_foreign_legacy_rooms_park_on_access_denied() {
+        assert!(should_park_access_denied(2, false));
+        assert!(should_park_access_denied(1, false));
+        assert!(!should_park_access_denied(2, true));
+        assert!(!should_park_access_denied(3, false));
+        assert!(!should_park_access_denied(3, true));
+    }
+
+    #[test]
+    fn first_contact_full_update_prepends_without_dropping_carry_over_deltas() {
+        let (_dir, host) = host();
+        DocHost::buffer_chat2_update(&host.inner, "handoff-chat", vec![1, 2]);
+        DocHost::buffer_chat2_update(&host.inner, "handoff-chat", vec![3, 4]);
+
+        DocHost::prepend_chat2_update(&host.inner, "handoff-chat", vec![9, 9]);
+
+        assert_eq!(
+            lock(&host.inner.chat2_pending_local)
+                .get("handoff-chat")
+                .cloned()
+                .unwrap(),
+            vec![vec![9, 9], vec![1, 2], vec![3, 4]],
+            "full state is first, while individually sendable deltas survive as a suffix"
+        );
+    }
+
+    #[tokio::test]
+    async fn parked_updates_requeue_after_chat2_to_chat3_handle_replacement() {
+        let (_dir, host) = host();
+        let workspace = WorkspaceHost::open(
+            host.inner.store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("carry-chat", None, Some("dev-b"), None, None)
+            .unwrap();
+        host.set_workspace(workspace.clone());
+
+        let old = host.open("carry-chat").unwrap();
+        assert_eq!(old.room_gen, 2);
+        let first = local_first_chat_client().await;
+        host.install_chat2_client(&old, first);
+        lock(&old.chat2)
+            .as_ref()
+            .unwrap()
+            .enqueue_update(vec![1, 2]);
+        assert_eq!(host.park_chat2_client(&old), 1);
+        // A commit made while the legacy client is parked takes the same
+        // host-level route as the real local-update subscription.
+        DocHost::buffer_chat2_update(&host.inner, "carry-chat", vec![3, 4]);
+
+        // Let open()'s initial command-drain release its temporary doc clone;
+        // the real cutover watcher deliberately leaves a live writer alone.
+        for _ in 0..64 {
+            if Arc::strong_count(&old.doc) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(Arc::strong_count(&old.doc), 1);
+        workspace.set_chat_room_gen("carry-chat", 3).unwrap();
+        for _ in 0..64 {
+            if !lock(&host.inner.handles).contains_key("carry-chat") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            !lock(&host.inner.handles).contains_key("carry-chat"),
+            "cutover watcher must replace the legacy handle"
+        );
+
+        let replacement = host.open("carry-chat").unwrap();
+        assert_eq!(replacement.room_gen, 3);
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        let next = local_first_chat_client().await;
+        assert_eq!(host.install_chat2_client(&replacement, next), 2);
+        assert!(
+            !lock(&host.inner.chat2_pending_local).contains_key("carry-chat"),
+            "generation handoff queue must drain into the new client"
+        );
+        let recovered = lock(&replacement.chat2)
+            .take()
+            .unwrap()
+            .into_pending_updates();
+        assert_eq!(recovered, vec![vec![1, 2], vec![3, 4]]);
+    }
+
+    #[tokio::test]
+    async fn restart_after_foreign_chat2_park_requeues_full_doc_into_chat3() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("restart-carry", None, Some("dev-b"), None, None)
+            .unwrap();
+
+        // Process one: a foreign chat2 snapshot already has a non-zero chat2
+        // cursor, then accumulates local work while its single-owner room is
+        // parked. Plain snapshot saves retain cursor=41, epoch=2.
+        let first_host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        first_host.set_workspace(workspace.clone());
+        let first = first_host.open("restart-carry").unwrap();
+        assert_eq!(first.room_gen, 2);
+        first
+            .doc
+            .doc()
+            .get_map("meta")
+            .insert("parked-local", "survives-restart")
+            .unwrap();
+        first.doc.doc().commit();
+        let snapshot = first.doc.export_snapshot().unwrap();
+        store
+            .save_snapshot_with_cursor("restart-carry", &snapshot, 41, 2)
+            .unwrap();
+        first_host.shutdown_workers().await;
+        drop(first);
+        drop(first_host);
+
+        // While this device is down, the registry moves the chat to the new
+        // org-shared room. Process two has no in-memory carry-over map.
+        assert!(workspace.set_chat_room_gen("restart-carry", 3).unwrap());
+        let second_host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:9", "token")),
+            },
+        );
+        second_host.set_workspace(workspace);
+        let replacement = second_host.open("restart-carry").unwrap();
+        assert_eq!(replacement.room_gen, 3);
+
+        // Local-first join installs quickly even though the test endpoint is
+        // closed. The old cursor must be treated as zero, which activates the
+        // complete-update enqueue before any network success is possible.
+        for _ in 0..100 {
+            let ready = lock(&replacement.chat2)
+                .as_ref()
+                .is_some_and(|client| client.stats().pending_pushes > 0);
+            if ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let client = lock(&replacement.chat2)
+            .take()
+            .expect("replacement client installed");
+        assert_eq!(
+            client.stats().cursor,
+            0,
+            "chat2 cursor must not cross into chat3"
+        );
+        let updates = client.into_pending_updates();
+        assert!(!updates.is_empty(), "full local update must be requeued");
+
+        let replay = loro::LoroDoc::new();
+        for update in updates {
+            replay.import(&update).unwrap();
+        }
+        assert!(matches!(
+            replay.get_map("meta").get("parked-local"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "survives-restart"
+        ));
+        second_host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn newer_snapshot_epoch_prevents_registry_generation_regression() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let doc = SessionDoc::init("epoch-ahead").unwrap();
+        store
+            .save_snapshot_with_cursor("epoch-ahead", &doc.export_snapshot().unwrap(), 23, 3)
+            .unwrap();
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("epoch-ahead", None, Some("dev-b"), None, None)
+            .unwrap();
+        assert_eq!(
+            workspace.chat("epoch-ahead").unwrap().unwrap().room_gen,
+            Some(2)
+        );
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        host.set_workspace(workspace.clone());
+
+        let handle = host.open("epoch-ahead").unwrap();
+
+        assert_eq!(handle.room_gen, 3);
+        assert_eq!(
+            workspace.chat("epoch-ahead").unwrap().unwrap().room_gen,
+            Some(3)
+        );
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn send_lands_a_steer_with_agent_attribution_and_hops() {
+        let (_dir, host) = host();
+        host.send_to_session("chat-a", "chat-b", "hello from a")
+            .unwrap();
+        let commands = queued_commands(&host, "chat-b");
+        assert_eq!(commands.len(), 1);
+        let entry = &commands[0];
+        assert_eq!(entry.user_id.as_deref(), Some("agent:chat-a"));
+        let origin = entry.origin.as_ref().expect("origin");
+        assert_eq!(origin.from_chat_id, "chat-a");
+        assert_eq!(origin.hops, 1);
+        assert!(matches!(
+            entry.payload,
+            SessionCommandPayload::Steer { ref prompt, .. } if prompt == "hello from a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn self_send_and_empty_message_are_rejected() {
+        let (_dir, host) = host();
+        assert!(host.send_to_session("chat-a", "chat-a", "loop").is_err());
+        assert!(host.send_to_session("chat-a", "chat-b", "   ").is_err());
+        assert!(queued_commands(&host, "chat-b").is_empty());
+    }
+
+    #[tokio::test]
+    async fn hop_limit_breaks_ping_pong() {
+        let (_dir, host) = host();
+        host.set_turn_origin_for_test("chat-a", 3);
+        assert!(host.send_to_session("chat-a", "chat-b", "hop 4").is_ok());
+        host.set_turn_origin_for_test("chat-a", 4);
+        let err = host
+            .send_to_session("chat-a", "chat-c", "hop 5")
+            .unwrap_err();
+        assert!(err.to_string().contains("too deep"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn per_turn_send_budget_is_enforced_and_reset_on_new_turn() {
+        let (_dir, host) = host();
+        for i in 0..8 {
+            host.send_to_session("chat-a", "chat-b", &format!("m{i}"))
+                .unwrap();
+        }
+        let err = host
+            .send_to_session("chat-a", "chat-b", "one too many")
+            .unwrap_err();
+        assert!(err.to_string().contains("budget"), "{err}");
+        // A fresh turn (execute records the origin and clears the budget).
+        lock(&host.inner.send_budgets).remove("chat-a");
+        assert!(
+            host.send_to_session("chat-a", "chat-b", "next turn")
+                .is_ok()
+        );
     }
 }

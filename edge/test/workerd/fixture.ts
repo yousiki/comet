@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+export { ChatRoom } from "../../src/chat-room";
 
 /** Bare SQLite-backed DO; tests reach its real `ctx.storage.sql` via
  * `runInDurableObject` (the cloudflare-os TEST_OVERSEER pattern). */

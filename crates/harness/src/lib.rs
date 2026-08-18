@@ -96,6 +96,7 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub(crate) mod jsonrpc;
+pub(crate) mod mcp;
 pub mod mock;
 pub mod shell_env;
 

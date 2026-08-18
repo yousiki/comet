@@ -409,6 +409,19 @@ async fn run_session(session: Session) {
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
+        if !request.mcp_servers.is_empty() {
+            // App-server's ThreadStartParams/ThreadResumeParams both expose
+            // session-scoped config overrides. Keep MCP env values on the
+            // private JSON-RPC stdio pipe instead of leaking them through `-c`
+            // process arguments. This exact `mcp_servers` config shape is the
+            // one Codex itself and codex-acp consume.
+            p.insert(
+                "config".into(),
+                json!({
+                    "mcp_servers": crate::mcp::stdio_server_map(&request.mcp_servers),
+                }),
+            );
+        }
         if let Some(model) = &request.model {
             p.insert("model".into(), Value::String(model.clone()));
         }
@@ -1281,7 +1294,11 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                 id: new_message_id(),
                 header: {
                     let h = field(["header", "title", "label"]);
-                    if h.is_empty() { "Codex question".into() } else { h }
+                    if h.is_empty() {
+                        "Codex question".into()
+                    } else {
+                        h
+                    }
                 },
                 question: field(["question", "prompt", "text"]),
                 options: q

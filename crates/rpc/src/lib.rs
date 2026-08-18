@@ -40,6 +40,12 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    /// Agent-to-agent send (the `zeron mcp-bridge` tool surface): queue a
+    /// Steer into ANOTHER chat's doc with `agent:{fromChatId}` attribution,
+    /// hop-limited and rate-limited. IPC-only; never relay-forwarded —
+    /// delivery to a remote host rides the command plane + nudge, not the
+    /// device relay.
+    pub const SEND_TO_SESSION: &str = "SendToSession";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
@@ -80,6 +86,13 @@ pub mod methods {
     pub const LIST_ORGS: &str = "ListOrgs";
     pub const CREATE_ORG: &str = "CreateOrg";
     pub const SELECT_ORG: &str = "SelectOrg";
+    // Team management (feature: org-shared sessions). All IPC-only; the edge
+    // enforces admin-ness and last-admin protection — these are thin proxies.
+    pub const LIST_MEMBERS: &str = "ListMembers";
+    pub const INVITE_MEMBER: &str = "InviteMember";
+    pub const SET_MEMBER_ROLE: &str = "SetMemberRole";
+    pub const REMOVE_MEMBER: &str = "RemoveMember";
+    pub const DELETE_ORG: &str = "DeleteOrg";
     /// One-time local→synced profile import: what's importable (unary).
     pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
     /// One-time local→synced profile import: run it (stream of progress items).

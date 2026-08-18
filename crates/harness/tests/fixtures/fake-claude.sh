@@ -7,11 +7,27 @@
 # mirror live captures from CLI 2.1.228. Driven by
 # crates/harness/tests/claude.rs.
 
+cli_args=$*
 read -r first || exit 1
 
 emit() { printf '%s\n' "$1"; }
+has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
 case "$first" in
+
+*scenario:mcp*)
+  for want in '--mcp-config' '--resume=sess-old' '"mcpServers"' \
+    '"zeron"' '"command":"/opt/zeron bin/comet"' \
+    '"args":["mcp-bridge","--literal=$HOME"]' \
+    '"ZERON_CHAT_ID":"chat-a"' '"ZERON_IPC_PORT":"12345"'; do
+    if ! has "$cli_args" "$want"; then
+      emit "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"errors\":[\"CLI MCP arg missing: $want\"],\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"session_id\":\"sess-mcp\"}"
+      exit 0
+    fi
+  done
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["mcp__zeron__send_to_session"],"cwd":"/tmp","session_id":"sess-mcp"}'
+  emit '{"type":"result","subtype":"success","result":"mcp ready","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-mcp"}'
+  ;;
 
 *scenario:happy*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash","Read"],"cwd":"/tmp","session_id":"sess-1"}'

@@ -12,8 +12,8 @@ use zeron_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
-    ToolCall, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, McpServerConfig, ReasoningLevel, RunRequest, SandboxLevel,
+    TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -45,6 +45,19 @@ fn request(prompt: &str) -> RunRequest {
         auto_approve: true,
         attachments: Vec::new(),
         resume: None,
+        mcp_servers: Vec::new(),
+    }
+}
+
+fn mcp_server() -> McpServerConfig {
+    McpServerConfig {
+        name: "zeron".into(),
+        command: "/opt/zeron bin/comet".into(),
+        args: vec!["mcp-bridge".into(), "--literal=$HOME".into()],
+        env: vec![
+            ("ZERON_CHAT_ID".into(), "chat-a".into()),
+            ("ZERON_IPC_PORT".into(), "12345".into()),
+        ],
     }
 }
 
@@ -566,6 +579,30 @@ async fn resume_reuses_the_existing_thread() {
 }
 
 #[tokio::test]
+async fn mcp_config_rides_private_thread_config_on_resume() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:mcp");
+    req.resume = Some("resume-ok".into());
+    req.mcp_servers = vec![mcp_server()];
+    let events = run_to_end(&harness(), req, controls).await;
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SessionStarted { session_id, .. } if session_id == "th-resumed"
+        )),
+        "{events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn missing_binary_is_not_installed() {
     let harness = CodexHarness::new().with_executable("/nonexistent/codex-nowhere");
     let (controls, _steer, _token) = controls("Yes");
@@ -692,12 +729,14 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
     // parent delta that follows it in the script (not only at thread/closed).
     let child_done = events
         .iter()
-        .position(|e| matches!(
-            e,
-            AgentEvent::Subagent { parent_tool_use_id, event }
-                if parent_tool_use_id == "call_alpha"
-                    && matches!(event.as_ref(), AgentEvent::Done { .. })
-        ))
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if parent_tool_use_id == "call_alpha"
+                        && matches!(event.as_ref(), AgentEvent::Done { .. })
+            )
+        })
         .expect("tagged done");
     let late_parent_delta = events
         .iter()

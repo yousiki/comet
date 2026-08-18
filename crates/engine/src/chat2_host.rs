@@ -17,8 +17,9 @@ use zeron_sync::{DocsStore, SyncError};
 
 use crate::doc_host::EdgeConfig;
 
-/// Doc epoch stamped on every chat2-synced snapshot (docs/chat2-sync.md M1:
-/// thin docs are lineage epoch 2; M3 readers discard-and-adopt below it).
+/// Minimum synchronized-room epoch. Values below 2 are legacy fat/s2 docs;
+/// values at or above 2 identify the room generation whose cursor is stored
+/// beside the thin snapshot (2 = chat2, 3 = org-shared chat3).
 pub const CHAT2_DOC_EPOCH: u32 = 2;
 
 /// [`ChatDocSink`] over a live [`SessionDoc`] + the cursor-bearing store.
@@ -37,29 +38,69 @@ pub struct EngineChatSink {
     doc: std::sync::Weak<SessionDoc>,
     store: Arc<DocsStore>,
     chat_id: String,
+    /// Room generation this client is converging onto.
+    target_room_gen: u32,
+    /// Serialized cursor/epoch persistence. During a generation handoff,
+    /// remote rows may arrive before the full-local-update batch is acked;
+    /// those rows keep the old epoch so a crash still resets/requeues. The
+    /// first own-write ack promotes the epoch to `target_room_gen`.
+    persist: std::sync::Mutex<PersistState>,
+}
+
+struct PersistState {
+    cursor: u64,
+    epoch: u32,
 }
 
 impl EngineChatSink {
-    pub fn new(doc: &Arc<SessionDoc>, store: Arc<DocsStore>, chat_id: impl Into<String>) -> Self {
+    pub fn new(
+        doc: &Arc<SessionDoc>,
+        store: Arc<DocsStore>,
+        chat_id: impl Into<String>,
+        room_gen: u32,
+        initial_cursor: u64,
+        initial_epoch: u32,
+    ) -> Self {
+        let target_room_gen = room_gen.max(CHAT2_DOC_EPOCH);
         Self {
             doc: Arc::downgrade(doc),
             store,
             chat_id: chat_id.into(),
+            target_room_gen,
+            persist: std::sync::Mutex::new(PersistState {
+                cursor: initial_cursor,
+                epoch: initial_epoch.max(CHAT2_DOC_EPOCH).min(target_room_gen),
+            }),
         }
     }
 
-    /// Export the CURRENT doc and persist it with `cursor` in one tx.
-    fn persist_with_cursor(&self, cursor: u64) {
+    /// Export the CURRENT doc and persist it with its cursor in one tx.
+    /// `promote` means an own batch was acked in the target room. `exact`
+    /// crosses an explicitly observed server-reset boundary and is the sole
+    /// path allowed to move a persisted cursor backwards.
+    fn persist_with_cursor(&self, cursor: u64, promote: bool, exact: bool) {
         let Some(doc) = self.doc.upgrade() else {
             return;
         };
+        let mut state = self
+            .persist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.cursor = if exact {
+            cursor
+        } else {
+            state.cursor.max(cursor)
+        };
+        if promote {
+            state.epoch = self.target_room_gen;
+        }
         match doc.export_snapshot() {
             Ok(bytes) => {
                 if let Err(err) = self.store.save_snapshot_with_cursor(
                     &self.chat_id,
                     &bytes,
-                    cursor,
-                    CHAT2_DOC_EPOCH,
+                    state.cursor,
+                    state.epoch,
                 ) {
                     tracing::warn!(chat = %self.chat_id, error = %err,
                         "chat2 sink: snapshot persist failed (will retry on next change)");
@@ -85,7 +126,7 @@ impl ChatDocSink for EngineChatSink {
             tracing::warn!(chat = %self.chat_id, error = %err,
                 "chat2 sink: row import failed; skipping row");
         }
-        self.persist_with_cursor(cursor);
+        self.persist_with_cursor(cursor, false, false);
     }
 
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
@@ -93,7 +134,7 @@ impl ChatDocSink for EngineChatSink {
         doc.doc()
             .import(bytes)
             .map_err(|e| format!("checkpoint import: {e}"))?;
-        self.persist_with_cursor(cursor);
+        self.persist_with_cursor(cursor, false, false);
         Ok(())
     }
 
@@ -133,7 +174,11 @@ impl ChatDocSink for EngineChatSink {
     }
 
     fn advance_cursor(&self, cursor: u64) {
-        self.persist_with_cursor(cursor);
+        self.persist_with_cursor(cursor, true, false);
+    }
+
+    fn reset_cursor(&self, cursor: u64) {
+        self.persist_with_cursor(cursor, false, true);
     }
 }
 
@@ -145,14 +190,22 @@ pub struct EdgeCheckpointFetcher {
     http: reqwest::Client,
     edge: EdgeConfig,
     chat_id: String,
+    /// 2 = `/chat2/...`, 3 = org-shared `/chat3/...`.
+    room_gen: u32,
 }
 
 impl EdgeCheckpointFetcher {
-    pub fn new(http: reqwest::Client, edge: EdgeConfig, chat_id: impl Into<String>) -> Self {
+    pub fn new(
+        http: reqwest::Client,
+        edge: EdgeConfig,
+        chat_id: impl Into<String>,
+        room_gen: u32,
+    ) -> Self {
         Self {
             http,
             edge,
             chat_id: chat_id.into(),
+            room_gen,
         }
     }
 }
@@ -162,8 +215,9 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
         let http = self.http.clone();
         let edge = self.edge.clone();
         let url = format!(
-            "{}/chat2/{}/checkpoint",
+            "{}/{}/{}/checkpoint",
             edge.url.trim_end_matches('/'),
+            if self.room_gen >= 3 { "chat3" } else { "chat2" },
             self.chat_id
         );
         Box::pin(async move {
@@ -238,14 +292,16 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
     }
 }
 
-
 /// Plain-HTTPS chat pull/push (the airplane-wifi transport): GET/POST
-/// `/chat2/{id}/rows` with the same bearer auth the checkpoint fetcher uses.
+/// `/chat2/{id}/rows` for legacy rooms or `/chat3/{id}/rows` for org-shared
+/// rooms, with the same bearer auth the checkpoint fetcher uses.
 pub struct EdgeChatTransport {
     http: reqwest::Client,
     edge: EdgeConfig,
     chat_id: String,
     device_id: String,
+    /// 2 = `/chat2/...`, 3 = org-shared `/chat3/...`.
+    room_gen: u32,
 }
 
 impl EdgeChatTransport {
@@ -254,22 +310,50 @@ impl EdgeChatTransport {
         edge: EdgeConfig,
         chat_id: impl Into<String>,
         device_id: impl Into<String>,
+        room_gen: u32,
     ) -> Self {
         Self {
             http,
             edge,
             chat_id: chat_id.into(),
             device_id: device_id.into(),
+            room_gen,
         }
     }
 
     fn rows_url(&self) -> String {
         format!(
-            "{}/chat2/{}/rows",
+            "{}/{}/{}/rows",
             self.edge.url.trim_end_matches('/'),
+            if self.room_gen >= 3 { "chat3" } else { "chat2" },
             self.chat_id
         )
     }
+}
+
+fn chat_rows_status_error(operation: &str, status: reqwest::StatusCode) -> SyncError {
+    let message = format!("chat {operation} http {status}");
+    if status == reqwest::StatusCode::FORBIDDEN {
+        SyncError::AccessDenied(message)
+    } else {
+        SyncError::Protocol(message)
+    }
+}
+
+fn chat_push_status_error(status: reqwest::StatusCode, body: &str) -> SyncError {
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return SyncError::AccessDenied(format!("chat push http {status}"));
+    }
+    let code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["error"].as_str().map(str::to_owned));
+    if matches!(code.as_deref(), Some("too_large" | "empty" | "bad_push")) {
+        return SyncError::PushRejected(code.expect("matched a present code"));
+    }
+    SyncError::Protocol(match code {
+        Some(code) => format!("chat push http {status}: {code}"),
+        None => format!("chat push http {status}"),
+    })
 }
 
 impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
@@ -291,7 +375,7 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
                 .await
                 .map_err(|e| SyncError::WebSocket(e.to_string()))?;
             if !res.status().is_success() {
-                return Err(SyncError::Protocol(format!("chat pull http {}", res.status())));
+                return Err(chat_rows_status_error("pull", res.status()));
             }
             let bytes = res
                 .bytes()
@@ -323,12 +407,15 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
                 .send()
                 .await
                 .map_err(|e| SyncError::WebSocket(e.to_string()))?;
-            if !res.status().is_success() {
-                return Err(SyncError::Protocol(format!("chat push http {}", res.status())));
-            }
-            res.text()
+            let status = res.status();
+            let body = res
+                .text()
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))
+                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+            if !status.is_success() {
+                return Err(chat_push_status_error(status, &body));
+            }
+            Ok(body)
         })
     }
 }
@@ -354,7 +441,7 @@ mod frontier_tests {
         let dir = std::env::temp_dir().join(format!("zeron-frontier2-{}", std::process::id()));
         let store = Arc::new(DocsStore::open(&dir).expect("store opens"));
         let doc = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
-        let sink = EngineChatSink::new(&doc, store, "frontier-test-2");
+        let sink = EngineChatSink::new(&doc, store, "frontier-test-2", 2, 0, 2);
         let encoded_empty = loro::VersionVector::default().encode();
         assert!(
             !sink.contains_frontier(&encoded_empty),
@@ -368,20 +455,133 @@ mod frontier_tests {
         let dir = std::env::temp_dir().join(format!("zeron-frontier-test-{}", std::process::id()));
         let store = Arc::new(DocsStore::open(&dir).expect("store opens"));
         let doc = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
-        let sink = EngineChatSink::new(&doc, store, "frontier-test");
+        let sink = EngineChatSink::new(&doc, store, "frontier-test", 2, 0, 2);
         assert!(
             !sink.contains_frontier(&[]),
             "empty frontier on a present checkpoint must trigger the fetch"
         );
         // A real, contained frontier still short-circuits the fetch — the
         // doc needs actual ops, or its own frontier is the vacuous-empty one.
-        doc.doc()
-            .get_map("meta")
-            .insert("k", "v")
-            .expect("insert");
+        doc.doc().get_map("meta").insert("k", "v").expect("insert");
         doc.doc().commit();
         let vv = doc.doc().oplog_vv().encode();
         assert!(sink.contains_frontier(&vv));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edge_transport_routes_org_rooms_to_chat3_rows() {
+        let edge = EdgeConfig::with_static_token("https://edge.example/", "token");
+        let legacy = EdgeChatTransport::new(
+            reqwest::Client::new(),
+            edge.clone(),
+            "chat-id",
+            "device-id",
+            2,
+        );
+        let org_shared =
+            EdgeChatTransport::new(reqwest::Client::new(), edge, "chat-id", "device-id", 3);
+
+        assert_eq!(legacy.rows_url(), "https://edge.example/chat2/chat-id/rows");
+        assert_eq!(
+            org_shared.rows_url(),
+            "https://edge.example/chat3/chat-id/rows"
+        );
+        assert!(!org_shared.rows_url().contains("/chat2/"));
+    }
+
+    #[test]
+    fn rows_http_403_is_typed_without_reclassifying_other_statuses() {
+        for operation in ["pull", "push"] {
+            assert!(matches!(
+                chat_rows_status_error(operation, reqwest::StatusCode::FORBIDDEN),
+                SyncError::AccessDenied(_)
+            ));
+            assert!(matches!(
+                chat_rows_status_error(operation, reqwest::StatusCode::UNAUTHORIZED),
+                SyncError::Protocol(_)
+            ));
+            assert!(matches!(
+                chat_rows_status_error(operation, reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+                SyncError::Protocol(_)
+            ));
+        }
+        assert!(matches!(
+            chat_push_status_error(
+                reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+                r#"{"error":"too_large"}"#,
+            ),
+            SyncError::PushRejected(code) if code == "too_large"
+        ));
+        assert!(matches!(
+            chat_push_status_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":"quota"}"#,
+            ),
+            SyncError::Protocol(_)
+        ));
+    }
+
+    #[test]
+    fn gen3_sink_persists_the_gen3_cursor_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let doc = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        doc.doc().get_map("meta").insert("k", "v").unwrap();
+        doc.doc().commit();
+        let sink = EngineChatSink::new(&doc, store.clone(), "gen3-chat", 3, 0, 2);
+
+        sink.apply_row(&doc.export_snapshot().unwrap(), 5);
+        let (_, cursor, epoch) = store
+            .load_snapshot_with_cursor("gen3-chat")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (cursor, epoch),
+            (5, 2),
+            "remote rows must not finish the handoff"
+        );
+
+        sink.advance_cursor(17);
+
+        let (_, cursor, epoch) = store
+            .load_snapshot_with_cursor("gen3-chat")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor, 17);
+        assert_eq!(epoch, 3);
+    }
+
+    #[test]
+    fn same_generation_reset_persists_an_exact_lower_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let doc = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        doc.doc().get_map("meta").insert("k", "v").unwrap();
+        doc.doc().commit();
+        let sink = EngineChatSink::new(&doc, store.clone(), "reset-chat", 3, 41, 3);
+
+        sink.reset_cursor(0);
+        let (_, cursor, epoch) = store
+            .load_snapshot_with_cursor("reset-chat")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (0, 3), "reset preserves room generation");
+
+        let update = doc
+            .doc()
+            .export(loro::ExportMode::updates(&loro::VersionVector::default()))
+            .unwrap();
+        sink.apply_row(&update, 1);
+        sink.advance_cursor(1);
+        let (_, cursor, epoch) = store
+            .load_snapshot_with_cursor("reset-chat")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (cursor, epoch),
+            (1, 3),
+            "post-reset row/ack must not be masked by the old cursor 41"
+        );
     }
 }

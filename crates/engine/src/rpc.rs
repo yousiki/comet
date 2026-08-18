@@ -903,6 +903,11 @@ impl AuthRpc {
                 | methods::LIST_ORGS
                 | methods::CREATE_ORG
                 | methods::SELECT_ORG
+                | methods::LIST_MEMBERS
+                | methods::INVITE_MEMBER
+                | methods::SET_MEMBER_ROLE
+                | methods::REMOVE_MEMBER
+                | methods::DELETE_ORG
         )
     }
 }
@@ -969,6 +974,83 @@ impl RpcService for AuthRpc {
                 let p: P = parse_params(params)?;
                 self.auth
                     .select_org(&p.organization_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::LIST_MEMBERS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    organization_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let members = self
+                    .auth
+                    .list_members(&p.organization_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "members": members }))
+            }
+            methods::INVITE_MEMBER => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    organization_id: String,
+                    email: String,
+                    #[serde(default)]
+                    role: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                let (added, invited) = self
+                    .auth
+                    .invite_member(
+                        &p.organization_id,
+                        &p.email,
+                        p.role.as_deref().unwrap_or("member"),
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "added": added, "invited": invited }))
+            }
+            methods::SET_MEMBER_ROLE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    organization_id: String,
+                    membership_id: String,
+                    role: String,
+                }
+                let p: P = parse_params(params)?;
+                self.auth
+                    .set_member_role(&p.organization_id, &p.membership_id, &p.role)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::REMOVE_MEMBER => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    organization_id: String,
+                    membership_id: String,
+                }
+                let p: P = parse_params(params)?;
+                self.auth
+                    .remove_member(&p.organization_id, &p.membership_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::DELETE_ORG => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    organization_id: String,
+                }
+                let p: P = parse_params(params)?;
+                self.auth
+                    .delete_org(&p.organization_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
@@ -1040,6 +1122,21 @@ impl RpcService for EngineRpc {
                 let command_id = self
                     .doc_host
                     .queue_command(&p.chat_id, p.command)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            methods::SEND_TO_SESSION => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct SendToSessionParams {
+                    from_chat_id: String,
+                    target_chat_id: String,
+                    message: String,
+                }
+                let p: SendToSessionParams = parse_params(params)?;
+                let command_id = self
+                    .doc_host
+                    .send_to_session(&p.from_chat_id, &p.target_chat_id, &p.message)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }

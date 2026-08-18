@@ -46,6 +46,7 @@ fn run_request(prompt: &str, cwd: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        mcp_servers: Vec::new(),
         resume: None,
     }
 }
@@ -341,6 +342,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
             }],
             created_at: 1,
             device_id: "dev-crash".into(),
+            user_id: None,
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         })
@@ -354,6 +356,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
             }],
             created_at: 2,
             device_id: "dev-crash".into(),
+            user_id: None,
             status: Some(MessageStatus::Streaming),
             continuation_of: None,
         })
@@ -587,6 +590,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
             }],
             created_at: now - 60_000,
             device_id: "dev-crash".into(),
+            user_id: None,
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         })
@@ -600,6 +604,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
             }],
             created_at: now - 30_000,
             device_id: "dev-crash".into(),
+            user_id: None,
             status: Some(MessageStatus::Streaming),
             continuation_of: None,
         })
@@ -848,6 +853,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
         attachments: Vec::new(),
+        mcp_servers: Vec::new(),
         resume: None,
     };
     let assemble_real = || {

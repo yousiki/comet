@@ -18,6 +18,7 @@ pub mod devices;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
+pub mod team;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).

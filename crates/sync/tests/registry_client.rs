@@ -3,14 +3,20 @@
 //! speaks the DO's JSON WS protocol. TS↔Rust interop is proven separately by
 //! the `--ignored` live-edge test (registry_edge.rs) and scripts/e2e-smoke.sh.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures::future::BoxFuture;
+use tokio::sync::watch;
 use zeron_doc::{REGISTRY_DOC_ID, RegistryDoc};
 use zeron_proto::{Chat, Device, Session, SessionStatus};
 use zeron_sync::registry::mock_server::MockRegistryServer;
-use zeron_sync::{DocsStore, RegistryClient, RegistryEvent};
+use zeron_sync::{
+    DocsStore, RegistryClient, RegistryEvent, RegistryTransport, RegistryTuning, StaticUrl,
+    SyncError,
+};
 
 fn ts(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
@@ -45,6 +51,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         space_id: None,
         last_seen_at: None,
         room_gen: None,
+        user_id: None,
     }
 }
 
@@ -63,6 +70,308 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
 
 fn new_doc(device: &str) -> Arc<Mutex<RegistryDoc>> {
     Arc::new(Mutex::new(RegistryDoc::new(device)))
+}
+
+struct GatedRegistryTransport {
+    fetch_release: watch::Receiver<bool>,
+    fetch_started: watch::Sender<bool>,
+    fetch_since: Arc<AtomicU64>,
+    push_acked: watch::Sender<bool>,
+}
+
+impl RegistryTransport for GatedRegistryTransport {
+    fn fetch(&self, since: u64) -> BoxFuture<'static, Result<String, SyncError>> {
+        let mut release = self.fetch_release.clone();
+        let started = self.fetch_started.clone();
+        let fetch_since = self.fetch_since.clone();
+        Box::pin(async move {
+            fetch_since.store(since, Ordering::Release);
+            let _ = started.send(true);
+            while !*release.borrow() {
+                release.changed().await.map_err(|_| SyncError::Closed)?;
+            }
+            let clock = "0000000001000-000000-dev-b";
+            Ok(serde_json::json!({
+                "seq": 11,
+                "full": false,
+                "gcFloor": 0,
+                "rows": [{
+                    "kind": "chats",
+                    "id": "foreign-chat",
+                    "seq": 10,
+                    "deleted": false,
+                    "fields": {
+                        "id": "foreign-chat",
+                        "deviceId": "dev-b",
+                        "createdAt": 1_000,
+                    },
+                    "clocks": {
+                        "id": clock,
+                        "deviceId": clock,
+                        "createdAt": clock,
+                    },
+                }],
+            })
+            .to_string())
+        })
+    }
+
+    fn push(&self, body: String) -> BoxFuture<'static, Result<String, SyncError>> {
+        let push_acked = self.push_acked.clone();
+        Box::pin(async move {
+            let body: serde_json::Value =
+                serde_json::from_str(&body).map_err(|err| SyncError::Protocol(err.to_string()))?;
+            let batch = body["batch"]
+                .as_str()
+                .ok_or_else(|| SyncError::Protocol("push without batch".into()))?;
+            let ack = serde_json::json!({ "batch": batch, "seq": 11, "applied": 1 });
+            let _ = push_acked.send(true);
+            Ok(ack.to_string())
+        })
+    }
+}
+
+async fn wait_true(rx: &mut watch::Receiver<bool>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !*rx.borrow() {
+            rx.changed().await.expect("signal sender stays alive");
+        }
+    })
+    .await
+    .expect("signal did not arrive");
+}
+
+#[tokio::test]
+async fn http_transport_returns_local_first_and_syncs_only_after_pull() {
+    let doc = new_doc("dev-a");
+    doc.lock().unwrap().upsert_device(&device("dev-a")).unwrap();
+
+    let (fetch_release_tx, fetch_release_rx) = watch::channel(false);
+    let (fetch_started_tx, mut fetch_started_rx) = watch::channel(false);
+    let (push_acked_tx, mut push_acked_rx) = watch::channel(false);
+    let fetch_since = Arc::new(AtomicU64::new(u64::MAX));
+    let transport = Arc::new(GatedRegistryTransport {
+        fetch_release: fetch_release_rx,
+        fetch_started: fetch_started_tx,
+        fetch_since: fetch_since.clone(),
+        push_acked: push_acked_tx,
+    });
+
+    // Reserve and release a port so the socket side fails independently; the
+    // HTTP seam is the only path capable of crossing readiness in this test.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve port");
+    let ws_url = format!("ws://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(1),
+        RegistryClient::connect_via_transport(
+            Arc::new(StaticUrl(ws_url)),
+            doc.clone(),
+            "dev-a",
+            RegistryTuning::default(),
+            transport,
+        ),
+    )
+    .await
+    .expect("construction must not wait for the HTTP pull")
+    .expect("local-first construction succeeds");
+
+    wait_true(&mut push_acked_rx).await;
+    wait_true(&mut fetch_started_rx).await;
+    assert_eq!(fetch_since.load(Ordering::Acquire), 0);
+    assert_eq!(doc.lock().unwrap().cursor(), 0);
+    assert_eq!(doc.lock().unwrap().pending_len(), 1);
+    assert!(
+        !client.has_synced(),
+        "a successful local push ack must remain deferred and is not readiness"
+    );
+
+    let mut events = client.events();
+    fetch_release_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(RegistryEvent::Synced) => {
+                    let foreign = doc
+                        .lock()
+                        .unwrap()
+                        .chat("foreign-chat")
+                        .unwrap()
+                        .expect("foreign row is applied before readiness");
+                    assert_eq!(foreign.device_id, "dev-b");
+                    break;
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("event stream ended: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("successful pull emits readiness");
+    assert!(client.has_synced(), "pull readiness is sticky");
+    assert_eq!(doc.lock().unwrap().cursor(), 11);
+    assert_eq!(doc.lock().unwrap().pending_len(), 0);
+
+    // Drop aborts the actor immediately; a graceful shutdown could otherwise
+    // wait for an in-progress WebSocket dial timeout on a hostile network.
+    drop(client);
+}
+
+struct FailingPullTransport {
+    fetch_release: watch::Receiver<bool>,
+    fetch_started: watch::Sender<bool>,
+    push_acked: watch::Sender<bool>,
+}
+
+impl RegistryTransport for FailingPullTransport {
+    fn fetch(&self, _since: u64) -> BoxFuture<'static, Result<String, SyncError>> {
+        let mut release = self.fetch_release.clone();
+        let started = self.fetch_started.clone();
+        Box::pin(async move {
+            let _ = started.send(true);
+            while !*release.borrow() {
+                release.changed().await.map_err(|_| SyncError::Closed)?;
+            }
+            Err(SyncError::Protocol("injected pull failure".into()))
+        })
+    }
+
+    fn push(&self, body: String) -> BoxFuture<'static, Result<String, SyncError>> {
+        let push_acked = self.push_acked.clone();
+        Box::pin(async move {
+            let body: serde_json::Value =
+                serde_json::from_str(&body).map_err(|err| SyncError::Protocol(err.to_string()))?;
+            let batch = body["batch"]
+                .as_str()
+                .ok_or_else(|| SyncError::Protocol("push without batch".into()))?;
+            let ack = serde_json::json!({ "batch": batch, "seq": 7, "applied": 1 });
+            let _ = push_acked.send(true);
+            Ok(ack.to_string())
+        })
+    }
+}
+
+#[tokio::test]
+async fn failed_http_pull_rearms_and_wakes_steady_websocket_push() {
+    let server = MockRegistryServer::start().await;
+    let doc = new_doc("dev-a");
+    doc.lock().unwrap().upsert_device(&device("dev-a")).unwrap();
+    let (fetch_release_tx, fetch_release_rx) = watch::channel(false);
+    let (fetch_started_tx, mut fetch_started_rx) = watch::channel(false);
+    let (push_acked_tx, mut push_acked_rx) = watch::channel(false);
+
+    let client = RegistryClient::connect_via_transport(
+        Arc::new(StaticUrl(server.url())),
+        doc.clone(),
+        "dev-a",
+        RegistryTuning::default(),
+        Arc::new(FailingPullTransport {
+            fetch_release: fetch_release_rx,
+            fetch_started: fetch_started_tx,
+            push_acked: push_acked_tx,
+        }),
+    )
+    .await
+    .expect("local-first construction succeeds");
+    wait_true(&mut push_acked_rx).await;
+    wait_true(&mut fetch_started_rx).await;
+    wait_until(|| client.stats().connected).await;
+
+    // Seeing a probe handled proves the actor has entered steady state after
+    // its one initial push pass (where the HTTP-owned batch was in-flight).
+    client.probe();
+    wait_until(|| client.stats().probes > 0).await;
+    assert_eq!(server.row_count(), 0);
+    assert_eq!(doc.lock().unwrap().pending_len(), 1);
+
+    fetch_release_tx.send(true).unwrap();
+    wait_until(|| doc.lock().unwrap().pending_len() == 0).await;
+    assert_eq!(server.row_count(), 1, "re-armed batch reached the live WS");
+    client.shutdown().await;
+}
+
+struct ResetAfterPushTransport;
+
+impl RegistryTransport for ResetAfterPushTransport {
+    fn fetch(&self, since: u64) -> BoxFuture<'static, Result<String, SyncError>> {
+        Box::pin(async move {
+            assert_eq!(since, 10);
+            Ok(serde_json::json!({
+                "seq": 0,
+                "full": true,
+                "gcFloor": 0,
+                "rows": [],
+            })
+            .to_string())
+        })
+    }
+
+    fn push(&self, body: String) -> BoxFuture<'static, Result<String, SyncError>> {
+        Box::pin(async move {
+            let body: serde_json::Value =
+                serde_json::from_str(&body).map_err(|err| SyncError::Protocol(err.to_string()))?;
+            let batch = body["batch"]
+                .as_str()
+                .ok_or_else(|| SyncError::Protocol("push without batch".into()))?;
+            Ok(serde_json::json!({ "batch": batch, "seq": 11, "applied": 1 }).to_string())
+        })
+    }
+}
+
+#[tokio::test]
+async fn reset_between_http_push_and_pull_keeps_batch_for_replay() {
+    let doc = new_doc("dev-a");
+    doc.lock().unwrap().apply_state(10, false, 0, vec![]);
+    doc.lock().unwrap().upsert_device(&device("dev-a")).unwrap();
+
+    // Hold the socket handshake so only the one HTTP cycle touches pending.
+    let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind blackhole");
+    let ws_url = format!("ws://{}", blackhole.local_addr().unwrap());
+    let client = RegistryClient::connect_via_transport(
+        Arc::new(StaticUrl(ws_url)),
+        doc.clone(),
+        "dev-a",
+        RegistryTuning::default(),
+        Arc::new(ResetAfterPushTransport),
+    )
+    .await
+    .expect("local-first construction succeeds");
+
+    wait_until(|| client.has_synced()).await;
+    assert_eq!(doc.lock().unwrap().cursor(), 0, "reset state applied");
+    assert_eq!(doc.lock().unwrap().pending_len(), 1);
+    assert_eq!(
+        doc.lock().unwrap().take_pushable().len(),
+        1,
+        "pre-reset ack did not retire and the batch was re-armed"
+    );
+    drop(client);
+    drop(blackhole);
+}
+
+#[tokio::test]
+async fn new_client_rearms_batches_left_in_flight_by_aborted_owner() {
+    let server = MockRegistryServer::start().await;
+    let doc = new_doc("dev-a");
+    doc.lock().unwrap().upsert_device(&device("dev-a")).unwrap();
+
+    // Exact residue of an owner aborted after take_pushable: the batch stays
+    // pending, but its transport-local flag would hide it from a successor.
+    let abandoned = doc.lock().unwrap().take_pushable();
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(doc.lock().unwrap().pending_len(), 1);
+
+    let client = RegistryClient::connect(&server.url(), doc.clone(), "dev-a")
+        .await
+        .expect("successor connects");
+    wait_until(|| doc.lock().unwrap().pending_len() == 0).await;
+    assert_eq!(server.row_count(), 1, "successor re-sent abandoned batch");
+    client.shutdown().await;
 }
 
 #[tokio::test]

@@ -122,6 +122,10 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// Local IPC port the `zeron mcp-bridge` subprocess dials back to for
+    /// agent tools (send_to_session / list_sessions). 0 = disabled (no IPC
+    /// listener bound, or bare tests) — sessions then get no MCP servers.
+    mcp_port: std::sync::atomic::AtomicU16,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -157,8 +161,18 @@ impl SessionsEngine {
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                mcp_port: std::sync::atomic::AtomicU16::new(0),
             }),
         }
+    }
+
+    /// Enable the agent MCP bridge: dispatched sessions get a `zeron
+    /// mcp-bridge` stdio server dialing back to this engine's IPC `port`.
+    /// Called once the IPC listener is actually bound (headless and headed).
+    pub fn set_mcp_port(&self, port: u16) {
+        self.inner
+            .mcp_port
+            .store(port, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -322,7 +336,7 @@ impl SessionsEngine {
                     message_id: user_id.clone(),
                 });
                 let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                handle.write_user_message(&user_id, &request.prompt, now_ms(), None)?;
                 if self.is_live(chat_id, &run_id) {
                     // Working BEFORE the lastMessageAt bump: both ride the
                     // workspace doc from this one peer, so causal order makes it
@@ -355,10 +369,31 @@ impl SessionsEngine {
             self.interrupt(chat_id).await?;
         }
 
+        // Agent MCP bridge: computed HERE, on the executing host (never off
+        // the wire) — the subprocess dials our own IPC port and identifies
+        // its session via env.
+        let mcp_port = self
+            .inner
+            .mcp_port
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if mcp_port != 0
+            && let Ok(exe) = std::env::current_exe()
+        {
+            request.mcp_servers = vec![zeron_proto::McpServerConfig {
+                name: "zeron".into(),
+                command: exe.display().to_string(),
+                args: vec!["mcp-bridge".into()],
+                env: vec![
+                    ("ZERON_CHAT_ID".into(), chat_id.to_string()),
+                    ("ZERON_IPC_PORT".into(), mcp_port.to_string()),
+                ],
+            }];
+        }
+
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
-        handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        handle.write_user_message(&user_id, &request.prompt, now_ms(), None)?;
 
         // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -488,7 +523,7 @@ impl SessionsEngine {
             message_id: user_id.clone(),
         });
         let handle = self.doc_handle(chat_id)?;
-        handle.write_user_message(&user_id, prompt, now_ms())?;
+        handle.write_user_message(&user_id, prompt, now_ms(), None)?;
         // A routed steer is a turn too. Fired here (not only on the confirmed
         // path) — a reclaim falls back to dispatch, which just re-snapshots.
         if let Some(request) = self.last_request(chat_id) {
@@ -676,6 +711,7 @@ impl SessionsEngine {
                             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
                             attachments: Vec::new(),
+                            mcp_servers: Vec::new(),
                             resume: None,
                         })
                     });
@@ -939,7 +975,6 @@ impl Inner {
 
 // ── run task ────────────────────────────────────────────────────────────────
 
-
 // ── subagent docs ───────────────────────────────────────────────────────────
 
 /// The per-subagent doc id: `{chatId}--sub--{suffix}`. Constrained by the
@@ -994,21 +1029,18 @@ impl SubagentSink {
                 self.written = written;
                 r
             }
-            None => match SegmentWriter::begin(
-                &self.doc,
-                &self.entry_id,
-                device_id,
-                self.started_at,
-            ) {
-                Ok(mut w) => {
-                    let r = w.sync(&rendered);
-                    let (ix, written) = w.into_state();
-                    self.entry_index = Some(ix);
-                    self.written = written;
-                    r
+            None => {
+                match SegmentWriter::begin(&self.doc, &self.entry_id, device_id, self.started_at) {
+                    Ok(mut w) => {
+                        let r = w.sync(&rendered);
+                        let (ix, written) = w.into_state();
+                        self.entry_index = Some(ix);
+                        self.written = written;
+                        r
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
         };
         if let Err(err) = result {
             // Fail soft: a broken subagent doc degrades to chip-only, never
@@ -1480,9 +1512,9 @@ async fn drive_run(
         {
             inner.publish(&chat_id, &event);
             let sub_id = subagent_doc_id(&chat_id, parent_tool_use_id);
-            let chip_streaming = folded.iter().any(
-                |p| matches!(p, MessagePart::Tool { id, .. } if id == parent_tool_use_id),
-            );
+            let chip_streaming = folded
+                .iter()
+                .any(|p| matches!(p, MessagePart::Tool { id, .. } if id == parent_tool_use_id));
             let sink_known = subagents.contains_key(parent_tool_use_id);
             if chip_streaming {
                 if !sink_known {
@@ -1507,8 +1539,7 @@ async fn drive_run(
             // A Done with NO sink (a subagent that never streamed — codex
             // turn ends can beat registration) is chip-only: minting a doc
             // just to freeze it empty helps no one.
-            let done_only = !sink_known
-                && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
             if !sink_known && !done_only {
                 let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
                     Ok(handle) => Some(handle.doc_arc()),

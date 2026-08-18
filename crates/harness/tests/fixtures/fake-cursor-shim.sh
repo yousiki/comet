@@ -4,6 +4,7 @@
 # Driven by crates/harness/tests/cursor.rs.
 
 emit() { printf '%s\n' "$1"; }
+has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
 read -r first || exit 1
 case "$first" in
@@ -12,6 +13,23 @@ case "$first" in
 esac
 
 case "$first" in
+
+*scenario:mcp*)
+  for want in '"resume":"agent-existing"' '"mcpServers":{"zeron"' \
+    '"command":"/opt/zeron bin/comet"' \
+    '"args":["mcp-bridge","--literal=$HOME"]' \
+    '"ZERON_CHAT_ID":"chat-a"' '"ZERON_IPC_PORT":"12345"'; do
+    if ! has "$first" "$want"; then
+      emit "{\"ev\":\"fatal\",\"message\":\"Cursor MCP option missing: $want\"}"
+      exit 1
+    fi
+  done
+  emit '{"ev":"ready","agentId":"agent-existing","model":"auto"}'
+  emit '{"ev":"tool","phase":"start","id":"mcp-1","name":"mcp","args":{"providerIdentifier":"zeron","toolName":"send_to_session","args":{"target_chat_id":"chat-b"}}}'
+  emit '{"ev":"tool","phase":"end","id":"mcp-1","name":"mcp","args":{"providerIdentifier":"zeron","toolName":"send_to_session","args":{"target_chat_id":"chat-b"}},"error":false}'
+  emit '{"ev":"turn","status":"finished"}'
+  exit 0
+  ;;
 
 *scenario:happy*)
   emit '{"ev":"ready","agentId":"agent-1","model":"composer-2.5"}'
