@@ -4130,15 +4130,17 @@ fn chip_header_row(
             // The sidebar working-row spinner, in the chip's trailing slot —
             // paint-local (fixed footprint), so it never moves the layout.
             row.child(
-                div().flex_none().child(crate::loaders::mini_gradient_spinner(
-                    format!(
-                        "subagent-chip-{}",
-                        tool.subagent_ref.as_deref().unwrap_or_default()
-                    ),
-                    2.0,
-                    view,
-                    cx,
-                )),
+                div()
+                    .flex_none()
+                    .child(crate::loaders::mini_gradient_spinner(
+                        format!(
+                            "subagent-chip-{}",
+                            tool.subagent_ref.as_deref().unwrap_or_default()
+                        ),
+                        2.0,
+                        view,
+                        cx,
+                    )),
             )
         })
         .when_some(chevron, |row, open| {

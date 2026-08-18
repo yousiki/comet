@@ -19,7 +19,7 @@
  *   POST /append/:chatId              — repair: merge-import a Loro update
  *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss; legacy clients)
  *   GET  /workspace/:orgId/tail       — workspace-doc tail JSON
- *   GET  /registry/:orgId/ws          — workspace registry room `reg1/{orgId}/{user}` (wss)
+ *   GET  /registry/:orgId/ws          — org-shared registry room `reg2/{orgId}` (wss)
  *   GET  /registry/:orgId/stats       — registry seq/rows/attribution
  *   GET  /registry/:orgId/rows        — registry full-table repair read
  *   POST /registry/:orgId/reset       — registry operator wipe (self-healing)
@@ -31,6 +31,7 @@
  *   GET  /blob/:chatId/:partId
  *   GET  /chat2/:chatId/ws            — chat2 log-relay room (wss, chat2-sync B)
  *   GET|POST /chat2/:chatId/checkpoint — client-built doc snapshot (Range-resumable GET)
+ *   GET|POST /chat2/:chatId/rows      — plain-HTTPS log pull/push
  *   GET|PUT  /chat2/:chatId/tail      — host-published sidecars, served verbatim
  *   GET|PUT  /chat2/:chatId/diff
  *   GET  /chat2/:chatId/stats
@@ -269,6 +270,7 @@ export default {
       }
       const routes: Record<string, string[]> = {
         checkpoint: ["GET", "POST"],
+        rows: ["GET", "POST"],
         tail: ["GET", "PUT"],
         diff: ["GET", "PUT"],
         stats: ["GET"],

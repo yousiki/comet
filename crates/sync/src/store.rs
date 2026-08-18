@@ -33,8 +33,9 @@ const MIGRATIONS: &[&str] = &[
     // v2 — chat2 room cursor + doc epoch (docs/chat2-sync.md C2). The cursor
     // is persisted in the SAME transaction as the snapshot bytes, so content
     // and cursor cannot diverge (restored backups / copied devices simply
-    // redownload from their honest cursor). `epoch` marks rebuild lineage
-    // (M1/M3): 2 = thin chat2 rebuild; NULL/0 = pre-migration s2 doc.
+    // redownload from their honest cursor). `epoch` marks the cursor's room
+    // generation as well as the thin-lineage boundary (M1/M3): 2 = chat2,
+    // 3 = org-shared chat3, NULL/0 = pre-migration s2 doc.
     "ALTER TABLE snapshots ADD COLUMN cursor INTEGER;
      ALTER TABLE snapshots ADD COLUMN epoch INTEGER;",
 ];
@@ -86,7 +87,8 @@ impl DocsStore {
         Ok(())
     }
 
-    /// Save the snapshot together with its chat2 room cursor and doc epoch —
+    /// Save the snapshot together with its room cursor and synchronized room
+    /// generation (`epoch`) —
     /// ONE transaction, so bytes and cursor can never disagree (the C2 rule;
     /// a divergent pair is exactly the restored-backup redownload bug).
     pub fn save_snapshot_with_cursor(
@@ -105,7 +107,7 @@ impl DocsStore {
         Ok(())
     }
 
-    /// Snapshot + chat2 cursor + epoch. Pre-migration rows (or rows written
+    /// Snapshot + room cursor + synchronized generation. Pre-migration rows (or rows written
     /// by [`Self::save_snapshot`]) read back as `(bytes, 0, 0)`.
     pub fn load_snapshot_with_cursor(
         &self,

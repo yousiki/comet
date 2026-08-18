@@ -975,7 +975,6 @@ impl Inner {
 
 // ── run task ────────────────────────────────────────────────────────────────
 
-
 // ── subagent docs ───────────────────────────────────────────────────────────
 
 /// The per-subagent doc id: `{chatId}--sub--{suffix}`. Constrained by the
@@ -1030,21 +1029,18 @@ impl SubagentSink {
                 self.written = written;
                 r
             }
-            None => match SegmentWriter::begin(
-                &self.doc,
-                &self.entry_id,
-                device_id,
-                self.started_at,
-            ) {
-                Ok(mut w) => {
-                    let r = w.sync(&rendered);
-                    let (ix, written) = w.into_state();
-                    self.entry_index = Some(ix);
-                    self.written = written;
-                    r
+            None => {
+                match SegmentWriter::begin(&self.doc, &self.entry_id, device_id, self.started_at) {
+                    Ok(mut w) => {
+                        let r = w.sync(&rendered);
+                        let (ix, written) = w.into_state();
+                        self.entry_index = Some(ix);
+                        self.written = written;
+                        r
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
         };
         if let Err(err) = result {
             // Fail soft: a broken subagent doc degrades to chip-only, never
@@ -1516,9 +1512,9 @@ async fn drive_run(
         {
             inner.publish(&chat_id, &event);
             let sub_id = subagent_doc_id(&chat_id, parent_tool_use_id);
-            let chip_streaming = folded.iter().any(
-                |p| matches!(p, MessagePart::Tool { id, .. } if id == parent_tool_use_id),
-            );
+            let chip_streaming = folded
+                .iter()
+                .any(|p| matches!(p, MessagePart::Tool { id, .. } if id == parent_tool_use_id));
             let sink_known = subagents.contains_key(parent_tool_use_id);
             if chip_streaming {
                 if !sink_known {
@@ -1543,8 +1539,7 @@ async fn drive_run(
             // A Done with NO sink (a subagent that never streamed — codex
             // turn ends can beat registration) is chip-only: minting a doc
             // just to freeze it empty helps no one.
-            let done_only = !sink_known
-                && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
             if !sink_known && !done_only {
                 let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
                     Ok(handle) => Some(handle.doc_arc()),

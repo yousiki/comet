@@ -9,7 +9,7 @@ Every device runs a small engine that stores sessions on that device. A new inst
 ## Install and run locally (Linux)
 
 ```bash
-curl -fsSL https://zeron.sh/install.sh | sh
+curl -fsSL https://edge.siki.moe/install.sh | sh
 zeron status
 ```
 

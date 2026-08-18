@@ -1,7 +1,7 @@
 #!/bin/sh
 # Zeron (native) headless installer.
 #
-#   curl -fsSL https://zeron.sh/install.sh | sh
+#   curl -fsSL https://edge.siki.moe/install.sh | sh
 #
 # Installs the self-contained native binary (no runtime deps) to
 # ~/.zeron/app, puts `zeron` on PATH, and runs it as a local-only
@@ -13,7 +13,7 @@
 # client-id configuration needed. Overrides (if any) go in ~/.zeron/env.
 set -eu
 
-BASE="${ZERON_BASE_URL:-https://zeron.sh}"
+BASE="${ZERON_BASE_URL:-https://edge.siki.moe}"
 
 # --- platform ---------------------------------------------------------------
 os="$(uname -s)"

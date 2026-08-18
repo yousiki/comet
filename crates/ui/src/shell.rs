@@ -37,10 +37,10 @@ use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
-use crate::settings::team::TeamPage;
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::team::TeamPage;
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
@@ -1671,7 +1671,13 @@ impl Shell {
                 title,
                 frozen,
             } => {
-                self.add_subagent_surface(chat_id.clone(), doc_id.clone(), title.clone(), *frozen, cx);
+                self.add_subagent_surface(
+                    chat_id.clone(),
+                    doc_id.clone(),
+                    title.clone(),
+                    *frozen,
+                    cx,
+                );
             }
         }
     }
@@ -5017,12 +5023,7 @@ impl Shell {
                 .right(px(10.0))
                 .flex()
                 .justify_center()
-                .child(self.jump_pill(
-                    "jump-to-bottom",
-                    "jump-pill",
-                    self.transcript.clone(),
-                    cx,
-                ))
+                .child(self.jump_pill("jump-to-bottom", "jump-pill", self.transcript.clone(), cx))
                 .into_any_element(),
         )
     }

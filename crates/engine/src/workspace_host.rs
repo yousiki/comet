@@ -363,17 +363,25 @@ impl WorkspaceHost {
                     Ok(client) => {
                         let client = Arc::new(client);
                         client.set_presence(now_ms());
+                        // Subscribe before reading the sticky readiness bit:
+                        // if a fast HTTP pull/WS hello lands between the two,
+                        // either `has_synced` observes it or `Synced` is queued.
                         let mut events = client.events();
+                        let remote_synced = client.has_synced();
                         if token_revoked(&token).await {
                             return;
                         }
                         let Some(inner) = weak.upgrade() else { return };
                         *lock(&inner.room) = Some(client.clone());
-                        // Hello state has been applied — unknown chats may be
-                        // claimed again (see `is_host` fail-closed gate).
-                        inner
-                            .synced_once
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        // Socket-only construction returns after hello, while
+                        // the dual transport deliberately returns local-first.
+                        // Only cross the ownership gate if remote state really
+                        // landed before we subscribed.
+                        if remote_synced {
+                            inner
+                                .synced_once
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
                         inner.bump_changed();
                         tracing::info!(org = %org_id, "registry room joined");
                         drop(inner);
@@ -386,6 +394,15 @@ impl WorkspaceHost {
                         loop {
                             tokio::select! {
                                 event = events.recv() => match event {
+                                    Ok(zeron_sync::RegistryEvent::Synced) => {
+                                        let Some(inner) = weak.upgrade() else { return };
+                                        if !inner
+                                            .synced_once
+                                            .swap(true, std::sync::atomic::Ordering::AcqRel)
+                                        {
+                                            inner.bump_changed();
+                                        }
+                                    }
                                     Ok(zeron_sync::RegistryEvent::Applied)
                                     | Ok(zeron_sync::RegistryEvent::Connected) => {
                                         let Some(inner) = weak.upgrade() else { return };
@@ -396,7 +413,23 @@ impl WorkspaceHost {
                                         inner.publish();
                                     }
                                     Ok(zeron_sync::RegistryEvent::Disconnected) => {}
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                        // `Synced` is deliberately one-shot. If this receiver
+                                        // lagged past it, recover from the client's sticky latch
+                                        // instead of leaving host claims closed forever.
+                                        let Some(inner) = weak.upgrade() else { return };
+                                        let remote_synced = lock(&inner.room)
+                                            .as_ref()
+                                            .is_some_and(|room| room.has_synced());
+                                        if remote_synced
+                                            && !inner.synced_once.swap(
+                                                true,
+                                                std::sync::atomic::Ordering::AcqRel,
+                                            )
+                                        {
+                                            inner.bump_changed();
+                                        }
+                                    }
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 },
                                 _ = token_changed(&mut token_changes) => {
@@ -577,7 +610,7 @@ impl WorkspaceHost {
                     || self
                         .inner
                         .synced_once
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .load(std::sync::atomic::Ordering::Acquire)
             }
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry chat read failed");
@@ -1324,7 +1357,6 @@ fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> Stri
         .to_string()
 }
 
-
 /// Plain-HTTPS registry pull/push derived from the SAME WebSocket URL
 /// provider the dial uses (`wss://…/registry/{org}/ws?token=…&device=…`):
 /// swap the scheme, swap the `/ws` leaf for `/rows` or `/push`, keep the
@@ -1355,7 +1387,9 @@ impl WsDerivedRegistryTransport {
         let _ = u.set_scheme(scheme);
         let path = u.path().to_string();
         let Some(base) = path.strip_suffix("/ws") else {
-            return Err(zeron_sync::SyncError::Protocol("ws url without /ws leaf".into()));
+            return Err(zeron_sync::SyncError::Protocol(
+                "ws url without /ws leaf".into(),
+            ));
         };
         let new_path = format!("{base}/{leaf}");
         u.set_path(&new_path);

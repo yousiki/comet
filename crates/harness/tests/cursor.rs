@@ -8,7 +8,9 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use zeron_harness::{CancellationToken, CursorHarness, Harness, RunControls, SteerMessage};
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall};
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, McpServerConfig, RunRequest, SandboxLevel, ToolCall,
+};
 
 fn fixture_path() -> PathBuf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -39,6 +41,19 @@ fn request(prompt: &str) -> RunRequest {
         auto_approve: true,
         attachments: Vec::new(),
         resume: None,
+        mcp_servers: Vec::new(),
+    }
+}
+
+fn mcp_server() -> McpServerConfig {
+    McpServerConfig {
+        name: "zeron".into(),
+        command: "/opt/zeron bin/comet".into(),
+        args: vec!["mcp-bridge".into(), "--literal=$HOME".into()],
+        env: vec![
+            ("ZERON_CHAT_ID".into(), "chat-a".into()),
+            ("ZERON_IPC_PORT".into(), "12345".into()),
+        ],
     }
 }
 
@@ -268,6 +283,31 @@ async fn fatal_frame_surfaces_the_auth_fix_as_an_errored_done() {
         }
         other => panic!("expected errored done, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn mcp_config_is_forwarded_to_cursor_sdk_create_or_resume_options() {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:mcp");
+    req.resume = Some("agent-existing".into());
+    req.mcp_servers = vec![mcp_server()];
+    let events = run_to_first_done(&harness(), req, controls).await;
+
+    assert!(events.contains(&AgentEvent::ToolCall {
+        id: "mcp-1".into(),
+        call: ToolCall::Mcp {
+            server: "zeron".into(),
+            tool: "send_to_session".into(),
+            input: Some(serde_json::json!({ "target_chat_id": "chat-b" })),
+        },
+    }));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

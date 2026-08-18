@@ -88,6 +88,269 @@ struct ChatStateHeader: Equatable {
 
 // ── catch-up planning (pure — the client-side precision rule) ───────────────
 
+// ── HTTPS push/pull validation ──
+
+/// A POST `/rows` acknowledgement. It stays staged until the following GET
+/// proves that the remote frontier containing this sequence was applied.
+struct ChatHTTPPushAck: Hashable {
+    var batchId: String
+    var seq: UInt64
+}
+
+private struct ChatHTTPPushAckBody: Decodable {
+    var batchId: String
+    var seq: UInt64
+    var dup: Bool?
+}
+
+/// Decode an ack without NSNumber's lossy/coercing `uint64Value` behavior.
+/// In particular, booleans, negative/fractional values and an ack for another
+/// batch are protocol failures, not permission to retire local data.
+func chatDecodeHTTPPushAck(_ data: Data, expectedBatchId: String) -> ChatHTTPPushAck? {
+    guard !expectedBatchId.isEmpty,
+          let body = try? JSONDecoder().decode(ChatHTTPPushAckBody.self, from: data),
+          body.batchId == expectedBatchId, body.seq > 0 else { return nil }
+    return ChatHTTPPushAck(batchId: body.batchId, seq: body.seq)
+}
+
+struct ChatHTTPPullRow {
+    var frame: ChatWireFrame
+    var seq: UInt64
+    var batchId: String
+}
+
+/// A completely decoded GET `/rows` body. Construction is intentionally
+/// strict: a truncated/unknown/skipped frame must never become evidence used
+/// to retire a pending push.
+struct ChatHTTPPullBatch {
+    var stateFrame: ChatWireFrame
+    var state: ChatStateHeader
+    var rows: [ChatHTTPPullRow]
+    var headSeq: UInt64
+}
+
+private struct ChatHTTPStateBody: Decodable {
+    var headSeq: UInt64
+    var seqFloor: UInt64
+    var checkpointSeq: UInt64
+    var checkpointSize: UInt64
+    var rowCount: UInt64?
+    var rowBytes: UInt64?
+}
+
+private struct ChatHTTPRowBody: Decodable {
+    var seq: UInt64
+    var device: String
+    var batchId: String
+}
+
+private struct ChatHTTPRowsDoneBody: Decodable {
+    var headSeq: UInt64
+}
+
+private func chatDecodeHeader<T: Decodable>(_ header: [String: Any], as: T.Type) -> T? {
+    guard JSONSerialization.isValidJSONObject(header),
+          let data = try? JSONSerialization.data(withJSONObject: header),
+          let decoded = try? JSONDecoder().decode(T.self, from: data) else { return nil }
+    return decoded
+}
+
+/// Decode the u32-LE length-prefixed HTTP response and require the exact
+/// `state, row*, rowsDone` grammar. Rows must be non-empty and strictly
+/// increasing; completeness relative to the request cursor is checked by
+/// `chatHTTPPullCoversFrontier` below.
+func chatDecodeHTTPPull(_ body: Data) -> ChatHTTPPullBatch? {
+    var frames: [ChatWireFrame] = []
+    var offset = 0
+    while offset < body.count {
+        guard body.count - offset >= 4 else { return nil }
+        let length = body.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
+            Int($0.loadUnaligned(as: UInt32.self).littleEndian)
+        }
+        offset += 4
+        guard length >= 5, length <= body.count - offset,
+              let frame = ChatWire.decode(body.subdata(in: offset..<(offset + length))) else {
+            return nil
+        }
+        frames.append(frame)
+        offset += length
+    }
+
+    guard frames.count >= 2,
+          frames[0].kind == ChatFrameType.state,
+          frames[frames.count - 1].kind == ChatFrameType.rowsDone,
+          let strictState = chatDecodeHeader(frames[0].header, as: ChatHTTPStateBody.self),
+          let state = ChatStateHeader(frames[0].header),
+          let done = chatDecodeHeader(frames[frames.count - 1].header,
+                                      as: ChatHTTPRowsDoneBody.self),
+          strictState.seqFloor <= strictState.checkpointSeq,
+          strictState.checkpointSeq <= strictState.headSeq,
+          state.headSeq == strictState.headSeq,
+          done.headSeq == strictState.headSeq else { return nil }
+
+    var rows: [ChatHTTPPullRow] = []
+    var previousSeq: UInt64 = 0
+    for frame in frames.dropFirst().dropLast() {
+        guard frame.kind == ChatFrameType.row,
+              let header = chatDecodeHeader(frame.header, as: ChatHTTPRowBody.self),
+              header.seq > previousSeq, header.seq <= done.headSeq,
+              !header.batchId.isEmpty, !frame.payload.isEmpty else { return nil }
+        previousSeq = header.seq
+        rows.append(ChatHTTPPullRow(frame: frame, seq: header.seq,
+                                    batchId: header.batchId))
+    }
+    return ChatHTTPPullBatch(stateFrame: frames[0], state: state,
+                             rows: rows, headSeq: done.headSeq)
+}
+
+/// The cursor represented by a checkpoint-confirmed local doc before the
+/// response's rows are applied. Rows at/below it may have been pruned.
+func chatHTTPConfirmedBase(capturedCursor: UInt64, state: ChatStateHeader) -> UInt64 {
+    state.checkpointSize > 0 ? max(capturedCursor, state.checkpointSeq) : capturedCursor
+}
+
+/// A decoded body is a frontier proof only when it contains every unpruned
+/// sequence after the pre-push cursor (or checkpoint) through rowsDone.
+func chatHTTPPullCoversFrontier(capturedCursor: UInt64,
+                                pull: ChatHTTPPullBatch) -> Bool {
+    guard pull.state.headSeq >= capturedCursor else { return false }
+    let base = chatHTTPConfirmedBase(capturedCursor: capturedCursor, state: pull.state)
+    guard base <= pull.headSeq else { return false }
+    var expected = base
+    for row in pull.rows {
+        guard expected < UInt64.max else { return false }
+        expected += 1
+        guard row.seq == expected else { return false }
+    }
+    return expected == pull.headSeq
+}
+
+/// A state behind the request cursor, or behind an ack returned just before
+/// it, is authoritative reset evidence. With a checkpoint, its sequence is
+/// the only safe restart point; otherwise replay the room from zero.
+func chatHTTPResetCursor(capturedCursor: UInt64,
+                         state: ChatStateHeader,
+                         stagedAcks: [ChatHTTPPushAck] = []) -> UInt64? {
+    // `captured=0, head=0` is still a reset when this cycle just received an
+    // ack at seq 1+: the POST and GET observed different room incarnations.
+    guard state.headSeq < capturedCursor
+            || stagedAcks.contains(where: { $0.seq > state.headSeq }) else { return nil }
+    return chatResetAnchor(state: state)
+}
+
+/// Exact safe cursor for a confirmed reset. A malformed/ahead checkpoint is
+/// not an anchor and falls back to a full replay.
+func chatResetAnchor(state: ChatStateHeader) -> UInt64 {
+    state.checkpointSize > 0 && state.checkpointSeq <= state.headSeq
+        ? state.checkpointSeq : 0
+}
+
+/// Pull far enough back to include every acknowledgement whose batch identity
+/// this cycle intends to prove. `seq == 0` is malformed but still maps safely
+/// to zero so the later identity check forces reset instead of underflowing.
+func chatHTTPPullSince(prePushCursor: UInt64,
+                       acknowledgements: [ChatHTTPPushAck]) -> UInt64 {
+    acknowledgements.reduce(prePushCursor) { cursor, ack in
+        min(cursor, ack.seq > 0 ? ack.seq - 1 : 0)
+    }
+}
+
+func chatHTTPAcknowledgementIsProven(pullSince: UInt64,
+                                     pull: ChatHTTPPullBatch,
+                                     ack: ChatHTTPPushAck) -> Bool {
+    guard ack.seq > pullSince, ack.seq <= pull.headSeq,
+          let row = pull.rows.first(where: { $0.seq == ack.seq }) else { return false }
+    return row.batchId == ack.batchId
+}
+
+/// Exact proof tuples from the pre-dispatch snapshot. The caller uses this
+/// same set to retire pending pushes and journal entries atomically after all
+/// rows apply; acknowledgements arriving after dispatch are not swept up.
+func chatHTTPProvenAcknowledgements(pullSince: UInt64,
+                                    pull: ChatHTTPPullBatch,
+                                    acknowledgements: [ChatHTTPPushAck]) -> [ChatHTTPPushAck] {
+    var seen = Set<ChatHTTPPushAck>()
+    return acknowledgements.filter { ack in
+        chatHTTPAcknowledgementIsProven(pullSince: pullSince, pull: pull, ack: ack)
+            && seen.insert(ack).inserted
+    }
+}
+
+/// Remove only exact tuples proven by this cycle. A late ACK with a different
+/// tuple remains journaled for the next pull, while a late WS copy of a staged
+/// HTTP ACK is cleared by the staged tuple's proof.
+func chatHTTPRetainedAcknowledgements(current: [ChatHTTPPushAck],
+                                      proven: [ChatHTTPPushAck]) -> [ChatHTTPPushAck] {
+    let provenSet = Set(proven)
+    return current.filter { !provenSet.contains($0) }
+}
+
+/// Detect an ABA room reset even when the new incarnation's numeric head has
+/// already caught up with the old cursor. Every acknowledgement in the fixed
+/// pre-dispatch proof snapshot must name its exact row in this response.
+func chatAcknowledgementsRequireReset(pullSince: UInt64,
+                                      pull: ChatHTTPPullBatch,
+                                      acknowledgements: [ChatHTTPPushAck]) -> Bool {
+    acknowledgements.contains {
+        !chatHTTPAcknowledgementIsProven(pullSince: pullSince, pull: pull, ack: $0)
+    }
+}
+
+/// Stable replay order after reset. Acked entries come first because they may
+/// have been removed from `pending` by a racing WS ACK; the HTTP snapshot and
+/// current queue fill the rest. Permanent server verdicts are never restored.
+func chatResetReplayOrder(acknowledgedBatchIds: [String],
+                          snapshotBatchIds: [String],
+                          pendingBatchIds: [String],
+                          permanentlyRejected: Set<String>) -> [String] {
+    var seen = Set<String>()
+    return (acknowledgedBatchIds + snapshotBatchIds + pendingBatchIds).filter { batchId in
+        !batchId.isEmpty && !permanentlyRejected.contains(batchId)
+            && seen.insert(batchId).inserted
+    }
+}
+
+/// Every async transport response is stamped with the room-reset version at
+/// dispatch. A reset changes the version before any await, invalidating old
+/// HTTP responses and frames from the socket incarnation being replaced.
+func chatSessionVersionIsCurrent(_ responseVersion: UInt64,
+                                 currentVersion: UInt64) -> Bool {
+    responseVersion == currentVersion
+}
+
+enum ChatHTTPPushDisposition: Equatable {
+    case retire
+    case retry
+    case reset(cursor: UInt64)
+}
+
+/// Decide whether a staged POST ack can retire its local batch. `pullApplied`
+/// means checkpoint/frontier validation and every parsed row application have
+/// completed, and the delegate cursor covers `pull.headSeq`.
+func chatHTTPPushDisposition(prePushCursor: UInt64,
+                             pullSince: UInt64,
+                             pull: ChatHTTPPullBatch,
+                             pullApplied: Bool,
+                             ack: ChatHTTPPushAck) -> ChatHTTPPushDisposition {
+    if let cursor = chatHTTPResetCursor(capturedCursor: prePushCursor,
+                                        state: pull.state,
+                                        stagedAcks: [ack]) {
+        return .reset(cursor: cursor)
+    }
+    if chatAcknowledgementsRequireReset(
+        pullSince: pullSince, pull: pull, acknowledgements: [ack]) {
+        return .reset(cursor: chatResetAnchor(state: pull.state))
+    }
+    guard pullApplied,
+          chatHTTPPullCoversFrontier(capturedCursor: pullSince, pull: pull),
+          ack.seq <= pull.headSeq else { return .retry }
+
+    if pull.rows.contains(where: { $0.seq == ack.seq && $0.batchId == ack.batchId }) {
+        return .retire
+    }
+    return .retry
+}
+
 enum ChatCatchUpPlan: Equatable {
     /// Local doc already contains the checkpoint frontier (or there is no
     /// checkpoint): stream rows only.

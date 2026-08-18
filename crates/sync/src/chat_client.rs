@@ -13,7 +13,7 @@
 //! transport pings prove nothing about the DO; room health is judged only by
 //! protocol frames with probe deadlines.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::chat_frames::{self as wire, frame_type};
@@ -93,6 +93,10 @@ pub enum ChatEvent {
     /// next posts a checkpoint — the C3 host should treat this event as a
     /// checkpoint trigger, not a shrug.
     PushRejected,
+    /// A room request was authenticated but refused with HTTP 403. This is
+    /// also latched on [`ChatClient::access_denied`] because local-first
+    /// construction can finish before an event receiver subscribes.
+    AccessDenied,
 }
 
 // ── engine-facing traits ────────────────────────────────────────────────────
@@ -110,6 +114,10 @@ pub trait ChatDocSink: Send + Sync + 'static {
     fn contains_frontier(&self, frontier: &[u8]) -> bool;
     /// An own-write ack advanced the cursor with no content change.
     fn advance_cursor(&self, cursor: u64);
+    /// The server log was reset/replaced within the same room generation.
+    /// Persist `cursor` exactly (including a backwards move) without treating
+    /// it as an own-write ack or promoting a generation handoff epoch.
+    fn reset_cursor(&self, cursor: u64);
 }
 
 /// `GET /chat2/{chatId}/checkpoint` over HTTP. Implementations should resume
@@ -126,8 +134,11 @@ pub trait CheckpointFetcher: Send + Sync + 'static {
 /// Both are safe at-least-once: batchId dedupe and Loro re-import no-ops.
 pub trait ChatTransport: Send + Sync + 'static {
     fn fetch_rows(&self, after: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>>;
-    fn push(&self, batch_id: String, bytes: Vec<u8>)
-    -> BoxFuture<'static, Result<String, SyncError>>;
+    fn push(
+        &self,
+        batch_id: String,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<String, SyncError>>;
 }
 
 // ── catch-up planning (pure — the client-side precision rule) ───────────────
@@ -172,6 +183,123 @@ pub fn plan_catch_up(
     }
 }
 
+/// Fully decoded plain-HTTPS rows response. Unlike the WebSocket stream, this
+/// body is an atomic proof: staged POST acks may be retired only after every
+/// length-prefixed frame and the terminal frontier have been validated.
+struct HttpRowsResponse {
+    state: wire::StateHeader,
+    frontier: Vec<u8>,
+    rows: Vec<(wire::RowHeader, Vec<u8>)>,
+    head_seq: u64,
+}
+
+fn decode_http_rows_response(body: &[u8]) -> Result<HttpRowsResponse, String> {
+    let mut frames = Vec::new();
+    let mut off = 0usize;
+    while off < body.len() {
+        if body.len() - off < 4 {
+            return Err("trailing bytes after final HTTP row frame".into());
+        }
+        let len = u32::from_le_bytes(
+            body[off..off + 4]
+                .try_into()
+                .expect("four-byte prefix was bounds checked"),
+        ) as usize;
+        off += 4;
+        let end = off
+            .checked_add(len)
+            .ok_or_else(|| "HTTP row frame length overflow".to_string())?;
+        if end > body.len() {
+            return Err("truncated HTTP row frame".into());
+        }
+        let frame =
+            wire::decode(&body[off..end]).ok_or_else(|| "malformed HTTP row frame".to_string())?;
+        frames.push(frame);
+        off = end;
+    }
+
+    let mut iter = frames.into_iter();
+    let state_frame = iter
+        .next()
+        .ok_or_else(|| "HTTP rows response is empty".to_string())?;
+    if state_frame.kind != frame_type::STATE {
+        return Err("HTTP rows response does not start with STATE".into());
+    }
+    let state = serde_json::from_value::<wire::StateHeader>(state_frame.header)
+        .map_err(|err| format!("malformed HTTP STATE header: {err}"))?;
+    let mut rows = Vec::new();
+    let mut done = None;
+    for frame in iter {
+        if done.is_some() {
+            return Err("frame follows HTTP ROWS_DONE".into());
+        }
+        match frame.kind {
+            frame_type::ROW => {
+                let row = serde_json::from_value::<wire::RowHeader>(frame.header)
+                    .map_err(|err| format!("malformed HTTP ROW header: {err}"))?;
+                rows.push((row, frame.payload));
+            }
+            frame_type::ROWS_DONE => {
+                if !frame.payload.is_empty() {
+                    return Err("HTTP ROWS_DONE unexpectedly has a payload".into());
+                }
+                let header = serde_json::from_value::<wire::RowsDoneHeader>(frame.header)
+                    .map_err(|err| format!("malformed HTTP ROWS_DONE header: {err}"))?;
+                done = Some(header.head_seq);
+            }
+            _ => return Err("unexpected frame in HTTP rows response".into()),
+        }
+    }
+    let head_seq = done.ok_or_else(|| "HTTP rows response lacks ROWS_DONE".to_string())?;
+    Ok(HttpRowsResponse {
+        state,
+        frontier: state_frame.payload,
+        rows,
+        head_seq,
+    })
+}
+
+/// Verify that the response proves one contiguous local frontier through its
+/// terminal head. Rows at or below `covered_after` may be absent because an
+/// imported/contained checkpoint covers them; everything above it is exact.
+fn validate_http_rows_frontier(
+    response: &HttpRowsResponse,
+    requested_after: u64,
+    covered_after: u64,
+) -> Result<u64, String> {
+    if response.head_seq != response.state.head_seq {
+        return Err("HTTP STATE and ROWS_DONE disagree on headSeq".into());
+    }
+    if covered_after > response.head_seq {
+        return Err("HTTP covered frontier is ahead of ROWS_DONE".into());
+    }
+    let mut previous = requested_after;
+    let mut covered = covered_after;
+    for (row, _) in &response.rows {
+        if row.seq <= requested_after || row.seq <= previous {
+            return Err("HTTP rows are not strictly ordered after the request cursor".into());
+        }
+        previous = row.seq;
+        if row.seq > response.head_seq {
+            return Err("HTTP row is ahead of ROWS_DONE".into());
+        }
+        if row.seq <= covered_after {
+            continue;
+        }
+        let expected = covered
+            .checked_add(1)
+            .ok_or_else(|| "HTTP row frontier overflow".to_string())?;
+        if row.seq != expected {
+            return Err("HTTP rows leave a gap before ROWS_DONE".into());
+        }
+        covered = row.seq;
+    }
+    if covered != response.head_seq {
+        return Err("HTTP rows do not reach ROWS_DONE".into());
+    }
+    Ok(covered)
+}
+
 // ── transport plumbing (binary sibling of registry.rs's TextPipe) ───────────
 
 pub(crate) struct BinPipe {
@@ -187,6 +315,14 @@ struct WsBinConnector {
     url: Arc<dyn UrlProvider>,
 }
 
+fn map_ws_connect_error(err: WsError) -> SyncError {
+    if matches!(&err, WsError::Http(response) if response.status().as_u16() == 403) {
+        SyncError::AccessDenied("websocket handshake HTTP 403".into())
+    } else {
+        SyncError::WebSocket(err.to_string())
+    }
+}
+
 impl BinConnector for WsBinConnector {
     fn connect(&self) -> BoxFuture<'static, Result<BinPipe, SyncError>> {
         let provider = self.url.clone();
@@ -194,7 +330,7 @@ impl BinConnector for WsBinConnector {
             let url = provider.url().await?;
             let ws = crate::dial::connect_ws(&url)
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+                .map_err(map_ws_connect_error)?;
             let (out_tx, out_rx) = mpsc::channel(64);
             let (in_tx, in_rx) = mpsc::channel(64);
             tokio::spawn(pump(ws, out_rx, in_tx));
@@ -267,7 +403,22 @@ struct PendingPush {
 #[derive(Default)]
 struct Shared {
     cursor: u64,
+    /// Incremented for every intentional backwards cursor move. HTTP and WS
+    /// responses capture this before I/O; a changed value means their sequence
+    /// namespace was overtaken even if the numeric cursor later matches again.
+    reset_version: u64,
     pending: VecDeque<PendingPush>,
+    /// UUIDs captured by the single in-flight HTTPS round. A concurrent WS
+    /// permanent verdict only needs a tombstone while its UUID is in this set.
+    offline_snapshot_ids: HashSet<String>,
+    /// WS acks racing an HTTPS snapshot are staged here instead of retiring
+    /// the only replay copy. The HTTP round merges them with its POST acks once
+    /// a complete pull proves which room incarnation contains each sequence.
+    offline_ws_acks: HashMap<String, u64>,
+    /// Batch UUIDs that received a permanent server verdict while an HTTPS
+    /// round may still hold a pre-verdict snapshot. The round guard removes
+    /// its UUIDs on exit; until then reset recovery must not resurrect them.
+    permanent_rejections: HashSet<String>,
     /// Last hello/probe view of the server log (checkpoint-policy inputs).
     server: Option<wire::StateHeader>,
     /// Set by a transient (`quota`) rejection: re-push at this instant
@@ -330,10 +481,28 @@ pub struct ChatClient {
 #[derive(Default)]
 struct Flags {
     connected: std::sync::atomic::AtomicBool,
+    /// Sticky authorization verdict. A broadcast alone is insufficient:
+    /// the pull-first actor can receive a 403 before its caller subscribes.
+    access_denied: std::sync::atomic::AtomicBool,
     rejoins: std::sync::atomic::AtomicU64,
     disconnects: std::sync::atomic::AtomicU64,
     rejected: std::sync::atomic::AtomicU64,
     server_resets: std::sync::atomic::AtomicU64,
+}
+
+fn signal_access_denied(flags: &Flags, events: &broadcast::Sender<ChatEvent>) {
+    use std::sync::atomic::Ordering::AcqRel;
+    // One verdict/event per client is enough. The latch is the authoritative
+    // state for late subscribers; live subscribers get the transition.
+    if !flags.access_denied.swap(true, AcqRel) {
+        let _ = events.send(ChatEvent::AccessDenied);
+    }
+}
+
+fn signal_if_access_denied(err: &SyncError, flags: &Flags, events: &broadcast::Sender<ChatEvent>) {
+    if matches!(err, SyncError::AccessDenied(_)) {
+        signal_access_denied(flags, events);
+    }
 }
 
 impl ChatClient {
@@ -383,7 +552,9 @@ impl ChatClient {
     /// now and converging it is the actor's ongoing job), an HTTP pull
     /// bootstraps in ~1 RTT while the WS spends its round trips, and every
     /// backoff cycle syncs over HTTPS so a network that never passes the
-    /// upgrade still converges and still delivers sends.
+    /// upgrade still converges and still delivers sends. A later HTTP/WS
+    /// 403 is surfaced through [`ChatEvent::AccessDenied`] and the sticky
+    /// [`ChatClient::access_denied`] accessor.
     pub async fn connect_via_transport(
         provider: Arc<dyn UrlProvider>,
         sink: Arc<dyn ChatDocSink>,
@@ -413,8 +584,16 @@ impl ChatClient {
         initial_cursor: u64,
         tuning: ChatTuning,
     ) -> Result<Self, SyncError> {
-        Self::connect_with_transport(connector, sink, fetcher, device_id, initial_cursor, tuning, None)
-            .await
+        Self::connect_with_transport(
+            connector,
+            sink,
+            fetcher,
+            device_id,
+            initial_cursor,
+            tuning,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn connect_with_transport(
@@ -448,6 +627,7 @@ impl ChatClient {
             tuning,
             events: events.clone(),
             shutdown: shutdown_rx,
+            nudge: nudge_tx.clone(),
             nudge_rx,
             probe_rx,
             redial_rx,
@@ -487,6 +667,14 @@ impl ChatClient {
         self.events.subscribe()
     }
 
+    /// Whether any rows request or WebSocket handshake for this client was
+    /// refused with HTTP 403. Sticky for the client's lifetime so callers
+    /// can subscribe first and then inspect this value without a gap.
+    pub fn access_denied(&self) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        self.flags.access_denied.load(Acquire)
+    }
+
     /// Queue one local update batch for push (a fresh batch id is minted; the
     /// batch survives reconnects until acked — the server dedupes replays).
     ///
@@ -514,6 +702,22 @@ impl ChatClient {
             });
         }
         let _ = self.nudge.try_send(());
+    }
+
+    /// Stop this client and return every still-unacknowledged local update.
+    /// Hosts use this when parking an inaccessible legacy room: re-enqueueing
+    /// these bytes after a room-generation cutover is safe because both the
+    /// row protocol and Loro imports are at-least-once/idempotent.
+    pub fn into_pending_updates(mut self) -> Vec<Vec<u8>> {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        lock(&self.shared)
+            .pending
+            .drain(..)
+            .map(|push| push.bytes)
+            .collect()
     }
 
     /// Publish this device's presence beat with an opaque payload (cursor
@@ -607,6 +811,9 @@ struct Actor {
     tuning: ChatTuning,
     events: broadcast::Sender<ChatEvent>,
     shutdown: watch::Receiver<bool>,
+    /// Self-wake path used when the HTTPS sibling re-arms work while a socket
+    /// is already parked in steady state.
+    nudge: mpsc::Sender<()>,
     nudge_rx: mpsc::Receiver<()>,
     probe_rx: mpsc::Receiver<()>,
     redial_rx: mpsc::Receiver<()>,
@@ -646,6 +853,446 @@ enum Waited {
     Shutdown,
 }
 
+fn retire_confirmed_http_acks(
+    shared: &mut Shared,
+    acked: &[(String, u64)],
+    confirmed_frontier: u64,
+) -> (bool, bool) {
+    let mut retired = false;
+    let mut unconfirmed = false;
+    for (batch_id, seq) in acked {
+        if !shared.pending.iter().any(|push| push.batch_id == *batch_id) {
+            // The WebSocket sibling (or a permanent verdict) already retired
+            // this exact UUID; never let an old HTTP result affect new work.
+            continue;
+        }
+        if *seq <= confirmed_frontier {
+            shared.pending.retain(|push| push.batch_id != *batch_id);
+            retired = true;
+        } else {
+            unconfirmed = true;
+        }
+    }
+    (retired, unconfirmed)
+}
+
+fn merged_round_acks(
+    shared: &Shared,
+    http_acks: &[(String, u64)],
+    batches: &[(String, Vec<u8>)],
+) -> Vec<(String, u64)> {
+    batches
+        .iter()
+        .filter_map(|(batch_id, _)| {
+            let http_seq = http_acks
+                .iter()
+                .filter(|(acked_id, _)| acked_id == batch_id)
+                .map(|(_, seq)| *seq)
+                .max();
+            let ws_seq = shared.offline_ws_acks.get(batch_id).copied();
+            http_seq
+                .into_iter()
+                .chain(ws_seq)
+                .max()
+                .map(|seq| (batch_id.clone(), seq))
+        })
+        .collect()
+}
+
+/// A complete pull can confirm an ack only when the exact `(seq, batchId)` row
+/// is present. A sequence above the new head, a missing row (including one
+/// omitted by the request cursor or hidden behind a checkpoint), or a
+/// different batch at that sequence means the ack came from another log
+/// incarnation or the response is otherwise inconsistent. Checkpoint-frontier
+/// containment only proves local document state, not that the server's
+/// checkpoint contains this pending batch. Conservatively re-anchor and
+/// replay; Loro import and batch-id dedupe make that safe.
+fn round_acks_require_reset(response: &HttpRowsResponse, acked: &[(String, u64)]) -> bool {
+    acked.iter().any(|(batch_id, seq)| {
+        if *seq > response.head_seq {
+            return true;
+        }
+        !response
+            .rows
+            .iter()
+            .any(|(row, _)| row.seq == *seq && row.batch_id == *batch_id)
+    })
+}
+
+struct OfflineRoundGuard {
+    shared: Arc<Mutex<Shared>>,
+    pull_reset_version: u64,
+    reset_observed: bool,
+    batches: Vec<(String, Vec<u8>)>,
+    finished: bool,
+}
+
+impl OfflineRoundGuard {
+    /// Finish while the caller still owns the shared-state lock. This closes
+    /// the gap in which a WS ack could otherwise be staged after the final
+    /// merge but before Drop cleared the round's snapshot IDs.
+    fn finish_locked(&mut self, shared: &mut Shared) -> usize {
+        if self.finished {
+            return 0;
+        }
+        let restored = if self.reset_observed || shared.reset_version != self.pull_reset_version {
+            restore_http_snapshot_after_reset(shared, &self.batches)
+        } else {
+            0
+        };
+        for (batch_id, _) in &self.batches {
+            shared.offline_snapshot_ids.remove(batch_id);
+            shared.offline_ws_acks.remove(batch_id);
+            shared.permanent_rejections.remove(batch_id);
+        }
+        self.finished = true;
+        restored
+    }
+}
+
+impl Drop for OfflineRoundGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let shared_arc = self.shared.clone();
+        let mut shared = lock(&shared_arc);
+        self.finish_locked(&mut shared);
+    }
+}
+
+/// Restore the replay copies captured before this HTTP round. An ack that
+/// arrived before reset evidence is no longer proof that the row survived the
+/// reset; permanent verdicts are the sole exception. Snapshot batches retain
+/// their original order and stay ahead of work enqueued during the round.
+fn restore_http_snapshot_after_reset(shared: &mut Shared, batches: &[(String, Vec<u8>)]) -> usize {
+    let mut restored = 0usize;
+    let mut replay = VecDeque::new();
+    for (batch_id, bytes) in batches {
+        if shared.permanent_rejections.contains(batch_id) {
+            continue;
+        }
+        if let Some(index) = shared
+            .pending
+            .iter()
+            .position(|push| push.batch_id == *batch_id)
+        {
+            replay.push_back(
+                shared
+                    .pending
+                    .remove(index)
+                    .expect("position came from the same queue"),
+            );
+        } else {
+            replay.push_back(PendingPush {
+                batch_id: batch_id.clone(),
+                bytes: bytes.clone(),
+            });
+            restored += 1;
+        }
+    }
+    replay.append(&mut shared.pending);
+    shared.pending = replay;
+    restored
+}
+
+async fn offline_sync_once(
+    transport: Arc<dyn ChatTransport>,
+    shared: Arc<Mutex<Shared>>,
+    sink: Arc<dyn ChatDocSink>,
+    fetcher: Arc<dyn CheckpointFetcher>,
+    events: broadcast::Sender<ChatEvent>,
+    flags: Arc<Flags>,
+    nudge: mpsc::Sender<()>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // This is the only cursor the GET may use. A POST ack can sit above unseen
+    // foreign rows and therefore is not a pull frontier by itself.
+    let (pull_since, pull_reset_version, batches): (u64, u64, Vec<(String, Vec<u8>)>) = {
+        let mut shared = lock(&shared);
+        let batches: Vec<_> = shared
+            .pending
+            .iter()
+            .map(|push| (push.batch_id.clone(), push.bytes.clone()))
+            .collect();
+        shared
+            .offline_snapshot_ids
+            .extend(batches.iter().map(|(batch_id, _)| batch_id.clone()));
+        (shared.cursor, shared.reset_version, batches)
+    };
+    let mut round_guard = OfflineRoundGuard {
+        shared: shared.clone(),
+        pull_reset_version,
+        reset_observed: false,
+        batches,
+        finished: false,
+    };
+    let mut acked = Vec::new();
+    let mut push_failed = false;
+    for (batch_id, bytes) in &round_guard.batches {
+        match transport.push(batch_id.clone(), bytes.clone()).await {
+            Ok(body) => match serde_json::from_str::<wire::AckHeader>(&body) {
+                Ok(ack) if ack.batch_id == *batch_id && ack.seq > 0 => {
+                    acked.push((ack.batch_id, ack.seq));
+                }
+                _ => {
+                    tracing::warn!(batch = %batch_id,
+                        "chat2: malformed/mismatched http push ack; will retry");
+                    push_failed = true;
+                    break;
+                }
+            },
+            Err(SyncError::PushRejected(code)) => {
+                // A permanent verdict is the one safe pre-pull retirement: no
+                // future retry can land this exact payload. Continue so a bad
+                // head (notably an oversized handoff full update) cannot wedge
+                // later small deltas behind it.
+                let dropped = {
+                    let mut shared = lock(&shared);
+                    shared.permanent_rejections.insert(batch_id.clone());
+                    let before = shared.pending.len();
+                    shared.pending.retain(|push| push.batch_id != *batch_id);
+                    let dropped = before != shared.pending.len();
+                    if dropped && !shared.pending.is_empty() {
+                        shared.retry_at = Some(tokio::time::Instant::now());
+                    }
+                    dropped
+                };
+                if dropped {
+                    flags.rejected.fetch_add(1, Relaxed);
+                    tracing::error!(batch = %batch_id, code,
+                        "chat2: HTTP batch permanently rejected; retired and continuing");
+                    let _ = events.send(ChatEvent::PushRejected);
+                }
+            }
+            Err(err) => {
+                signal_if_access_denied(&err, &flags, &events);
+                tracing::warn!(error = %err, "chat2: http push failed; will retry");
+                push_failed = true;
+                break;
+            }
+        }
+    }
+
+    let body = match transport.fetch_rows(pull_since).await {
+        Ok(body) => body,
+        Err(err) => {
+            signal_if_access_denied(&err, &flags, &events);
+            tracing::warn!(error = %err, "chat2: http pull failed; will retry");
+            let _ = nudge.try_send(());
+            return;
+        }
+    };
+    let response = match decode_http_rows_response(&body) {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(error = %err, "chat2: incomplete/malformed http pull; will retry");
+            let _ = nudge.try_send(());
+            return;
+        }
+    };
+    if response.head_seq != response.state.head_seq {
+        tracing::warn!(
+            state_head = response.state.head_seq,
+            done_head = response.head_seq,
+            "chat2: HTTP STATE/ROWS_DONE frontier mismatch; will retry"
+        );
+        let _ = nudge.try_send(());
+        return;
+    }
+    let cursor_reset_observed = response.state.head_seq < pull_since;
+    // capturedCursor=0/head=0 cannot express a backwards comparison. Merge
+    // HTTP POST acks with WS acks staged against this snapshot, then require
+    // the complete GET to prove both their sequence and batch identity.
+    let merged_acks = {
+        let shared = lock(&shared);
+        merged_round_acks(&shared, &acked, &round_guard.batches)
+    };
+    let mut ack_reset_observed = round_acks_require_reset(&response, &merged_acks);
+    let mut reset_observed = cursor_reset_observed || ack_reset_observed;
+    round_guard.reset_observed = reset_observed;
+    if cursor_reset_observed && !response.rows.is_empty() {
+        tracing::warn!(
+            pull_since,
+            head_seq = response.head_seq,
+            "chat2: reset response unexpectedly contains rows beyond the old cursor"
+        );
+        let _ = nudge.try_send(());
+        return;
+    }
+    let contained =
+        response.state.checkpoint_size == 0 || sink.contains_frontier(&response.frontier);
+    let ordinary_plan = plan_catch_up(pull_since, &response.state, contained);
+    let reset_plan = plan_catch_up(0, &response.state, contained);
+    let initial_plan = if reset_observed {
+        reset_plan
+    } else {
+        ordinary_plan
+    };
+    let initial_after = match initial_plan {
+        CatchUpPlan::RowsOnly { after } | CatchUpPlan::CheckpointThenRows { after } => after,
+    };
+
+    // A reset response was fetched with the old, now-meaningless `after`, so
+    // its lack of rows cannot prove the new frontier. It is still authoritative
+    // evidence for the exact cursor reset; the self-nudge fetches from `after`
+    // next. Normal responses must prove every sequence through ROWS_DONE.
+    let verified_frontier = if reset_observed {
+        None
+    } else {
+        match validate_http_rows_frontier(&response, pull_since, initial_after) {
+            Ok(frontier) => Some(frontier),
+            Err(err) => {
+                tracing::warn!(error = %err, "chat2: http pull frontier is incomplete; will retry");
+                let _ = nudge.try_send(());
+                return;
+            }
+        }
+    };
+
+    let checkpoint = if matches!(initial_plan, CatchUpPlan::CheckpointThenRows { .. }) {
+        match tokio::time::timeout(CHECKPOINT_FETCH_DEADLINE, fetcher.fetch()).await {
+            Ok(Ok(bytes)) => Some(bytes),
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "chat2: http checkpoint fetch failed; will retry");
+                let _ = nudge.try_send(());
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("chat2: http checkpoint fetch timed out; will retry");
+                let _ = nudge.try_send(());
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut shared = lock(&shared);
+    if shared.reset_version != pull_reset_version {
+        // A sibling already crossed a reset boundary. Sequence numbers in this
+        // response (and every staged pre-boundary ack) are no longer comparable.
+        // Restore snapshot batches that a pre-reset WS ack may have removed.
+        let restored = round_guard.finish_locked(&mut shared);
+        drop(shared);
+        if restored > 0 {
+            tracing::warn!(restored, "chat2: restored pre-reset HTTP snapshot batches");
+        }
+        let _ = nudge.try_send(());
+        return;
+    }
+
+    // Cover WS acks that arrived while a checkpoint was being fetched. The
+    // checkpoint decision itself is independent of the starting cursor, so a
+    // newly discovered reset can safely switch from the ordinary plan to the
+    // already-fetched reset plan here.
+    let merged_acks = merged_round_acks(&shared, &acked, &round_guard.batches);
+    let final_ack_reset_observed = round_acks_require_reset(&response, &merged_acks);
+    if final_ack_reset_observed {
+        ack_reset_observed = true;
+        reset_observed = true;
+        round_guard.reset_observed = true;
+    }
+    let plan = if reset_observed {
+        reset_plan
+    } else {
+        ordinary_plan
+    };
+    let after = match plan {
+        CatchUpPlan::RowsOnly { after } | CatchUpPlan::CheckpointThenRows { after } => after,
+    };
+    if shared.cursor != pull_since && !reset_observed {
+        // The WebSocket sibling overtook this GET. Its continuous cursor can
+        // confirm staged acks in the same reset generation, but stale HTTP rows
+        // must never be allowed to move sink persistence backwards.
+        let current = shared.cursor;
+        let (retired, unconfirmed) = retire_confirmed_http_acks(&mut shared, &merged_acks, current);
+        if retired {
+            sink.advance_cursor(current);
+        }
+        let needs_nudge = push_failed || unconfirmed || response.head_seq > current;
+        round_guard.finish_locked(&mut shared);
+        drop(shared);
+        if retired {
+            let _ = events.send(ChatEvent::Applied);
+        }
+        if needs_nudge {
+            let _ = nudge.try_send(());
+        }
+        return;
+    }
+
+    shared.server = Some(response.state);
+    if reset_observed {
+        if let Some(bytes) = checkpoint {
+            if let Err(err) = sink.apply_checkpoint(&bytes, response.state.checkpoint_seq) {
+                drop(shared);
+                tracing::warn!(error = %err, "chat2: reset checkpoint import failed; will retry");
+                let _ = nudge.try_send(());
+                return;
+            }
+        }
+        let restored = round_guard.finish_locked(&mut shared);
+        shared.cursor = after;
+        shared.reset_version = shared.reset_version.wrapping_add(1);
+        sink.reset_cursor(after);
+        drop(shared);
+        flags.server_resets.fetch_add(1, Relaxed);
+        tracing::warn!(
+            pull_since,
+            head_seq = response.state.head_seq,
+            after,
+            ack_reset_observed,
+            restored,
+            "chat2: HTTP pull observed a room reset; pending pushes retained"
+        );
+        let _ = events.send(ChatEvent::ServerReset);
+        let _ = events.send(ChatEvent::Applied);
+        let _ = nudge.try_send(());
+        return;
+    }
+
+    let mut applied = false;
+    if let Some(bytes) = checkpoint {
+        if let Err(err) = sink.apply_checkpoint(&bytes, response.state.checkpoint_seq) {
+            drop(shared);
+            tracing::warn!(error = %err, "chat2: http checkpoint import failed; will retry");
+            let _ = nudge.try_send(());
+            return;
+        }
+        shared.cursor = shared.cursor.max(after);
+        applied = true;
+    }
+    for (row, payload) in response.rows {
+        sink.apply_row(&payload, row.seq);
+        shared.cursor = shared.cursor.max(row.seq);
+        applied = true;
+    }
+    let verified_frontier = verified_frontier.expect("normal response validated a frontier");
+    if shared.cursor < verified_frontier {
+        // A contained checkpoint can cover a trimmed prefix without producing
+        // a row callback. Persist that proven cursor without promoting epoch.
+        shared.cursor = verified_frontier;
+        sink.reset_cursor(verified_frontier);
+        applied = true;
+    }
+    let (retired, unconfirmed) =
+        retire_confirmed_http_acks(&mut shared, &merged_acks, verified_frontier);
+    if retired {
+        sink.advance_cursor(shared.cursor);
+    }
+    let needs_nudge = push_failed || unconfirmed;
+    round_guard.finish_locked(&mut shared);
+    drop(shared);
+    if applied || retired {
+        let _ = events.send(ChatEvent::Applied);
+    }
+    if needs_nudge {
+        let _ = nudge.try_send(());
+    }
+}
+
 impl Actor {
     async fn run(mut self, ready: oneshot::Sender<Result<(), SyncError>>) {
         let mut ready = Some(ready);
@@ -672,6 +1319,7 @@ impl Actor {
             let pipe = match dial {
                 Ok(Ok(pipe)) => pipe,
                 Ok(Err(err)) => {
+                    signal_if_access_denied(&err, &self.flags, &self.events);
                     if let Some(ready) = ready.take() {
                         let _ = ready.send(Err(err));
                         return; // first join failed: caller owns the retry
@@ -766,11 +1414,14 @@ impl Actor {
         use std::sync::atomic::Ordering::Relaxed;
 
         // ── hello / state ───────────────────────────────────────────────────
-        let cursor = lock(&self.shared).cursor;
+        let (requested_cursor, requested_reset_version) = {
+            let shared = lock(&self.shared);
+            (shared.cursor, shared.reset_version)
+        };
         let hello = wire::encode(
             frame_type::HELLO,
             &wire::HelloHeader {
-                cursor,
+                cursor: requested_cursor,
                 device: &self.device_id,
             },
             &[],
@@ -801,6 +1452,18 @@ impl Actor {
             tracing::warn!("chat2: malformed state header");
             return SessionEnd::Reconnect;
         };
+        {
+            let shared = lock(&self.shared);
+            if shared.reset_version != requested_reset_version || shared.cursor != requested_cursor
+            {
+                tracing::debug!(
+                    requested_cursor,
+                    current = shared.cursor,
+                    "chat2: skipping WS state overtaken by sibling transport"
+                );
+                return SessionEnd::Reconnect;
+            }
+        }
         lock(&self.shared).server = Some(state);
         // Cursor amnesty, once per client: a cursor above the checkpoint seq
         // claims history the doc may have silently parked and dropped —
@@ -818,6 +1481,8 @@ impl Actor {
                     "chat2: cursor amnesty — refetching rows above the checkpoint"
                 );
                 shared.cursor = state.checkpoint_seq;
+                shared.reset_version = shared.reset_version.wrapping_add(1);
+                self.sink.reset_cursor(state.checkpoint_seq);
             }
         }
         let cursor = lock(&self.shared).cursor;
@@ -855,8 +1520,17 @@ impl Actor {
         // Clamp the persisted cursor into the room's honest range (server
         // reset detection happened in plan_catch_up via after==0).
         if after < cursor {
-            lock(&self.shared).cursor = after;
+            let mut shared = lock(&self.shared);
+            // No await occurred since `cursor` was read, but the HTTP sibling
+            // may still have overtaken this handshake on another task.
+            if shared.cursor != cursor {
+                return SessionEnd::Reconnect;
+            }
+            shared.cursor = after;
+            shared.reset_version = shared.reset_version.wrapping_add(1);
+            self.sink.reset_cursor(after);
         }
+        let session_reset_version = lock(&self.shared).reset_version;
         // Rows request goes out BEFORE any checkpoint fetch: the row backfill
         // streams over the socket while the checkpoint downloads over HTTP in
         // parallel, instead of serializing download → request → backfill. On
@@ -889,6 +1563,10 @@ impl Actor {
         }
         let mut buffered: Vec<wire::WireFrame> = Vec::new();
         if let CatchUpPlan::CheckpointThenRows { .. } = plan {
+            let (checkpoint_base_cursor, checkpoint_reset_version) = {
+                let shared = lock(&self.shared);
+                (shared.cursor, shared.reset_version)
+            };
             tracing::info!(
                 checkpoint_seq = state.checkpoint_seq,
                 checkpoint_size = state.checkpoint_size,
@@ -930,11 +1608,21 @@ impl Actor {
                     }
                 }
             };
+            let mut shared = lock(&self.shared);
+            if shared.cursor != checkpoint_base_cursor
+                || shared.reset_version != checkpoint_reset_version
+            {
+                tracing::debug!(
+                    checkpoint_base_cursor,
+                    current = shared.cursor,
+                    "chat2: discarding checkpoint response overtaken by sibling transport"
+                );
+                return SessionEnd::Reconnect;
+            }
             if let Err(err) = self.sink.apply_checkpoint(&bytes, state.checkpoint_seq) {
                 tracing::warn!(error = %err, "chat2: checkpoint import failed");
                 return SessionEnd::Reconnect;
             }
-            let mut shared = lock(&self.shared);
             shared.cursor = shared.cursor.max(state.checkpoint_seq);
             drop(shared);
             let _ = self.events.send(ChatEvent::Applied);
@@ -951,7 +1639,7 @@ impl Actor {
                 head_seq = Some(done.head_seq);
                 continue; // frames after ROWS_DONE are steady-state; keep them
             }
-            if !self.handle_frame(frame) {
+            if !self.handle_frame(frame, session_reset_version) {
                 return SessionEnd::Reconnect;
             }
         }
@@ -971,7 +1659,7 @@ impl Actor {
                                 return Some(done.head_seq);
                             }
                             _ => {
-                                if !self.handle_frame(frame) {
+                                if !self.handle_frame(frame, session_reset_version) {
                                     return None;
                                 }
                             }
@@ -1013,11 +1701,14 @@ impl Actor {
                         tracing::warn!("chat2: unparseable frame");
                         return SessionEnd::Reconnect;
                     };
-                    if !self.handle_frame(frame) {
+                    if !self.handle_frame(frame, session_reset_version) {
                         return SessionEnd::Reconnect;
                     }
                 }
                 _ = self.nudge_rx.recv() => {
+                    if lock(&self.shared).reset_version != session_reset_version {
+                        return SessionEnd::Reconnect;
+                    }
                     if !self.push_pending(&mut pipe).await {
                         return SessionEnd::Reconnect;
                     }
@@ -1106,11 +1797,9 @@ impl Actor {
         }
     }
 
-    /// One HTTPS sync cycle off the critical path: flush pending batches
-    /// (POST — batchId dedupe), then pull rows (GET) and apply them exactly
-    /// as the WS backfill would, fetching the checkpoint first when the
-    /// state says the local doc lacks its frontier. Single-flight; failures
-    /// retry on the next backoff cycle.
+    /// One HTTPS sync cycle off the critical path. POST acks are staged until
+    /// a strict GET from the pre-push cursor proves the complete resulting
+    /// frontier; only then may they retire the sole replay copy of a batch.
     fn spawn_offline_sync(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(transport) = self.transport.clone() else {
@@ -1123,120 +1812,11 @@ impl Actor {
         let sink = self.sink.clone();
         let fetcher = self.fetcher.clone();
         let events = self.events.clone();
+        let flags = self.flags.clone();
+        let nudge = self.nudge.clone();
         let busy = self.sync_busy.clone();
         tokio::spawn(async move {
-            let batches: Vec<(String, Vec<u8>)> = lock(&shared)
-                .pending
-                .iter()
-                .map(|p| (p.batch_id.clone(), p.bytes.clone()))
-                .collect();
-            for (batch_id, bytes) in batches {
-                match transport.push(batch_id, bytes).await {
-                    Ok(ack) => {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ack) {
-                            if let (Some(b), Some(seq)) = (v["batchId"].as_str(), v["seq"].as_u64())
-                            {
-                                let mut sh = lock(&shared);
-                                sh.pending.retain(|p| p.batch_id != b);
-                                sh.cursor = sh.cursor.max(seq);
-                                let cursor = sh.cursor;
-                                drop(sh);
-                                sink.advance_cursor(cursor);
-                                let _ = events.send(ChatEvent::Applied);
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "chat2: http push failed; will retry");
-                        break;
-                    }
-                }
-            }
-            let cursor = lock(&shared).cursor;
-            let body = match transport.fetch_rows(cursor).await {
-                Ok(body) => body,
-                Err(err) => {
-                    tracing::warn!(error = %err, "chat2: http pull failed; will retry");
-                    busy.store(false, Relaxed);
-                    return;
-                }
-            };
-            // u32-LE length-prefixed frames: state first, rows, rowsDone.
-            let mut frames: Vec<wire::WireFrame> = Vec::new();
-            let mut off = 0usize;
-            while off + 4 <= body.len() {
-                let len =
-                    u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]])
-                        as usize;
-                off += 4;
-                if off + len > body.len() {
-                    break;
-                }
-                if let Some(frame) = wire::decode(&body[off..off + len]) {
-                    frames.push(frame);
-                }
-                off += len;
-            }
-            let mut iter = frames.into_iter();
-            let Some(state_frame) = iter.next() else {
-                busy.store(false, Relaxed);
-                return;
-            };
-            if state_frame.kind == frame_type::STATE {
-                if let Ok(state) =
-                    serde_json::from_value::<wire::StateHeader>(state_frame.header.clone())
-                {
-                    lock(&shared).server = Some(state);
-                    let contained = state.checkpoint_size == 0
-                        || sink.contains_frontier(&state_frame.payload);
-                    if let CatchUpPlan::CheckpointThenRows { after } =
-                        plan_catch_up(cursor, &state, contained)
-                    {
-                        let fetched = tokio::time::timeout(
-                            CHECKPOINT_FETCH_DEADLINE,
-                            fetcher.fetch(),
-                        )
-                        .await;
-                        match fetched {
-                            Ok(Ok(bytes)) => {
-                                if sink.apply_checkpoint(&bytes, state.checkpoint_seq).is_err() {
-                                    busy.store(false, Relaxed);
-                                    return;
-                                }
-                                let mut sh = lock(&shared);
-                                sh.cursor = sh.cursor.max(after);
-                                drop(sh);
-                                let _ = events.send(ChatEvent::Applied);
-                            }
-                            _ => {
-                                busy.store(false, Relaxed);
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            let mut applied = false;
-            for frame in iter {
-                match frame.kind {
-                    frame_type::ROW => {
-                        let Ok(row) = serde_json::from_value::<wire::RowHeader>(frame.header)
-                        else {
-                            continue;
-                        };
-                        sink.apply_row(&frame.payload, row.seq);
-                        let mut sh = lock(&shared);
-                        sh.cursor = sh.cursor.max(row.seq);
-                        drop(sh);
-                        applied = true;
-                    }
-                    frame_type::ROWS_DONE => {}
-                    _ => {}
-                }
-            }
-            if applied {
-                let _ = events.send(ChatEvent::Applied);
-            }
+            offline_sync_once(transport, shared, sink, fetcher, events, flags, nudge).await;
             busy.store(false, Relaxed);
         });
     }
@@ -1265,8 +1845,12 @@ impl Actor {
     }
 
     /// Apply one inbound protocol frame. False = protocol breakdown, redial.
-    fn handle_frame(&self, frame: wire::WireFrame) -> bool {
+    fn handle_frame(&self, frame: wire::WireFrame, session_reset_version: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
+        if lock(&self.shared).reset_version != session_reset_version {
+            tracing::debug!("chat2: discarding WS frame from an overtaken reset generation");
+            return false;
+        }
         match frame.kind {
             frame_type::ROW => {
                 let Ok(row) = serde_json::from_value::<wire::RowHeader>(frame.header) else {
@@ -1275,8 +1859,11 @@ impl Actor {
                 // Own-device rows can still arrive (live relay of a racing
                 // second socket, or a server that ignored excludeOwn) — Loro
                 // re-import is a no-op; the cursor advance is what matters.
-                self.sink.apply_row(&frame.payload, row.seq);
                 let mut shared = lock(&self.shared);
+                if shared.reset_version != session_reset_version {
+                    return false;
+                }
+                self.sink.apply_row(&frame.payload, row.seq);
                 shared.cursor = shared.cursor.max(row.seq);
                 drop(shared);
                 let _ = self.events.send(ChatEvent::Applied);
@@ -1286,7 +1873,30 @@ impl Actor {
                     return false;
                 };
                 let mut shared = lock(&self.shared);
+                if shared.reset_version != session_reset_version {
+                    return false;
+                }
+                if shared.offline_snapshot_ids.contains(&ack.batch_id) {
+                    // The HTTPS sibling owns the replay snapshot for this
+                    // UUID. Keep the only replay copy and stage the WS verdict
+                    // until its complete pull proves the log incarnation and
+                    // the exact `(seq, batchId)` row.
+                    shared
+                        .offline_ws_acks
+                        .entry(ack.batch_id)
+                        .and_modify(|seq| *seq = (*seq).max(ack.seq))
+                        .or_insert(ack.seq);
+                    return true;
+                }
+                let before = shared.pending.len();
                 shared.pending.retain(|p| p.batch_id != ack.batch_id);
+                let retired = before != shared.pending.len();
+                if !retired {
+                    // A sibling transport already handled this UUID. In
+                    // particular, never let a delayed pre-reset ack advance a
+                    // new cursor namespace after its replay copy is gone.
+                    return true;
+                }
                 shared.cursor = shared.cursor.max(ack.seq);
                 let cursor = shared.cursor;
                 // Quota drain: each grant immediately probes the next head
@@ -1298,8 +1908,8 @@ impl Actor {
                         shared.retry_at = Some(tokio::time::Instant::now());
                     }
                 }
-                drop(shared);
                 self.sink.advance_cursor(cursor);
+                drop(shared);
                 let _ = self.events.send(ChatEvent::Applied);
             }
             frame_type::PRESENCE => {
@@ -1330,9 +1940,21 @@ impl Actor {
                     // in the local doc and travel with the next checkpoint.
                     "too_large" | "empty" | "bad_push" if !batch_id.is_empty() => {
                         let mut shared = lock(&self.shared);
+                        if shared.reset_version != session_reset_version {
+                            return false;
+                        }
+                        if shared.offline_snapshot_ids.contains(batch_id) {
+                            shared.permanent_rejections.insert(batch_id.to_string());
+                        }
                         let before = shared.pending.len();
                         shared.pending.retain(|p| p.batch_id != batch_id);
                         let dropped = before != shared.pending.len();
+                        if dropped && !shared.pending.is_empty() {
+                            // Do not strand the next batch behind a permanently
+                            // rejected head. The steady-state retry arm pushes
+                            // it immediately without waiting for a new enqueue.
+                            shared.retry_at = Some(tokio::time::Instant::now());
+                        }
                         drop(shared);
                         if dropped {
                             tracing::error!(
@@ -1348,6 +1970,9 @@ impl Actor {
                     // the batch queued and head-probe on a short clock.
                     "quota" => {
                         let mut shared = lock(&self.shared);
+                        if shared.reset_version != session_reset_version {
+                            return false;
+                        }
                         shared.quota_blocked = true;
                         shared.retry_at = Some(tokio::time::Instant::now() + QUOTA_RETRY);
                     }

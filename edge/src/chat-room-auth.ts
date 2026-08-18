@@ -7,8 +7,8 @@
  * JWT org claim, so anyone who reaches the DO is a member. What's decided
  * here is the HOST-USER discipline layered on top:
  *
- * - Member ops (join, push via ws, checkpoint/sidecar reads, stats) are open
- *   to every member.
+ * - Member ops (join, push via ws or HTTP rows, rows/checkpoint/sidecar reads,
+ *   stats) are open to every member.
  * - Host ops (checkpoint POST, tail/diff PUT, reset) belong to exactly one
  *   user: the first to claim with `?role=host` (on ws join, or on the
  *   bootstrap checkpoint POST that can precede it). This is what makes the
@@ -20,6 +20,8 @@
  */
 export type ChatOp =
   | "join"
+  | "rowsGet"
+  | "rowsPost"
   | "checkpointGet"
   | "checkpointPost"
   | "sidecarGet"

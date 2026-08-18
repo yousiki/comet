@@ -12,6 +12,16 @@ use futures::future::BoxFuture;
 pub enum SyncError {
     #[error("websocket: {0}")]
     WebSocket(String),
+    /// The server authenticated the request but refused this room. Kept
+    /// distinct from other HTTP/WebSocket failures so local-first clients
+    /// can surface a durable authorization verdict without parsing strings.
+    #[error("access denied: {0}")]
+    AccessDenied(String),
+    /// The server permanently rejected one specific queued write. Callers may
+    /// retire that batch (the local document still retains its operations) and
+    /// continue with later batches instead of wedging the queue forever.
+    #[error("push rejected: {0}")]
+    PushRejected(String),
     #[error("protocol: {0}")]
     Protocol(String),
     #[error("join refused: {0}")]

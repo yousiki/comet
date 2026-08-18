@@ -20,7 +20,9 @@ export const FRAME = {
   /** `{cursor, device}` — first frame on a socket; answered by `state`. */
   hello: 0x01,
   /** `{after, excludeOwn}` — request backfill rows with `seq > after`;
-   * `excludeOwn` skips the sender device's own writes (reconnect path). */
+   * legacy chat2 may skip the sender device's own writes (reconnect path).
+   * Org-shared chat3 ignores `excludeOwn` because device ids are not bound
+   * to user identity. */
   rowsReq: 0x03,
   /** `{batchId}` + payload = one opaque Loro update. */
   push: 0x06,

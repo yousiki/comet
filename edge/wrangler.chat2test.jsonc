@@ -6,7 +6,7 @@
   "name": "comet-native-edge-chat2test2",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
-  "account_id": "b57dde68ee5964dccc025437b5478a5b",
+  "account_id": "3ba1aaf889ad9e15eebee459ff361919",
   "workers_dev": true,
   "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
   "alias": {
@@ -30,7 +30,7 @@
     { "binding": "RELEASES", "bucket_name": "comet-native-blobs-chat2test" }
   ],
   "vars": {
-    "WORKOS_CLIENT_ID": "client_01KWD0EAKZKD50YCQJNYSRE4BY",
+    "WORKOS_CLIENT_ID": "client_01M09AJF16TCBRA7H3BJC9PXEB",
     "AUTH_MODE": "dev"
   },
   "observability": {

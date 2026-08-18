@@ -1544,7 +1544,6 @@ fn handle_server_request_live(
     Vec::new()
 }
 
-
 /// Await a setup request while draining incoming messages, so a `session/load`
 /// whose replay outruns the incoming channel's capacity can't deadlock the
 /// reader. Replayed `session/update`s are dropped (the doc already holds the
@@ -1611,7 +1610,6 @@ fn track_turn_signals(
         _ => {}
     }
 }
-
 
 /// A mid-turn `_session/steering` call. `idleBehavior: promptRequired`
 /// covers the turn-ended race: the agent hands the text back instead of
@@ -1881,8 +1879,7 @@ async fn run_session(session: Session) {
         prompt_stall.map(|d| tokio::time::Instant::now() + d);
     let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
         prompt_seq += 1;
-        current_prompt_id =
-            prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
+        current_prompt_id = prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
         prompt_turn(
             client.clone(),
             session_id.clone(),

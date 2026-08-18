@@ -5,7 +5,11 @@
 //! claim-anything behavior (local-only chats must still run).
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 use zeron_engine::{WorkspaceHost, WorkspaceHostConfig};
 use zeron_sync::DocsStore;
 
@@ -25,6 +29,167 @@ fn open_host(dir: &std::path::Path, edge: Option<zeron_engine::EdgeConfig>) -> W
     .expect("workspace host opens")
 }
 
+struct GatedRegistryEdge {
+    url: String,
+    fetch_release: watch::Sender<bool>,
+    fetch_started: watch::Receiver<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl GatedRegistryEdge {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind edge");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (fetch_release, release_rx) = watch::channel(false);
+        let (started_tx, fetch_started) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(serve_registry_request(
+                    stream,
+                    started_tx.clone(),
+                    release_rx.clone(),
+                ));
+            }
+        });
+        Self {
+            url,
+            fetch_release,
+            fetch_started,
+            task,
+        }
+    }
+
+    async fn wait_for_fetch(&mut self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !*self.fetch_started.borrow() {
+                self.fetch_started
+                    .changed()
+                    .await
+                    .expect("edge task stays alive");
+            }
+        })
+        .await
+        .expect("registry pull did not start");
+    }
+
+    fn release_fetch(&self) {
+        self.fetch_release.send(true).unwrap();
+    }
+}
+
+impl Drop for GatedRegistryEdge {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<(String, String, String)> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let header_end = loop {
+        if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..read]);
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]);
+    let mut lines = head.lines();
+    let mut request_line = lines.next()?.split_whitespace();
+    let method = request_line.next()?.to_string();
+    let target = request_line.next()?.to_string();
+    let content_length = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = buf[header_end..].to_vec();
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+    Some((method, target, String::from_utf8_lossy(&body).into_owned()))
+}
+
+async fn respond(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+async fn serve_registry_request(
+    mut stream: tokio::net::TcpStream,
+    fetch_started: watch::Sender<bool>,
+    mut fetch_release: watch::Receiver<bool>,
+) {
+    let Some((method, target, body)) = read_request(&mut stream).await else {
+        return;
+    };
+    if method == "POST" && target.starts_with("/registry/org-test/push?") {
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(&body) else {
+            respond(&mut stream, "400 Bad Request", r#"{"error":"bad json"}"#).await;
+            return;
+        };
+        let Some(batch) = body["batch"].as_str() else {
+            respond(&mut stream, "400 Bad Request", r#"{"error":"no batch"}"#).await;
+            return;
+        };
+        let ack = serde_json::json!({ "batch": batch, "seq": 11, "applied": 1 });
+        respond(&mut stream, "200 OK", &ack.to_string()).await;
+    } else if method == "GET" && target.starts_with("/registry/org-test/rows?") {
+        let _ = fetch_started.send(true);
+        while !*fetch_release.borrow() {
+            if fetch_release.changed().await.is_err() {
+                return;
+            }
+        }
+        let clock = "0000000001000-000000-dev-b";
+        let pull = serde_json::json!({
+            "seq": 11,
+            "full": false,
+            "gcFloor": 0,
+            "rows": [{
+                "kind": "chats",
+                "id": "foreign-chat",
+                "seq": 10,
+                "deleted": false,
+                "fields": {
+                    "id": "foreign-chat",
+                    "deviceId": "dev-b",
+                    "createdAt": 1_000,
+                },
+                "clocks": {
+                    "id": clock,
+                    "deviceId": clock,
+                    "createdAt": clock,
+                },
+            }],
+        });
+        respond(&mut stream, "200 OK", &pull.to_string()).await;
+    } else {
+        // The WebSocket side is intentionally unavailable: this test isolates
+        // the HTTP local-first path and its remote-readiness transition.
+        respond(
+            &mut stream,
+            "503 Service Unavailable",
+            r#"{"error":"ws unavailable"}"#,
+        )
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn edgeless_host_claims_unknown_chats() {
     let dir = tempfile::tempdir().unwrap();
@@ -42,6 +207,39 @@ async fn edged_host_is_fail_closed_before_first_registry_sync() {
         !host.is_host("never-seen-chat"),
         "unknown chat must not be claimable before the first registry sync"
     );
+}
+
+#[tokio::test]
+async fn edged_host_opens_claim_gate_only_after_remote_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut edge = GatedRegistryEdge::start().await;
+    let config = zeron_engine::EdgeConfig::with_static_token(&edge.url, "alice");
+    let host = open_host(dir.path(), Some(config));
+    // Subscribe synchronously after open (before its spawned join task runs).
+    // The first publish proves the local-first client has been installed.
+    let mut devices = host.watch_devices();
+
+    edge.wait_for_fetch().await;
+    tokio::time::timeout(Duration::from_secs(5), devices.changed())
+        .await
+        .expect("registry client was not installed")
+        .expect("host stays alive");
+    assert!(
+        !host.is_host("unknown-before-pull"),
+        "HTTP connect return and push ack must not open the ownership gate"
+    );
+
+    edge.release_fetch();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !host.is_host("unknown-after-pull") || host.chat("foreign-chat").unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("successful remote pull did not open the ownership gate");
+    let foreign = host.chat("foreign-chat").unwrap().unwrap();
+    assert_eq!(foreign.device_id, "dev-b");
+    assert!(!host.is_host("foreign-chat"));
 }
 
 #[tokio::test]

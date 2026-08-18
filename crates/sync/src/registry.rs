@@ -71,6 +71,11 @@ impl Default for RegistryTuning {
 pub enum RegistryEvent {
     /// Joined (or re-joined); the hello state has been applied.
     Connected,
+    /// The first remote state has been applied, either from a successful HTTPS
+    /// pull or from the WebSocket hello/state handshake. Unlike
+    /// [`Self::Applied`], this is a one-shot readiness signal: local push
+    /// acknowledgements never emit it.
+    Synced,
     /// The connection dropped; the client is backing off before redialing.
     Disconnected,
     /// Rows/acks were applied to the doc — republish and persist.
@@ -270,6 +275,39 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Cross the remote-state readiness boundary exactly once. `Applied` remains
+/// the per-refresh notification; `Synced` is a sticky one-shot latch whose
+/// state is also readable by late subscribers through `has_synced`.
+fn emit_synced_once(
+    remote_synced: &std::sync::atomic::AtomicBool,
+    events: &broadcast::Sender<RegistryEvent>,
+) {
+    if !remote_synced.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let _ = events.send(RegistryEvent::Synced);
+    }
+}
+
+/// A state response can race the sibling transport that started from the same
+/// cursor. A lower delta is stale if another response already advanced the
+/// doc. Full responses behind their own request cursor remain authoritative
+/// reset evidence and must retain `apply_state`'s re-seed semantics.
+fn state_response_was_overtaken(
+    doc: &RegistryDoc,
+    requested_cursor: u64,
+    response_seq: u64,
+    full: bool,
+) -> bool {
+    // A full response behind THIS request's cursor is direct evidence that the
+    // server reset. Even if a sibling's older response moved the shared doc in
+    // the meantime, preserve apply_state's re-seed path (a duplicate re-seed
+    // is safe; swallowing the reset loses the only surviving rows).
+    if full && response_seq < requested_cursor {
+        return false;
+    }
+    let current = doc.cursor();
+    current != requested_cursor && response_seq < current
+}
+
 // ── the client ──────────────────────────────────────────────────────────────
 
 /// A live registry-room membership for one [`RegistryDoc`].
@@ -280,6 +318,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct RegistryClient {
     doc: Arc<Mutex<RegistryDoc>>,
     events: broadcast::Sender<RegistryEvent>,
+    /// Sticky companion to `RegistryEvent::Synced`: broadcast receivers can
+    /// subscribe after a fast pull/hello, so consumers use this to close that
+    /// race when they first attach.
+    remote_synced: Arc<std::sync::atomic::AtomicBool>,
     shutdown: watch::Sender<bool>,
     nudge: mpsc::Sender<()>,
     probe: mpsc::Sender<()>,
@@ -353,6 +395,13 @@ impl RegistryClient {
         tuning: RegistryTuning,
         transport: Option<Arc<dyn RegistryTransport>>,
     ) -> Result<Self, SyncError> {
+        // Client construction is an ownership boundary for transport-local
+        // `in_flight` flags. A prior actor may have been aborted while its
+        // detached HTTP pull was hung, leaving pending batches permanently
+        // invisible to `take_pushable`. Re-arm once before either transport in
+        // this actor starts. If an old owner is still winding down, duplicate
+        // sends are safe: strict-clock LWW replays are no-ops and ack is idempotent.
+        lock(&doc).mark_disconnected();
         let (events, _) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -362,6 +411,7 @@ impl RegistryClient {
         let (presence_tx, presence_rx) = mpsc::channel(4);
         let presence = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(Stats::default());
+        let remote_synced = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let actor = Actor {
             doc: doc.clone(),
@@ -370,12 +420,14 @@ impl RegistryClient {
             tuning,
             events: events.clone(),
             shutdown: shutdown_rx,
+            nudge: nudge_tx.clone(),
             nudge_rx,
             probe_rx,
             redial_rx,
             presence_rx,
             presence: presence.clone(),
             stats: stats.clone(),
+            remote_synced: remote_synced.clone(),
             transport,
             sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -385,6 +437,7 @@ impl RegistryClient {
             Ok(Ok(())) => Ok(Self {
                 doc,
                 events,
+                remote_synced,
                 shutdown: shutdown_tx,
                 nudge: nudge_tx,
                 probe: probe_tx,
@@ -411,6 +464,15 @@ impl RegistryClient {
 
     pub fn events(&self) -> broadcast::Receiver<RegistryEvent> {
         self.events.subscribe()
+    }
+
+    /// Whether this client has applied at least one remote state during its
+    /// lifetime. This remains true across reconnects; it means the local
+    /// replica has crossed the cold-start readiness boundary, not that the
+    /// socket is currently connected.
+    pub fn has_synced(&self) -> bool {
+        self.remote_synced
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Local writes were enqueued — push pending batches now.
@@ -474,12 +536,18 @@ struct Actor {
     tuning: RegistryTuning,
     events: broadcast::Sender<RegistryEvent>,
     shutdown: watch::Receiver<bool>,
+    /// Self-wake used when a failed HTTP pull re-arms batches after the WS
+    /// session has already passed its initial `push_pending` call.
+    nudge: mpsc::Sender<()>,
     nudge_rx: mpsc::Receiver<()>,
     probe_rx: mpsc::Receiver<()>,
     redial_rx: mpsc::Receiver<()>,
     presence_rx: mpsc::Receiver<i64>,
     presence: Arc<Mutex<HashMap<String, (i64, tokio::time::Instant)>>>,
     stats: Arc<Stats>,
+    /// Set after the first successfully applied remote state and never reset
+    /// across reconnects. See `RegistryClient::has_synced`.
+    remote_synced: Arc<std::sync::atomic::AtomicBool>,
     /// Plain-HTTPS pull/push (None = socket-only: tests, dev bearers).
     transport: Option<Arc<dyn RegistryTransport>>,
     /// One offline sync in flight at a time.
@@ -634,14 +702,16 @@ impl Actor {
         use std::sync::atomic::Ordering::Relaxed;
 
         // ── hello / state handshake ─────────────────────────────────────────
-        let cursor = {
+        let (requested_cursor, cursor) = {
             let doc = lock(&self.doc);
-            let cursor = doc.cursor();
-            if cursor == 0 && doc.pending_len() == 0 && doc.generation() == 0 {
-                None
-            } else {
-                Some(cursor)
-            }
+            let requested_cursor = doc.cursor();
+            let wire_cursor =
+                if requested_cursor == 0 && doc.pending_len() == 0 && doc.generation() == 0 {
+                    None
+                } else {
+                    Some(requested_cursor)
+                };
+            (requested_cursor, wire_cursor)
         };
         let hello = serde_json::to_string(&ClientFrame::Hello {
             cursor,
@@ -678,17 +748,37 @@ impl Actor {
             tracing::warn!("registry: no state frame within deadline");
             return SessionEnd::Reconnect;
         };
-        {
+        let state_applied = {
             let mut doc = lock(&self.doc);
-            let outcome = doc.apply_state(seq, full, gc_floor, rows);
-            if full {
-                self.stats.full_resyncs.fetch_add(1, Relaxed);
+            if state_response_was_overtaken(&doc, requested_cursor, seq, full) {
+                tracing::debug!(
+                    requested_cursor,
+                    seq,
+                    current = doc.cursor(),
+                    "registry: skipping WS state overtaken by sibling transport"
+                );
+                false
+            } else {
+                let outcome = doc.apply_state(seq, full, gc_floor, rows);
+                if outcome == StateOutcome::Stale {
+                    tracing::warn!(
+                        requested_cursor,
+                        seq,
+                        current = doc.cursor(),
+                        "registry: stale WS delta without concurrent progress"
+                    );
+                    return SessionEnd::Reconnect;
+                }
+                if full {
+                    self.stats.full_resyncs.fetch_add(1, Relaxed);
+                }
+                if outcome == StateOutcome::Reseeded {
+                    tracing::info!("registry: server behind local state; re-seeding");
+                }
+                true
             }
-            if outcome == StateOutcome::Reseeded {
-                tracing::info!("registry: server behind local state; re-seeding");
-            }
-        }
-        {
+        };
+        if state_applied {
             let now = tokio::time::Instant::now();
             let mut map = lock(&self.presence);
             for (device, at) in presence {
@@ -700,6 +790,7 @@ impl Actor {
         if ready.is_none() {
             self.stats.rejoins.fetch_add(1, Relaxed);
         }
+        emit_synced_once(&self.remote_synced, &self.events);
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
@@ -805,19 +896,41 @@ impl Actor {
         let events = self.events.clone();
         let presence = self.presence.clone();
         let stats = self.stats.clone();
+        let remote_synced = self.remote_synced.clone();
+        let nudge = self.nudge.clone();
         let busy = self.sync_busy.clone();
         tokio::spawn(async move {
-            let batches: Vec<PendingBatch> = lock(&doc).take_pushable();
+            // The pull frontier is the remote state we had BEFORE publishing
+            // local writes. A push ack's seq does not prove that any earlier
+            // foreign rows were fetched, so never let it advance this request.
+            let (pull_since, batches): (u64, Vec<PendingBatch>) = {
+                let mut d = lock(&doc);
+                let since = d.cursor();
+                (since, d.take_pushable())
+            };
+            // HTTP acks are deliberately deferred until a valid pull has been
+            // applied. Otherwise ack_batch could advance the shared cursor
+            // while a concurrent WS hello is choosing its own `since`.
+            let mut acked: Vec<(String, u64)> = Vec::new();
             let mut push_failed = false;
             for batch in &batches {
-                let body = serde_json::json!({ "batch": batch.batch, "ops": batch.ops }).to_string();
+                let body =
+                    serde_json::json!({ "batch": batch.batch, "ops": batch.ops }).to_string();
                 match transport.push(body).await {
                     Ok(ack) => {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ack) {
-                            if let (Some(b), Some(seq)) = (v["batch"].as_str(), v["seq"].as_u64()) {
-                                lock(&doc).ack_batch(b, seq);
-                                stats.last_ack_ms.store(epoch_ms(), Relaxed);
-                                let _ = events.send(RegistryEvent::Applied);
+                        let parsed = serde_json::from_str::<serde_json::Value>(&ack).ok();
+                        let received = parsed.as_ref().and_then(|v| {
+                            Some((v["batch"].as_str()?.to_string(), v["seq"].as_u64()?))
+                        });
+                        match received {
+                            Some((batch_id, seq)) if batch_id == batch.batch => {
+                                acked.push((batch_id, seq));
+                            }
+                            _ => {
+                                tracing::warn!(batch = %batch.batch,
+                                    "registry: malformed/mismatched http push ack; will retry");
+                                push_failed = true;
+                                break;
                             }
                         }
                     }
@@ -828,14 +941,7 @@ impl Actor {
                     }
                 }
             }
-            if push_failed {
-                // take_pushable marked them in flight; nothing will clear
-                // that until the next socket disconnect — un-mark so the
-                // next cycle (HTTP or WS) retries them.
-                lock(&doc).mark_disconnected();
-            }
-            let since = lock(&doc).cursor();
-            match transport.fetch(since).await {
+            match transport.fetch(pull_since).await {
                 Ok(body) => {
                     #[derive(serde::Deserialize)]
                     #[serde(rename_all = "camelCase")]
@@ -849,25 +955,112 @@ impl Actor {
                     }
                     match serde_json::from_str::<PullBody>(&body) {
                         Ok(pull) => {
-                            let mut d = lock(&doc);
-                            d.apply_state(pull.seq, pull.full, pull.gc_floor, pull.rows);
-                            drop(d);
-                            let now = tokio::time::Instant::now();
-                            let mut map = lock(&presence);
-                            for (device, at) in pull.presence {
-                                map.insert(device, (at, now));
+                            let reset_observed = pull.full && pull.seq < pull_since;
+                            let mut state_applied = false;
+                            let mut needs_nudge = push_failed;
+                            let mut retired_ack = false;
+                            let pull_valid = {
+                                let mut d = lock(&doc);
+                                let valid = if state_response_was_overtaken(
+                                    &d, pull_since, pull.seq, pull.full,
+                                ) {
+                                    tracing::debug!(
+                                        pull_since,
+                                        seq = pull.seq,
+                                        current = d.cursor(),
+                                        "registry: skipping HTTP state overtaken by WebSocket"
+                                    );
+                                    true
+                                } else {
+                                    let outcome = d.apply_state(
+                                        pull.seq,
+                                        pull.full,
+                                        pull.gc_floor,
+                                        pull.rows,
+                                    );
+                                    if outcome == StateOutcome::Stale {
+                                        tracing::warn!(
+                                            pull_since,
+                                            seq = pull.seq,
+                                            current = d.cursor(),
+                                            "registry: stale HTTP delta without concurrent progress"
+                                        );
+                                        false
+                                    } else {
+                                        state_applied = true;
+                                        needs_nudge |= outcome == StateOutcome::Reseeded;
+                                        true
+                                    }
+                                };
+                                if valid {
+                                    // Keep apply→ack atomic against the sibling
+                                    // WS state path: no reset/newer state may
+                                    // land between the remote-state proof and
+                                    // the cursor advance that retires our ops.
+                                    let confirmed_frontier = d.cursor();
+                                    let mut unconfirmed_ack = false;
+                                    for (batch, seq) in &acked {
+                                        // A reset observed after POST makes
+                                        // every ack from this round suspect,
+                                        // even if the restarted sequence
+                                        // happens to compare >=. Otherwise
+                                        // the applied state/WS frontier must
+                                        // cover the ack before it can retire
+                                        // the only local copy of the batch.
+                                        if !reset_observed && *seq <= confirmed_frontier {
+                                            retired_ack |= d.ack_batch(batch, *seq);
+                                        } else {
+                                            unconfirmed_ack = true;
+                                        }
+                                    }
+                                    if push_failed || unconfirmed_ack {
+                                        // Re-arm the failed/unattempted suffix
+                                        // or pre-reset/unconfirmed ack (and any
+                                        // concurrent in-flight batch) for the
+                                        // WS actor or next HTTP cycle.
+                                        d.mark_disconnected();
+                                        needs_nudge = true;
+                                    }
+                                }
+                                valid
+                            };
+                            if !pull_valid {
+                                lock(&doc).mark_disconnected();
+                                let _ = nudge.try_send(());
+                                busy.store(false, Relaxed);
+                                return;
                             }
-                            drop(map);
+                            if retired_ack {
+                                stats.last_ack_ms.store(epoch_ms(), Relaxed);
+                            }
+                            if state_applied {
+                                let now = tokio::time::Instant::now();
+                                let mut map = lock(&presence);
+                                for (device, at) in pull.presence {
+                                    map.insert(device, (at, now));
+                                }
+                            }
                             stats.last_pushed_ms.store(epoch_ms(), Relaxed);
+                            emit_synced_once(&remote_synced, &events);
                             let _ = events.send(RegistryEvent::Applied);
+                            if needs_nudge {
+                                // The WS may already be in steady state and
+                                // have observed every batch as in-flight. Wake
+                                // it explicitly after re-arming/re-seeding.
+                                let _ = nudge.try_send(());
+                            }
                         }
                         Err(err) => {
                             tracing::warn!(error = %err, "registry: http pull body unparseable");
+                            lock(&doc).mark_disconnected();
+                            let _ = nudge.try_send(());
                         }
                     }
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "registry: http pull failed; will retry");
+                    lock(&doc).mark_disconnected();
+                    let _ = nudge.try_send(());
                 }
             }
             busy.store(false, Relaxed);
@@ -924,9 +1117,20 @@ impl Actor {
                 rows,
                 presence,
             } => {
-                // Servers only send state as a hello answer, but applying a
-                // late duplicate is harmless and simpler than special-casing.
+                // Servers only send state as a hello answer. Tolerate a late
+                // duplicate, but never let it roll back newer sibling truth.
                 let mut doc = lock(&self.doc);
+                if seq < doc.cursor() {
+                    // A late state is never a reset signal (resets are handled
+                    // by the hello path with its request cursor). Do not let an
+                    // older full snapshot replace newer HTTP/WS truth.
+                    tracing::debug!(
+                        seq,
+                        current = doc.cursor(),
+                        "registry: ignoring late stale state"
+                    );
+                    return true;
+                }
                 doc.apply_state(seq, full, gc_floor, rows);
                 drop(doc);
                 let now = tokio::time::Instant::now();
@@ -934,6 +1138,8 @@ impl Actor {
                 for (device, at) in presence {
                     map.insert(device, (at, now));
                 }
+                drop(map);
+                emit_synced_once(&self.remote_synced, &self.events);
                 let _ = self.events.send(RegistryEvent::Applied);
             }
             ServerFrame::Error { code, message } => {
@@ -947,3 +1153,41 @@ impl Actor {
 
 #[cfg(any(test, feature = "mock-server"))]
 pub mod mock_server;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use zeron_doc::RegistryDoc;
+
+    use super::{RegistryEvent, emit_synced_once, state_response_was_overtaken};
+
+    #[test]
+    fn synced_readiness_is_a_sticky_one_shot_latch() {
+        let (events, _) = tokio::sync::broadcast::channel(4);
+        let mut receiver = events.subscribe();
+        let synced = AtomicBool::new(false);
+
+        emit_synced_once(&synced, &events);
+        emit_synced_once(&synced, &events);
+
+        assert!(synced.load(Ordering::Acquire));
+        assert_eq!(receiver.try_recv().unwrap(), RegistryEvent::Synced);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn full_response_behind_its_request_cursor_is_reset_not_stale() {
+        let mut doc = RegistryDoc::new("dev-a");
+        doc.apply_state(12, false, 0, vec![]);
+
+        assert!(state_response_was_overtaken(&doc, 10, 11, false));
+        assert!(state_response_was_overtaken(&doc, 0, 10, true));
+        assert!(
+            !state_response_was_overtaken(&doc, 10, 0, true),
+            "a full response behind its own cursor must run the reset/reseed path"
+        );
+    }
+}

@@ -240,13 +240,16 @@ impl Harness for CursorHarness {
 
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(stdin_writer(stdin, stdin_rx));
-        let first = json!({
+        let mut first = json!({
             "op": "run",
             "prompt": request.prompt,
             "cwd": request.cwd,
             "model": request.model,
             "resume": request.resume,
         });
+        if !request.mcp_servers.is_empty() {
+            first["mcpServers"] = Value::Object(crate::mcp::stdio_server_map(&request.mcp_servers));
+        }
         let _ = stdin_tx.send(first.to_string());
 
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
@@ -584,7 +587,9 @@ fn decode_tool(name: &str, args: &Value) -> ToolCall {
                 .collect(),
         },
         "mcp" => ToolCall::Mcp {
-            server: s(&["server", "serverName"]),
+            // @cursor/sdk 1.0.28 calls this `providerIdentifier`; retain the
+            // older spellings for captured/beta-wire compatibility.
+            server: s(&["providerIdentifier", "server", "serverName"]),
             tool: s(&["tool", "toolName", "name"]),
             input: args.get("args").or(args.get("input")).cloned(),
         },
@@ -758,10 +763,9 @@ mod tests {
 
     #[test]
     fn nested_frames_arrive_tagged() {
-        let frame: Value = serde_json::from_str(
-            r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#,
-        )
-        .unwrap();
+        let frame: Value =
+            serde_json::from_str(r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#)
+                .unwrap();
         assert_eq!(
             map_shim_frame(&frame, false),
             vec![AgentEvent::Subagent {

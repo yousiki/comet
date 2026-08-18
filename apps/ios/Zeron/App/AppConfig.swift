@@ -141,12 +141,13 @@ final class AppConfig: @unchecked Sendable {
         return request
     }
 
-    /// GET /chat2/{chatId}/rows?after= — pull over plain HTTPS: one request
-    /// collapses the socket's connect→hello→state→rowsReq→backfill, and it
-    /// works on networks that strip WS upgrades (airplane wifi).
-    func chat2RowsRequest(chatId: String, after: UInt64) async -> URLRequest? {
+    /// GET /{chat2|chat3}/{chatId}/rows?after= — pull over plain HTTPS: one
+    /// request collapses the socket's connect→hello→state→rowsReq→backfill,
+    /// and it works on networks that strip WS upgrades (airplane wifi).
+    func chat2RowsRequest(chatId: String, roomGen: Int, after: UInt64) async -> URLRequest? {
         guard let token = await currentToken() else { return nil }
-        var url = edgeURL.appending(path: "chat2/\(chatId)/rows")
+        var url = edgeURL.appending(
+            path: "\(Self.chatRoomPrefix(roomGen: roomGen))/\(chatId)/rows")
         url.append(queryItems: [URLQueryItem(name: "after", value: String(after)),
                                 URLQueryItem(name: "device", value: deviceId)])
         var request = URLRequest(url: url)
@@ -154,11 +155,12 @@ final class AppConfig: @unchecked Sendable {
         return request
     }
 
-    /// POST /chat2/{chatId}/rows?batchId= — push over plain HTTPS (batchId
-    /// dedupe makes replays no-ops); body is the raw update batch.
-    func chat2PushRequest(chatId: String, batchId: String) async -> URLRequest? {
+    /// POST /{chat2|chat3}/{chatId}/rows?batchId= — push over plain HTTPS
+    /// (batchId dedupe makes replays no-ops); body is the raw update batch.
+    func chat2PushRequest(chatId: String, roomGen: Int, batchId: String) async -> URLRequest? {
         guard let token = await currentToken() else { return nil }
-        var url = edgeURL.appending(path: "chat2/\(chatId)/rows")
+        var url = edgeURL.appending(
+            path: "\(Self.chatRoomPrefix(roomGen: roomGen))/\(chatId)/rows")
         url.append(queryItems: [URLQueryItem(name: "batchId", value: batchId),
                                 URLQueryItem(name: "device", value: deviceId)])
         var request = URLRequest(url: url)

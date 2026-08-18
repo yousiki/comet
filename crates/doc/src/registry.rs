@@ -302,6 +302,8 @@ pub struct PendingBatch {
 /// What [`RegistryDoc::apply_state`] decided about a `state` frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateOutcome {
+    /// A delta older than the already-applied server frontier was ignored.
+    Stale,
     /// Delta applied over existing authoritative rows.
     Delta,
     /// Full state replaced local authoritative rows.
@@ -413,7 +415,7 @@ impl RegistryDoc {
 
     // ── server frames ───────────────────────────────────────────────────────
 
-    /// Apply a hello `state` frame. See [`StateOutcome`] for the three shapes.
+    /// Apply a hello `state` frame. See [`StateOutcome`] for the four shapes.
     pub fn apply_state(
         &mut self,
         seq: u64,
@@ -421,15 +423,23 @@ impl RegistryDoc {
         gc_floor: u64,
         rows: Vec<RegistryRow>,
     ) -> StateOutcome {
-        self.generation += 1;
         if !full {
+            // HTTP pull and WS delivery run concurrently. Once a newer state
+            // or rows frame has advanced the frontier, an older delta is a
+            // snapshot from the past: applying its rows could overwrite newer
+            // merged truth, and assigning its seq would move the cursor back.
+            if seq < self.server_seq {
+                return StateOutcome::Stale;
+            }
+            self.generation += 1;
             for row in rows {
                 self.put_authoritative(row);
             }
             self.server_seq = seq;
-            self.gc_floor = gc_floor;
+            self.gc_floor = self.gc_floor.max(gc_floor);
             return StateOutcome::Delta;
         }
+        self.generation += 1;
         if seq < self.server_seq {
             // The server lost state (reset/wipe). Local rows are the only
             // copy: keep them and re-seed the server with ORIGINAL clocks.
@@ -479,6 +489,12 @@ impl RegistryDoc {
 
     /// Apply a `rows` broadcast (merged truth for the touched rows).
     pub fn apply_rows(&mut self, seq: u64, rows: Vec<RegistryRow>) {
+        // A detached HTTP pull may already have applied a newer frontier while
+        // an older WS frame was queued. Server row frames are ordered within a
+        // socket, but not against that sibling transport.
+        if seq < self.server_seq {
+            return;
+        }
         self.generation += 1;
         for row in rows {
             self.put_authoritative(row);

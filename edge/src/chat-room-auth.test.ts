@@ -16,8 +16,15 @@ describe("authorizeChatRoom", () => {
     });
   });
 
-  it("lets members join and read without a claim", () => {
-    for (const op of ["join", "checkpointGet", "sidecarGet", "stats"] as ChatOp[]) {
+  it("lets members join, pull, push, and read without a host claim", () => {
+    for (const op of [
+      "join",
+      "rowsGet",
+      "rowsPost",
+      "checkpointGet",
+      "sidecarGet",
+      "stats"
+    ] as ChatOp[]) {
       expect(authorizeChatRoom(op, "bob", null, false).allow).toBe(true);
       expect(authorizeChatRoom(op, "bob", "alice", false).allow).toBe(true);
     }

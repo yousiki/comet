@@ -250,10 +250,10 @@ final class SessionStore {
                 await config.chat2CheckpointRequest(chatId: chatId, roomGen: gen)
             },
             rowsRequest: { [config, chatId] after in
-                await config.chat2RowsRequest(chatId: chatId, after: after)
+                await config.chat2RowsRequest(chatId: chatId, roomGen: gen, after: after)
             },
             pushRequest: { [config, chatId] batchId in
-                await config.chat2PushRequest(chatId: chatId, batchId: batchId)
+                await config.chat2PushRequest(chatId: chatId, roomGen: gen, batchId: batchId)
             },
             delegate: delegate)
         chatRoom = client

@@ -43,7 +43,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
@@ -230,6 +230,19 @@ impl ClaudeHarness {
         if !settings.is_empty() {
             cmd.arg("--settings");
             cmd.arg(Value::Object(settings).to_string());
+        }
+        if !request.mcp_servers.is_empty() {
+            // Claude 2.1.x accepts an inline JSON config here. Values remain
+            // argv/env data for the MCP child (Command never invokes a shell),
+            // and omitting both this flag and --strict-mcp-config preserves the
+            // user's normal ambient MCP settings when the engine has no bridge.
+            cmd.arg("--mcp-config");
+            cmd.arg(
+                json!({
+                    "mcpServers": crate::mcp::stdio_server_map(&request.mcp_servers),
+                })
+                .to_string(),
+            );
         }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);

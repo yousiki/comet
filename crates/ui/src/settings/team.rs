@@ -131,7 +131,9 @@ impl TeamPage {
             this.update(cx, |page, cx| {
                 match orgs {
                     Ok(value) => page.orgs = sort_memberships(parse_orgs(&value)),
-                    Err(err) => page.error = Some(format!("Loading workspaces failed: {err}").into()),
+                    Err(err) => {
+                        page.error = Some(format!("Loading workspaces failed: {err}").into())
+                    }
                 }
                 match members {
                     Some(Ok(value)) => {
@@ -179,7 +181,8 @@ impl TeamPage {
                         }
                         // Invite outcome feedback (added now vs emailed).
                         if value.get("invited").and_then(|v| v.as_bool()) == Some(true) {
-                            page.info = Some("Invitation sent — they can join after signing up.".into());
+                            page.info =
+                                Some("Invitation sent — they can join after signing up.".into());
                         } else if value.get("added").and_then(|v| v.as_bool()) == Some(true) {
                             page.info = Some("Member added.".into());
                         }
@@ -239,25 +242,24 @@ impl TeamPage {
         let mut card = widgets::section_card(theme);
         for (ix, org) in self.orgs.clone().into_iter().enumerate() {
             let is_current = Some(&org.organization_id) == current.as_ref();
-            let mut row = widgets::card_row(theme, ix == 0)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(widgets::row_title(theme, org.name.clone()))
-                        .child(widgets::meta_line(
-                            theme,
-                            vec![
-                                div()
-                                    .child(SharedString::from(if org.role == "admin" {
-                                        "Admin"
-                                    } else {
-                                        "Member"
-                                    }))
-                                    .into_any_element(),
-                            ],
-                        )),
-                );
+            let mut row = widgets::card_row(theme, ix == 0).child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(widgets::row_title(theme, org.name.clone()))
+                    .child(widgets::meta_line(
+                        theme,
+                        vec![
+                            div()
+                                .child(SharedString::from(if org.role == "admin" {
+                                    "Admin"
+                                } else {
+                                    "Member"
+                                }))
+                                .into_any_element(),
+                        ],
+                    )),
+            );
             if is_current {
                 row = row.child(widgets::badge_active(theme, "Current"));
             } else {
@@ -328,7 +330,11 @@ impl TeamPage {
                     .child(widgets::row_title(theme, title))
                     .child(widgets::meta_line(
                         theme,
-                        vec![div().child(SharedString::from(member.email.clone())).into_any_element()],
+                        vec![
+                            div()
+                                .child(SharedString::from(member.email.clone()))
+                                .into_any_element(),
+                        ],
                     )),
             );
             row = row.child(if member.role == "admin" {
@@ -339,7 +345,11 @@ impl TeamPage {
             if member.user_id == me {
                 row = row.child(widgets::badge(theme, "You"));
             } else if is_admin {
-                let flip_to = if member.role == "admin" { "member" } else { "admin" };
+                let flip_to = if member.role == "admin" {
+                    "member"
+                } else {
+                    "admin"
+                };
                 let flip_label = if member.role == "admin" {
                     "Make member"
                 } else {
@@ -386,7 +396,11 @@ impl TeamPage {
             card = card.child(row);
         }
         if is_admin {
-            let role_label = if self.invite_admin { "as Admin" } else { "as Member" };
+            let role_label = if self.invite_admin {
+                "as Admin"
+            } else {
+                "as Member"
+            };
             card = card.child(
                 widgets::card_row(theme, self.members.is_empty())
                     .child(div().flex_1().child(self.invite.clone()))

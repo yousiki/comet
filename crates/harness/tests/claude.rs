@@ -13,8 +13,8 @@ use zeron_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, McpServerConfig, RunRequest, SandboxLevel, ToolCall,
+    UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -46,6 +46,19 @@ fn request(prompt: &str) -> RunRequest {
         auto_approve: true,
         attachments: Vec::new(),
         resume: None,
+        mcp_servers: Vec::new(),
+    }
+}
+
+fn mcp_server() -> McpServerConfig {
+    McpServerConfig {
+        name: "zeron".into(),
+        command: "/opt/zeron bin/comet".into(),
+        args: vec!["mcp-bridge".into(), "--literal=$HOME".into()],
+        env: vec![
+            ("ZERON_CHAT_ID".into(), "chat-a".into()),
+            ("ZERON_IPC_PORT".into(), "12345".into()),
+        ],
     }
 }
 
@@ -226,7 +239,11 @@ async fn eager_done_forwards_wake_turn_as_second_done() {
         .enumerate()
         .filter_map(|(i, e)| matches!(e, AgentEvent::Done { .. }).then_some(i))
         .collect();
-    assert_eq!(done_positions.len(), 2, "eager done + wake done: {events:?}");
+    assert_eq!(
+        done_positions.len(),
+        2,
+        "eager done + wake done: {events:?}"
+    );
 
     // One SessionStarted total — the wake init is deduped.
     assert_eq!(
@@ -440,6 +457,26 @@ async fn error_codes_map_to_readable_messages() {
 }
 
 #[tokio::test]
+async fn mcp_config_is_attached_to_resumed_cli_session() {
+    let (controls, _steer, _token) = controls("A");
+    let mut req = request("scenario:mcp");
+    req.resume = Some("sess-old".into());
+    req.mcp_servers = vec![mcp_server()];
+    let events = run_to_end(&harness(), req, controls).await;
+
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: Some("mcp ready".into()),
+            error: None,
+            session_id: Some("sess-mcp".into()),
+        }),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn missing_binary_is_not_installed() {
     let harness = ClaudeHarness::new().with_executable("/nonexistent/claude-nowhere");
     let (controls, _steer, _token) = controls("A");
@@ -475,7 +512,10 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
     let cli = dir.join("replay.sh");
     std::fs::write(
         &cli,
-        format!("#!/bin/sh\nread -r _first || exit 1\ncat '{}'\n", frames.display()),
+        format!(
+            "#!/bin/sh\nread -r _first || exit 1\ncat '{}'\n",
+            frames.display()
+        ),
     )
     .expect("replayer written");
     #[cfg(unix)]

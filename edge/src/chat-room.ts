@@ -45,8 +45,9 @@ const MAX_SIDECAR_BYTES = 4 * 1024 * 1024;
 const MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024;
 /** Presence beats older than this are swept before relay/stats. */
 const PRESENCE_TTL_MS = 30_000;
-/** Per-device push quota, rolling window (in-memory; resets on hibernation —
- * it exists to contain a runaway client loop, not to meter honest traffic). */
+/** Per-(user, device) push quota, rolling window (in-memory; resets on
+ * hibernation — it exists to contain a runaway client loop, not to meter
+ * honest traffic). */
 const QUOTA_WINDOW_MS = 60_000;
 const QUOTA_MAX_PUSHES = 300;
 const QUOTA_MAX_BYTES = 8 * 1024 * 1024;
@@ -54,6 +55,9 @@ const QUOTA_MAX_BYTES = 8 * 1024 * 1024;
 interface SocketState {
   userId: string;
   device: string;
+  /** Explicit on new sockets. Missing means a pre-deploy attachment, for
+   * which disabling excludeOwn is the data-safe compatibility behavior. */
+  orgChat?: boolean;
   /** Set once a valid hello established the session. */
   ready?: boolean;
 }
@@ -132,7 +136,8 @@ export class ChatRoom implements DurableObject {
         else if (owner !== userId) return json({ error: "forbidden" }, 403);
         return null;
       }
-      // Everything else reads a claimed room.
+      // Everything else requires an already-claimed room and stays
+      // owner-only (including the plain-HTTPS rows pull/push paths).
       if (!owner) return json({ error: "not_found" }, 404);
       if (owner !== userId) return json({ error: "forbidden" }, 403);
       return null;
@@ -144,7 +149,7 @@ export class ChatRoom implements DurableObject {
       const device = url.searchParams.get("device") ?? "";
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
-      const state: SocketState = { userId, device };
+      const state: SocketState = { userId, device, orgChat };
       pair[1].serializeAttachment(state);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -205,6 +210,8 @@ export class ChatRoom implements DurableObject {
     }
 
     if (url.pathname === "/rows" && request.method === "GET") {
+      const denied = gate("rowsGet");
+      if (denied) return deny(denied);
       // Pull over plain HTTPS: one GET collapses connect → hello → state →
       // rowsReq → backfill (4+ serial round trips on a WS, and impossible on
       // networks that strip the upgrade) into a single request. The body is
@@ -214,8 +221,11 @@ export class ChatRoom implements DurableObject {
       const afterRaw = Number(url.searchParams.get("after") ?? "0");
       const after = Number.isInteger(afterRaw) && afterRaw >= 0 ? afterRaw : 0;
       const device = url.searchParams.get("device") ?? "";
-      const exclude =
-        url.searchParams.get("excludeOwn") === "1" && device !== "" ? device : undefined;
+      const exclude = excludedDevice(
+        orgChat,
+        url.searchParams.get("excludeOwn") === "1",
+        device
+      );
       const stats = logStats(sql);
       const frontier = this.blobs.get(FRONTIER_BLOB) ?? new Uint8Array(0);
       const frames: Uint8Array[] = [
@@ -257,26 +267,33 @@ export class ChatRoom implements DurableObject {
     }
 
     if (url.pathname === "/rows" && request.method === "POST") {
+      const denied = gate("rowsPost");
+      if (denied) return deny(denied);
       // Push over plain HTTPS — the WS push's fallback twin for networks
       // where the upgrade never completes. batchId dedupe (UNIQUE column)
       // makes at-least-once delivery exact-once in effect.
       const device = url.searchParams.get("device") ?? "";
+      // `device` is caller-controlled even though `userId` is Worker-stamped.
+      // Match the WS path's attribution so one org member cannot collide with
+      // another member's quota window or incident ledger by reusing/omitting
+      // a device id.
+      const attribution = attributionKey({ userId, device });
       const batchId = url.searchParams.get("batchId") ?? "";
       if (batchId === "" || batchId.length > 128) {
-        this.recordPush(device, false);
+        this.recordPush(attribution, false);
         return json({ error: "bad_push" }, 400);
       }
       const payload = new Uint8Array(await request.arrayBuffer());
-      if (!this.admitQuota(device, payload.byteLength)) {
-        this.recordPush(device, false);
+      if (!this.admitQuota(attribution, payload.byteLength)) {
+        this.recordPush(attribution, false);
         return json({ error: "quota" }, 429);
       }
       const outcome = appendRow(sql, device, batchId, payload, Date.now());
       if (!outcome.ok) {
-        this.recordPush(device, false);
+        this.recordPush(attribution, false);
         return json({ error: outcome.error }, outcome.error === "too_large" ? 413 : 400);
       }
-      this.recordPush(device, true);
+      this.recordPush(attribution, true);
       if (!outcome.dup) {
         this.markBackupDirty();
         // Live relay to every ready socket — a same-device socket would
@@ -323,8 +340,8 @@ export class ChatRoom implements DurableObject {
         ...logStats(sql),
         connectedSockets: this.ctx.getWebSockets().length,
         presence: Object.fromEntries(this.presence),
-        // The ONLY per-device attribution surface — kept from the 2026-08-05
-        // incident tooling (SessionRoom's /stats pushOutcomes).
+        // The ONLY per-(user, device) attribution surface — kept from the
+        // 2026-08-05 incident tooling (SessionRoom's /stats pushOutcomes).
         pushOutcomes: JSON.parse(getMeta(sql, "pushOutcomes") ?? "{}") as Record<
           string,
           PushOutcome
@@ -403,10 +420,9 @@ export class ChatRoom implements DurableObject {
 
   private handleHello(ws: WebSocket, state: SocketState, header: Record<string, unknown>): void {
     // The URL `device` param (Worker-validated against ID_RE) is the ONLY
-    // device source. The hello header's copy is ignored: honoring it let a
-    // client assume another device's identity, which in a shared room would
-    // poison quotas, pushOutcomes, and — worst — excludeOwn backfills
-    // (another user's rows silently omitted while the doc looks converged).
+    // device source. The hello header's copy is ignored so attribution cannot
+    // change after the authenticated upgrade. Quotas/outcomes also include
+    // `userId`, and org rooms disable raw-device `excludeOwn` below.
     void header;
     state.ready = true;
     ws.serializeAttachment(state);
@@ -437,7 +453,13 @@ export class ChatRoom implements DurableObject {
       return;
     }
     const after = typeof header.after === "number" && header.after >= 0 ? header.after : 0;
-    const exclude = header.excludeOwn === true ? state.device : undefined;
+    // In an org room `device` is caller-selected, not identity-bound. Another
+    // member may legitimately or maliciously reuse it; filtering by the raw
+    // value would hide that member's rows forever. Re-importing our own Loro
+    // rows is a no-op, so chat3 disables this bandwidth-only optimization.
+    // Old serialized attachments have `orgChat === undefined`; fail safe and
+    // disable exclusion until their next reconnect stamps the room kind.
+    const exclude = excludedDevice(state.orgChat, header.excludeOwn === true, state.device);
     const sql = this.ctx.storage.sql;
     for (const row of rowsAfter(sql, after, exclude)) {
       send(ws, FRAME.row, { seq: row.seq, device: row.device, batchId: row.batchId }, row.bytes);
@@ -599,6 +621,15 @@ export class ChatRoom implements DurableObject {
  * device string (or a blank one) must never share a window or a ledger row. */
 const attributionKey = (state: SocketState): string =>
   `${state.userId}:${state.device === "" ? "(unknown)" : state.device}`;
+
+/** Legacy chat2 may omit its own device's replay rows. Org-shared chat3 must
+ * not: device ids are not bound to user identity, so a collision would hide a
+ * foreign member's update. */
+const excludedDevice = (
+  orgChat: boolean | undefined,
+  requested: boolean,
+  device: string
+): string | undefined => (requested && orgChat === false && device !== "" ? device : undefined);
 
 const send = (
   ws: WebSocket,
