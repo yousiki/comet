@@ -13,21 +13,14 @@
   "name": "comet-native-edge",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
-  "account_id": "b57dde68ee5964dccc025437b5478a5b",
+  // This fork deploys to YouSiki's Cloudflare account (was upstream
+  // b57dde68ee5964dccc025437b5478a5b on the zeron.sh zone).
+  "account_id": "3ba1aaf889ad9e15eebee459ff361919",
   "workers_dev": true,
-  // Public hostname on the zeron.sh zone, plus the install surface carved out
-  // of the landing host: path routes beat the landing worker's custom
-  // domain, so `curl -fsSL https://zeron.sh/install.sh | sh` installs Zeron
-  // while the rest of zeron.sh serves the landing page.
-  "routes": [
-    { "pattern": "edge.zeron.sh", "custom_domain": true },
-    { "pattern": "zeron.sh/install.sh", "zone_name": "zeron.sh" },
-    { "pattern": "zeron.sh/releases/*", "zone_name": "zeron.sh" },
-    // Legacy comet hostnames — keep until 0.1.x clients are gone.
-    { "pattern": "edge.comet.zeron.sh", "custom_domain": true },
-    { "pattern": "comet.zeron.sh/install.sh", "zone_name": "zeron.sh" },
-    { "pattern": "comet.zeron.sh/releases/*", "zone_name": "zeron.sh" }
-  ],
+  // Public hostname on the siki.moe zone. (Upstream carved install.sh and
+  // /releases/* out of its landing zone; this fork exposes them on the same
+  // edge host — the installer URL is https://edge.siki.moe/install.sh.)
+  "routes": [{ "pattern": "edge.siki.moe", "custom_domain": true }],
   // Serve src/install.sh as a string (the /install.sh route).
   "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
   // loro-crdt's default entry loads its WASM via URL fetch, which workerd
@@ -73,11 +66,11 @@
     }
   ],
   "vars": {
-    // WorkOS AuthKit client id — JWTs verified against its JWKS. Placeholder;
-    // set the real client id before deploying. Set AUTH_MODE=dev locally to
-    // accept bearer==userId. WORKOS_API_KEY is a wrangler secret
+    // WorkOS AuthKit client id (this fork's own WorkOS environment) — JWTs
+    // verified against its JWKS. Set AUTH_MODE=dev locally to accept
+    // bearer==userId. WORKOS_API_KEY is a wrangler secret
     // (`wrangler secret put WORKOS_API_KEY`) powering the /auth/* routes.
-    "WORKOS_CLIENT_ID": "client_01KWD0EAKZKD50YCQJNYSRE4BY",
+    "WORKOS_CLIENT_ID": "client_01M09AJF16TCBRA7H3BJC9PXEB",
     "AUTH_MODE": "workos"
   },
   "observability": {
