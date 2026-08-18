@@ -36,6 +36,7 @@ fn run_request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        mcp_servers: Vec::new(),
         resume: None,
     }
 }
@@ -163,6 +164,8 @@ fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
         payload,
         issued_by: VIEWER.into(),
         issued_at: now,
+        user_id: None,
+        origin: None,
         based_on,
         expires_at: None,
         status: SessionCommandStatus::Pending,
@@ -614,6 +617,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
             }],
             created_at: 1,
             device_id: device_id.into(),
+            user_id: None,
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         })
@@ -1658,6 +1662,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
         attachments: vec![path],
+        mcp_servers: Vec::new(),
         resume: None,
     };
     core.doc_host

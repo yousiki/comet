@@ -601,6 +601,16 @@ impl Shell {
                     if let Some(device) = state.device_name(&chat.device_id) {
                         folder = format!("{folder} @ {device}");
                     }
+                    // Org-shared registries: a teammate's chat names its
+                    // creator (raw user id; display-name resolution is a
+                    // follow-up — there is no member-list API yet).
+                    if let Some(owner) = chat
+                        .user_id
+                        .as_deref()
+                        .filter(|owner| state.auth_user().is_none_or(|me| me.id != *owner))
+                    {
+                        folder = format!("{folder} · {owner}");
+                    }
                     // The branch shows whenever the engine has stamped one —
                     // main-checkout sessions included, not just worktrees.
                     let branch = chat

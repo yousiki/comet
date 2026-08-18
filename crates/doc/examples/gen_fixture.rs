@@ -24,6 +24,7 @@ fn main() {
         }],
         created_at: 1_700_000_000_000,
         device_id: "device-rust".into(),
+        user_id: None,
         status: Some(MessageStatus::Complete),
         continuation_of: None,
     })
@@ -75,6 +76,8 @@ fn main() {
         },
         issued_by: "device-rust".into(),
         issued_at: 1_700_000_002_000,
+        user_id: None,
+        origin: None,
         based_on: None,
         expires_at: None,
         status: SessionCommandStatus::Pending,

@@ -4,6 +4,7 @@
 
 mod auth_cli;
 mod daemon;
+mod mcp_bridge;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -39,6 +40,11 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// MCP stdio server for agent sessions (engine-spawned; not for direct
+    /// use). Exposes list_sessions / send_to_session, dialing back to the
+    /// engine named by ZERON_IPC_PORT as the session in ZERON_CHAT_ID.
+    #[command(hide = true)]
+    McpBridge,
 }
 
 #[derive(Subcommand)]
@@ -169,6 +175,10 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
+        }
+        Some(Command::McpBridge) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(mcp_bridge::run())
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),

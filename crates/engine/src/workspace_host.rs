@@ -130,8 +130,9 @@ pub struct WorkspaceHostConfig {
     /// `std::env::consts::OS`-style platform string.
     pub platform: String,
     pub org_id: String,
-    /// The signed-in user — registries are per-user (`reg1/{orgId}/{userId}`):
-    /// spaces/sessions are private to their owner, never org-visible.
+    /// The signed-in user. The registry room is org-shared (`reg2/{orgId}`):
+    /// every member sees every row; `user_id` stamps creator attribution on
+    /// chats this device creates or claims.
     pub user_id: String,
     /// When present, the host joins `/registry/{orgId}/ws`. `None` = fully offline
     /// (local snapshots only; the registry still drives everything device-side).
@@ -162,6 +163,12 @@ struct WorkspaceHostInner {
     peer_alive: Mutex<Option<PeerAliveHook>>,
     /// Deaf-socket tripwire state — see `check_presence_deafness`.
     presence_watch: Mutex<PresenceWatch>,
+    /// True once the registry room has been joined at least once this boot
+    /// (hello state applied). Gates `is_host` on unknown chats: in an
+    /// org-shared registry, "no row yet" usually means "not synced yet", and
+    /// claiming a foreign chat before the first sync would double-execute its
+    /// commands. Local-only (no edge) hosts never wait.
+    synced_once: std::sync::atomic::AtomicBool,
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -275,6 +282,7 @@ impl WorkspaceHost {
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
+                synced_once: std::sync::atomic::AtomicBool::new(false),
             }),
         };
         // Persist immediately: after this boot the migration source is never
@@ -361,6 +369,11 @@ impl WorkspaceHost {
                         }
                         let Some(inner) = weak.upgrade() else { return };
                         *lock(&inner.room) = Some(client.clone());
+                        // Hello state has been applied — unknown chats may be
+                        // claimed again (see `is_host` fail-closed gate).
+                        inner
+                            .synced_once
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         inner.bump_changed();
                         tracing::info!(org = %org_id, "registry room joined");
                         drop(inner);
@@ -551,14 +564,24 @@ impl WorkspaceHost {
     // ── chat ownership ──────────────────────────────────────────────────────
 
     /// Writer discipline: the chat's host is its row's `deviceId`. Unknown chats
-    /// are claimable — the first run command claims them via [`Self::claim_chat`].
+    /// are claimable — the first run command claims them via [`Self::claim_chat`]
+    /// — but only once the registry has synced at least once (or when there is
+    /// no edge at all). Fail-closed before that: in an org-shared registry an
+    /// unsynced device believing it hosts a foreign chat would double-execute
+    /// its commands. Read errors are likewise no longer treated as ownership.
     pub fn is_host(&self, chat_id: &str) -> bool {
         match self.read(|doc| doc.chat(chat_id)) {
             Ok(Some(chat)) => chat.device_id == self.inner.config.device_id,
-            Ok(None) => true,
+            Ok(None) => {
+                self.inner.config.edge.is_none()
+                    || self
+                        .inner
+                        .synced_once
+                        .load(std::sync::atomic::Ordering::Relaxed)
+            }
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry chat read failed");
-                true
+                false
             }
         }
     }
@@ -585,7 +608,19 @@ impl WorkspaceHost {
             Some(cwd) => Some(self.space_for_path(cwd)?),
             None => None,
         };
-        self.mutate(|doc| doc.claim_chat(chat_id, cwd, space_id.as_deref(), Utc::now()));
+        let user = match self.inner.config.user_id.as_str() {
+            "" => None,
+            u => Some(u.to_string()),
+        };
+        self.mutate(|doc| {
+            doc.claim_chat(
+                chat_id,
+                cwd,
+                space_id.as_deref(),
+                user.as_deref(),
+                Utc::now(),
+            )
+        });
         Ok(())
     }
 
@@ -743,13 +778,22 @@ impl WorkspaceHost {
                 last_message_at: None,
                 created_at: Utc::now(),
                 harness_session_id: None,
-                // Born on chat2: a brand-new chat has an empty doc — nothing
-                // to seed, no migration race to lose. Only pre-existing chats
-                // go through the seed+flip path (the host migration sweep).
-                room_gen: Some(2),
+                // Born on the current room generation: a brand-new chat has
+                // an empty doc — nothing to seed, no migration race to lose.
+                // 3 = org-shared chat3 whenever an edge is configured; only
+                // pre-existing chats go through the host migration sweep.
+                room_gen: Some(if self.inner.config.edge.is_some() {
+                    3
+                } else {
+                    2
+                }),
                 harness_session_cwd: None,
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
+                user_id: match self.inner.config.user_id.as_str() {
+                    "" => None,
+                    u => Some(u.to_string()),
+                },
             })
         })?;
         Ok(())
@@ -1378,7 +1422,35 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{device_name_on_boot, linked_worktree_root};
+    use super::{device_name_on_boot, linked_worktree_root, merge_sessions};
+    use zeron_proto::{Session, SessionStatus};
+
+    fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
+        Session {
+            chat_id: chat_id.into(),
+            device_id: device_id.into(),
+            status,
+            started_at: None,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Org-shared registry: rows now arrive from other USERS' devices too.
+    /// The overlay must keep them verbatim while replacing only rows for our
+    /// own device with the local live statuses.
+    #[test]
+    fn merge_sessions_keeps_foreign_device_rows() {
+        let rows = vec![
+            session("chat-own", "dev-me", SessionStatus::Idle), // stale remote copy of us
+            session("chat-teammate", "dev-bob", SessionStatus::Working),
+        ];
+        let local = vec![session("chat-own", "dev-me", SessionStatus::Working)];
+        let merged = merge_sessions("dev-me", &rows, &local);
+        let by_chat = |id: &str| merged.iter().find(|s| s.chat_id == id).unwrap();
+        assert_eq!(by_chat("chat-own").status, SessionStatus::Working); // local wins
+        assert_eq!(by_chat("chat-teammate").device_id, "dev-bob"); // foreign kept
+        assert_eq!(merged.len(), 2);
+    }
 
     #[test]
     fn boot_repairs_the_legacy_unknown_device_sentinel() {

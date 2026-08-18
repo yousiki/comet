@@ -1043,6 +1043,21 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
+            methods::SEND_TO_SESSION => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct SendToSessionParams {
+                    from_chat_id: String,
+                    target_chat_id: String,
+                    message: String,
+                }
+                let p: SendToSessionParams = parse_params(params)?;
+                let command_id = self
+                    .doc_host
+                    .send_to_session(&p.from_chat_id, &p.target_chat_id, &p.message)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
             methods::WATCH_DOC_MESSAGES => {
                 let p: ChatParams = parse_params(params)?;
                 let handle = self

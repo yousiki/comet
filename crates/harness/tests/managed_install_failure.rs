@@ -52,6 +52,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        mcp_servers: Vec::new(),
         resume: None,
     };
 

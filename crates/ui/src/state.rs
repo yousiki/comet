@@ -302,6 +302,7 @@ impl EngineHandle {
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
         let service_for_boot = assembled_service.clone();
+        let ipc_bound = ipc_task.is_some();
         // The instance lock rides into the boot task and is consumed by
         // assembly — held through sign-in onboarding too, because this process
         // owns the data dir from the moment it decided to embed.
@@ -336,6 +337,15 @@ impl EngineHandle {
 
             match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
                 Ok(engine_runtime) => {
+                    // Agent MCP bridge dials the IPC port — only when this
+                    // window actually won the bind (a lost race would hand
+                    // the bridge to a DIFFERENT engine's sessions).
+                    if ipc_bound {
+                        engine_runtime
+                            .core()
+                            .sessions
+                            .set_mcp_port(engine_config.ipc_port);
+                    }
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
                     *runtime_for_boot.lock().await = Some(engine_runtime);
                     if service_for_boot.set(service).is_err() {
@@ -2197,6 +2207,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            user_id: None,
         }
     }
 
@@ -2238,6 +2249,7 @@ mod tests {
             parts: Vec::new(),
             created_at: 0,
             device_id: "dev".into(),
+            user_id: None,
             status: None,
             continuation_of: None,
         }
@@ -2585,6 +2597,7 @@ mod tests {
             parts: vec![],
             created_at: 0,
             device_id: "local".into(),
+            user_id: None,
             status: None,
             continuation_of: None,
         };

@@ -121,11 +121,16 @@ pub struct Chat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
     /// Which sync room generation serves this chat (docs/chat2-sync.md M2):
-    /// `None`/1 = legacy s2 loro room, 2 = chat2 dumb relay. The HOST flips
-    /// this in the same breath as seeding the chat2 checkpoint; every device
-    /// dials the room the registry names. Per-chat and instantly revertible.
+    /// `None`/1 = legacy s2 loro room, 2 = chat2 dumb relay, 3 = org-shared
+    /// chat3 room. The HOST flips this in the same breath as seeding the
+    /// room; every device dials the room the registry names. Per-chat and
+    /// instantly revertible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_gen: Option<u32>,
+    /// Creating user (additive; absent on rows from pre-attribution writers).
+    /// Sidebar "whose chat" label in org-shared registries. Informational.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 impl Chat {

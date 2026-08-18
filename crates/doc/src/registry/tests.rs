@@ -272,6 +272,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         space_id: None,
         last_seen_at: None,
         room_gen: None,
+        user_id: None,
     }
 }
 
@@ -516,7 +517,13 @@ fn late_create_chat_config_survives_a_prior_claim() {
     // claims trail by whole seconds; the sleep keeps the HLCs out of the
     // same-millisecond device-id tiebreak.)
     std::thread::sleep(std::time::Duration::from_millis(2));
-    host.claim_chat("chat-race", Some("/tmp/repo"), Some("space-1"), ts(9_000));
+    host.claim_chat(
+        "chat-race",
+        Some("/tmp/repo"),
+        Some("space-1"),
+        None,
+        ts(9_000),
+    );
 
     let mut server = HashMap::new();
     let mut seq = 0u64;

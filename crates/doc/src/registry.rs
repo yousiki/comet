@@ -821,7 +821,7 @@ impl RegistryDoc {
             Some(config) => serde_json::to_value(config)?,
             None => Value::Null,
         };
-        let set = fields([
+        let mut set = fields([
             ("id", json!(chat.id)),
             ("deviceId", json!(chat.device_id)),
             ("title", opt_str(chat.title.as_deref())),
@@ -851,6 +851,12 @@ impl RegistryDoc {
                 chat.room_gen.map(|g| json!(g)).unwrap_or(Value::Null),
             ),
         ]);
+        // Creator attribution is write-once-ish: only stamped when known, so
+        // a round-tripped upsert from a reader that lacks it can never
+        // LWW-clobber the original creator with Null.
+        if let Some(user_id) = &chat.user_id {
+            set.insert("userId".into(), json!(user_id));
+        }
         self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
         Ok(())
     }
@@ -865,6 +871,7 @@ impl RegistryDoc {
         chat_id: &str,
         cwd: Option<&str>,
         space_id: Option<&str>,
+        user_id: Option<&str>,
         created_at: DateTime<Utc>,
     ) {
         let mut set = fields([
@@ -877,6 +884,9 @@ impl RegistryDoc {
         }
         if let Some(space_id) = space_id {
             set.insert("spaceId".into(), json!(space_id));
+        }
+        if let Some(user_id) = user_id {
+            set.insert("userId".into(), json!(user_id));
         }
         self.write(KIND_CHATS, chat_id, OpKind::Upsert, set);
     }

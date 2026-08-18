@@ -46,6 +46,12 @@ pub struct SessionMessageEntry {
     /// Epoch millis.
     pub created_at: i64,
     pub device_id: String,
+    /// Authoring user (additive; absent on old rows and old writers). Shared
+    /// sessions render "who said this" from it; `agent:{chatId}` values mark
+    /// agent-to-agent sends. Informational, not authenticated — same trust
+    /// level as the rest of the doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<MessageStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -340,6 +346,15 @@ impl SessionDoc {
         )?;
         map.insert("issuedBy", entry.issued_by.as_str())?;
         map.insert("issuedAt", entry.issued_at)?;
+        if let Some(user_id) = &entry.user_id {
+            map.insert("userId", user_id.as_str())?;
+        }
+        if let Some(origin) = &entry.origin {
+            map.insert(
+                "origin",
+                loro_value_from_json(&serde_json::to_value(origin)?),
+            )?;
+        }
         if let Some(based_on) = &entry.based_on {
             map.insert(
                 "basedOn",
@@ -591,6 +606,9 @@ fn write_entry_scalar_fields(map: &LoroMap, entry: &SessionMessageEntry) -> Resu
     )?;
     map.insert("createdAt", entry.created_at)?;
     map.insert("deviceId", entry.device_id.as_str())?;
+    if let Some(user_id) = &entry.user_id {
+        map.insert("userId", user_id.as_str())?;
+    }
     if let Some(status) = entry.status {
         map.insert("status", status_str(status))?;
     }
@@ -674,6 +692,8 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
         created_at: i64,
         device_id: String,
         #[serde(default)]
+        user_id: Option<String>,
+        #[serde(default)]
         status: Option<MessageStatus>,
         #[serde(default)]
         continuation_of: Option<String>,
@@ -685,6 +705,7 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
             parts: raw.parts.into_iter().map(from_doc_part).collect(),
             created_at: raw.created_at,
             device_id: raw.device_id,
+            user_id: raw.user_id,
             status: raw.status,
             continuation_of: raw.continuation_of,
         }),
@@ -747,6 +768,7 @@ fn salvage_entry(
         parts,
         created_at: obj.get("createdAt").and_then(|x| x.as_i64()).unwrap_or(0),
         device_id: str_field("deviceId").unwrap_or_default(),
+        user_id: str_field("userId"),
         status: obj
             .get("status")
             .and_then(|s| serde_json::from_value(s.clone()).ok()),
@@ -873,6 +895,7 @@ impl<'a> SegmentWriter<'a> {
                 parts: vec![],
                 created_at,
                 device_id: device_id.into(),
+                user_id: None,
                 status: Some(MessageStatus::Streaming),
                 continuation_of: None,
             },
@@ -1104,6 +1127,7 @@ mod tests {
             }],
             created_at: 1,
             device_id: "dev-a".into(),
+            user_id: None,
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         }
@@ -1194,6 +1218,7 @@ mod tests {
             }],
             created_at: 1,
             device_id: "dev-a".into(),
+            user_id: None,
             // The orphan case: the run died and recovery stamped the entry.
             status: Some(MessageStatus::Aborted),
             continuation_of: None,
@@ -1400,6 +1425,7 @@ mod tests {
             }],
             created_at: 1,
             device_id: "dev-a".into(),
+            user_id: None,
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         })
@@ -1446,6 +1472,8 @@ mod tests {
             },
             issued_by: "dev-b".into(),
             issued_at: 10,
+            user_id: None,
+            origin: None,
             based_on: None,
             expires_at: None,
             status: SessionCommandStatus::Pending,

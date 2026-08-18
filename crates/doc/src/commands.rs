@@ -74,6 +74,17 @@ pub struct CommandBasedOn {
     pub frontier: Option<String>,
 }
 
+/// Provenance of an agent-to-agent send: which session's agent issued it and
+/// how deep the send chain is. `hops` is what breaks A→B→A ping-pong — the
+/// executing host records the live turn's depth and the engine refuses to
+/// queue past MAX_AGENT_HOPS.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandOrigin {
+    pub from_chat_id: String,
+    pub hops: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionCommandEntry {
@@ -82,6 +93,13 @@ pub struct SessionCommandEntry {
     pub issued_by: String,
     /// Epoch millis.
     pub issued_at: i64,
+    /// Issuing user (additive; absent from old writers). Rendered as message
+    /// authorship on the entry the host writes for this command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Agent-to-agent provenance (additive; absent on human sends).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CommandOrigin>,
     #[serde(default)]
     pub based_on: Option<CommandBasedOn>,
     /// Epoch millis; defaults to issued_at + COMMAND_DEFAULT_TTL_MS when absent.
@@ -184,6 +202,8 @@ mod tests {
             payload,
             issued_by: "device-a".into(),
             issued_at,
+            user_id: None,
+            origin: None,
             based_on: None,
             expires_at: None,
             status: SessionCommandStatus::Pending,
@@ -312,6 +332,7 @@ mod tests {
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             auto_approve: false,
             attachments: Vec::new(),
+            mcp_servers: Vec::new(),
             resume: None,
         }
     }

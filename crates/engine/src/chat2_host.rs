@@ -145,14 +145,22 @@ pub struct EdgeCheckpointFetcher {
     http: reqwest::Client,
     edge: EdgeConfig,
     chat_id: String,
+    /// 2 = `/chat2/...`, 3 = org-shared `/chat3/...`.
+    room_gen: u32,
 }
 
 impl EdgeCheckpointFetcher {
-    pub fn new(http: reqwest::Client, edge: EdgeConfig, chat_id: impl Into<String>) -> Self {
+    pub fn new(
+        http: reqwest::Client,
+        edge: EdgeConfig,
+        chat_id: impl Into<String>,
+        room_gen: u32,
+    ) -> Self {
         Self {
             http,
             edge,
             chat_id: chat_id.into(),
+            room_gen,
         }
     }
 }
@@ -162,8 +170,9 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
         let http = self.http.clone();
         let edge = self.edge.clone();
         let url = format!(
-            "{}/chat2/{}/checkpoint",
+            "{}/{}/{}/checkpoint",
             edge.url.trim_end_matches('/'),
+            if self.room_gen >= 3 { "chat3" } else { "chat2" },
             self.chat_id
         );
         Box::pin(async move {

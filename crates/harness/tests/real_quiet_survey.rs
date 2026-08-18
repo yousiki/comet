@@ -68,6 +68,7 @@ async fn probe_once(harness: AcpHarness) -> ProbeOutcome {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        mcp_servers: Vec::new(),
         resume: None,
     };
     let mut stream = match harness.run(req, controls).await {

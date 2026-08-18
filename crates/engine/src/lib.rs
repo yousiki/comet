@@ -204,6 +204,7 @@ impl EngineCore {
             store.clone(),
             DocHostConfig {
                 device_id: device_id.clone(),
+                user_id: profile.user_id().to_string(),
                 default_harness,
                 edge: edge.clone(),
             },
@@ -797,6 +798,9 @@ impl Engine {
             stop_tx,
         });
         let server = serve_ipc(config.ipc_port, service).await?;
+        // The listener is bound: agent sessions may now get the MCP bridge
+        // that dials back to it.
+        runtime.core().sessions.set_mcp_port(config.ipc_port);
 
         tokio::select! {
             result = shutdown_signal() => result?,

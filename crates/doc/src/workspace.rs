@@ -649,6 +649,8 @@ pub(crate) struct RawChat {
     last_seen_at: Option<i64>,
     #[serde(default)]
     room_gen: Option<u32>,
+    #[serde(default)]
+    user_id: Option<String>,
 }
 
 impl From<RawChat> for Chat {
@@ -670,6 +672,7 @@ impl From<RawChat> for Chat {
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
+            user_id: raw.user_id,
         }
     }
 }
@@ -742,6 +745,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            user_id: None,
         }
     }
 

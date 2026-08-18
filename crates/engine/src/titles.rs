@@ -171,6 +171,7 @@ impl TitleGenerator {
                 sandbox: SandboxLevel::ReadOnly,
                 auto_approve: true,
                 attachments: Vec::new(),
+                mcp_servers: Vec::new(),
                 resume: None,
             };
             match collect_text(harness.as_ref(), request).await {

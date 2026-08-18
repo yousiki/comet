@@ -113,22 +113,30 @@ final class AppConfig: @unchecked Sendable {
         return url
     }
 
-    /// The chat2 log-relay room (docs/chat2-sync.md B) — replaces the s2
+    /// Room-path prefix for a chat's sync generation: 2 = single-owner
+    /// `chat2`, 3+ = org-shared `chat3` (same DO surface, member-open reads).
+    private static func chatRoomPrefix(roomGen: Int) -> String {
+        roomGen >= 3 ? "chat3" : "chat2"
+    }
+
+    /// The chat log-relay room (docs/chat2-sync.md B) — replaces the s2
     /// session rooms, which mobile no longer dials at all. `device` rides the
     /// URL so the DO can attribute sockets and honor excludeOwn backfills.
-    func chat2SocketURL(chatId: String) async -> URL? {
+    /// iOS never claims host (`role=host` is the engine's job).
+    func chat2SocketURL(chatId: String, roomGen: Int) async -> URL? {
         guard let token = await currentToken() else { return nil }
-        var url = wsBase.appending(path: "chat2/\(chatId)/ws")
+        var url = wsBase.appending(path: "\(Self.chatRoomPrefix(roomGen: roomGen))/\(chatId)/ws")
         url.append(queryItems: [URLQueryItem(name: "token", value: token),
                                 URLQueryItem(name: "device", value: deviceId)])
         return url
     }
 
-    /// GET /chat2/{chatId}/checkpoint — the Range-resumable doc snapshot
-    /// (auth via bearer header; the caller adds Range on resume).
-    func chat2CheckpointRequest(chatId: String) async -> URLRequest? {
+    /// GET /{chat2|chat3}/{chatId}/checkpoint — the Range-resumable doc
+    /// snapshot (auth via bearer header; the caller adds Range on resume).
+    func chat2CheckpointRequest(chatId: String, roomGen: Int) async -> URLRequest? {
         guard let token = await currentToken() else { return nil }
-        var request = URLRequest(url: edgeURL.appending(path: "chat2/\(chatId)/checkpoint"))
+        var request = URLRequest(
+            url: edgeURL.appending(path: "\(Self.chatRoomPrefix(roomGen: roomGen))/\(chatId)/checkpoint"))
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         return request
     }

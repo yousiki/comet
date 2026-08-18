@@ -35,6 +35,7 @@ async fn main() {
         store,
         DocHostConfig {
             device_id: "probe-dev".into(),
+            user_id: "probe-user".into(),
             default_harness: zeron_proto::HarnessId::ClaudeCode,
             edge: Some(EdgeConfig::with_static_token(
                 format!("http://{addr}"),

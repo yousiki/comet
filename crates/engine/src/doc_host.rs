@@ -25,9 +25,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use zeron_doc::{
-    COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
-    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
-    SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
+    COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, CommandOrigin, DocError,
+    EvaluationContext, MessagePart, MessageRole, MessageStatus, SessionCommandEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries,
 };
 use zeron_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
@@ -121,11 +121,22 @@ impl EdgeConfig {
     /// the bearer is re-fetched before every connect, so reconnects after a
     /// token expiry present a fresh `?token=` instead of the boot-time one.
     pub fn room_url(&self, path: impl Into<String>) -> Arc<dyn zeron_sync::UrlProvider> {
+        self.room_url_with(path, "")
+    }
+
+    /// [`Self::room_url`] with extra query params appended after the token
+    /// and device (e.g. `"&role=host"` for a chat3 host claim).
+    pub fn room_url_with(
+        &self,
+        path: impl Into<String>,
+        extra_query: impl Into<String>,
+    ) -> Arc<dyn zeron_sync::UrlProvider> {
         let ws_base = self.url.replacen("http", "ws", 1);
         Arc::new(EdgeRoomUrl {
             base: format!("{}{}", ws_base.trim_end_matches('/'), path.into()),
             token: self.token.clone(),
             device_id: self.device_id.clone(),
+            extra_query: extra_query.into(),
         })
     }
 }
@@ -134,6 +145,7 @@ struct EdgeRoomUrl {
     base: String,
     token: Arc<dyn zeron_rpc::TokenSource>,
     device_id: String,
+    extra_query: String,
 }
 
 impl zeron_sync::UrlProvider for EdgeRoomUrl {
@@ -141,6 +153,7 @@ impl zeron_sync::UrlProvider for EdgeRoomUrl {
         let token = self.token.clone();
         let base = self.base.clone();
         let device = self.device_id.clone();
+        let extra = self.extra_query.clone();
         Box::pin(async move {
             let token = token.token().await.ok_or_else(|| {
                 zeron_sync::SyncError::Auth("no access token (signed out)".into())
@@ -149,14 +162,25 @@ impl zeron_sync::UrlProvider for EdgeRoomUrl {
             if !device.is_empty() {
                 url.push_str(&format!("&device={device}"));
             }
+            url.push_str(&extra);
             Ok(url)
         })
     }
 }
 
+/// Room-path prefix for a chat's sync generation: 2 = `chat2` (single-owner),
+/// 3 = `chat3` (org-shared). Gen 1 never dials a room.
+fn room_prefix(room_gen: u32) -> &'static str {
+    if room_gen >= 3 { "chat3" } else { "chat2" }
+}
+
 #[derive(Debug, Clone)]
 pub struct DocHostConfig {
     pub device_id: String,
+    /// The signed-in user — stamped on command entries this engine queues so
+    /// shared sessions can render "who sent this". Empty when unknown (dev
+    /// setups without auth); empty stamps nothing.
+    pub user_id: String,
     /// Harness for doc-command runs on chats without a workspace `config` row.
     pub default_harness: HarnessId,
     /// When present, each opened chat joins its edge session room. `None` = fully
@@ -190,6 +214,12 @@ struct DocHostInner {
     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
     /// discipline — diff_sync's untimed client hung on dead links).
     http: reqwest::Client,
+    /// chat_id → the live turn's agent-send hop depth (from the executed
+    /// command's `origin`; 0 for human sends). `send_to_session` reads it to
+    /// stamp `hops + 1` on outgoing sends — the A→B→A ping-pong breaker.
+    turn_origins: Mutex<HashMap<String, u32>>,
+    /// chat_id → sends spent this turn (reset when a new turn dispatches).
+    send_budgets: Mutex<HashMap<String, u32>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -293,11 +323,14 @@ impl ChatDocHandle {
 
     /// Write a complete user message entry, idempotent by id (the client-minted message
     /// id — a re-executed command or optimistic echo never duplicates the entry).
+    /// `author` is the issuing user (from the command entry) — `agent:{chatId}`
+    /// for agent-to-agent sends; None on entries from pre-attribution writers.
     pub fn write_user_message(
         &self,
         message_id: &str,
         text: &str,
         created_at: i64,
+        author: Option<&str>,
     ) -> Result<(), DocError> {
         if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
             return Ok(());
@@ -311,6 +344,7 @@ impl ChatDocHandle {
             }],
             created_at,
             device_id: self.device_id.clone(),
+            user_id: author.map(str::to_owned),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         })
@@ -396,6 +430,8 @@ impl DocHost {
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new()),
+                turn_origins: Mutex::new(HashMap::new()),
+                send_budgets: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -512,18 +548,36 @@ impl DocHost {
                     return; // edge-less engine: nothing to migrate onto
                 };
                 let Some(ws) = host.workspace() else { continue };
+                let minted = host.minted_room_gen();
                 let chats: Vec<zeron_proto::Chat> = ws.watch_chats().borrow().clone();
                 let device = host.inner.config.device_id.clone();
                 let now = now_ms();
                 let candidate = chats.into_iter().find(|c| {
                     c.device_id == device
-                        && c.room_gen.unwrap_or(1) < 2
+                        && c.room_gen.unwrap_or(1) < minted
                         && !attempted
                             .get(&c.id)
                             .is_some_and(|t| now - *t <= RETRY_GAP_MS)
                 });
                 let Some(chat) = candidate else { continue };
                 attempted.insert(chat.id.clone(), now);
+                // chat2 → chat3 needs NO rebuild: the doc lineage is already
+                // thin and unchanged, only the room moves. Flip the row; the
+                // cutover watcher retires the stale handle and the reopen
+                // dials chat3 with role=host, where the bootstrap-checkpoint
+                // heal seeds the fresh room from the same lineage. (Rebuilding
+                // would mint a NEW lineage and duplicate transcripts on every
+                // reader that already holds the chat2 one.)
+                if chat.room_gen.unwrap_or(1) >= 2 {
+                    match ws.set_chat_room_gen(&chat.id, minted) {
+                        Ok(true) => tracing::info!(chat = %chat.id, gen = minted,
+                            "migration sweep: flipped chat2 room to org-shared chat3"),
+                        Ok(false) => {}
+                        Err(err) => tracing::warn!(chat = %chat.id, error = %err,
+                            "migration sweep: gen flip failed"),
+                    }
+                    continue;
+                }
                 // A cached (warm) handle never re-enters open()'s build path,
                 // so arm the quiet-waiter directly; a cold chat opens, which
                 // arms it on the way up.
@@ -562,11 +616,11 @@ impl DocHost {
                 if chats.changed().await.is_err() {
                     return; // workspace host gone (shutdown)
                 }
-                let flipped: Vec<String> = chats
+                let flipped: Vec<(String, u32)> = chats
                     .borrow_and_update()
                     .iter()
                     .filter(|c| c.room_gen.unwrap_or(1) >= 2)
-                    .map(|c| c.id.clone())
+                    .map(|c| (c.id.clone(), c.room_gen.unwrap_or(1)))
                     .collect();
                 if flipped.is_empty() {
                     continue;
@@ -575,14 +629,21 @@ impl DocHost {
                 let mut stuck_live: Vec<(String, Arc<ChatDocHandle>)> = Vec::new();
                 {
                     let mut handles = lock(&host.inner.handles);
-                    for chat_id in flipped {
+                    for (chat_id, row_gen) in flipped {
                         let Some(handle) = handles.get(&chat_id) else {
                             continue;
                         };
-                        if handle.room_gen >= 2 {
-                            continue; // already chat2-mode
+                        if handle.room_gen >= row_gen {
+                            continue; // already on (or past) the named room
                         }
                         let live_writer = Arc::strong_count(&handle.doc) > 1;
+                        if live_writer && handle.room_gen >= 2 {
+                            // chat2 → chat3 under a live run: same lineage,
+                            // no seed needed — leave the run writing (local
+                            // persistence is unaffected); the next open after
+                            // it quiesces dials the chat3 room.
+                            continue;
+                        }
                         if live_writer {
                             // A run is writing into this s2 doc while the
                             // registry already says chat2 — the born-gen2
@@ -645,6 +706,17 @@ impl DocHost {
         &self.inner.config.device_id
     }
 
+    /// The room generation this engine mints for new/migrated chats: 3
+    /// (org-shared chat3) whenever an edge is configured — synced and dev
+    /// profiles always carry an org — else 2 (edge-less chats never dial).
+    fn minted_room_gen(&self) -> u32 {
+        if self.inner.config.edge.is_some() {
+            3
+        } else {
+            2
+        }
+    }
+
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -669,12 +741,14 @@ impl DocHost {
         // (2026-08-11).
         let registry_gen = match chat_row.as_ref() {
             Some(row) => row.room_gen.unwrap_or(1),
-            None => 2,
+            None => self.minted_room_gen(),
         };
         {
             let mut handles = lock(&self.inner.handles);
             if let Some(handle) = handles.get(chat_id) {
-                let stale = registry_gen >= 2 && handle.room_gen < 2;
+                // Stale = built for an older room generation than the registry
+                // names (s2→chat2 seed, or the chat2→chat3 org-share flip).
+                let stale = registry_gen >= 2 && handle.room_gen < registry_gen;
                 if (stale || handle.retired.load(Ordering::Relaxed)) && !self.pinned(handle) {
                     // A seed flipped this chat under a cached fat handle
                     // (review B1): drop it so this open converges onto the
@@ -701,14 +775,17 @@ impl DocHost {
         let stored = self.inner.store.load_snapshot_with_cursor(chat_id)?;
         let stored_epoch = stored.as_ref().map(|(_, _, e)| *e).unwrap_or(0);
         let room_gen = if stored_epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
-            if registry_gen < 2
-                && let Some(ws) = self.workspace()
-            {
-                let _ = ws.set_chat_room_gen(chat_id, 2);
-                tracing::info!(chat = %chat_id,
-                    "completed interrupted chat2 flip (local epoch 2, registry said s2)");
+            if registry_gen < 2 {
+                let minted = self.minted_room_gen();
+                if let Some(ws) = self.workspace() {
+                    let _ = ws.set_chat_room_gen(chat_id, minted);
+                    tracing::info!(chat = %chat_id, room_gen = minted,
+                        "completed interrupted room-gen flip (local epoch 2, registry said s2)");
+                }
+                minted
+            } else {
+                registry_gen
             }
-            2
         } else {
             registry_gen
         };
@@ -950,12 +1027,22 @@ impl DocHost {
             // chat2 handle read as perma-pinned — LRU eviction dead); this
             // task's own strong ref dies when the join resolves.
             drop(doc);
+            let room_gen = weak.upgrade().map(|h| h.room_gen).unwrap_or(2);
+            let prefix = room_prefix(room_gen);
             let fetcher = Arc::new(crate::chat2_host::EdgeCheckpointFetcher::new(
                 http,
                 edge.clone(),
                 chat.clone(),
+                room_gen,
             ));
-            let url = edge.room_url(format!("/chat2/{chat}/ws"));
+            // chat3 host claim rides the join: the DO's host-user slot gates
+            // checkpoint/tail/diff/reset to whoever first joins with role=host.
+            let host_query = if room_gen >= 3 && host.is_host(&chat) {
+                "&role=host"
+            } else {
+                ""
+            };
+            let url = edge.room_url_with(format!("/{prefix}/{chat}/ws"), host_query);
             let mut wake = zeron_sync::wake::subscribe();
             let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
             loop {
@@ -1110,6 +1197,18 @@ impl DocHost {
                         }
                     }
                     Ok(Err(err)) => {
+                        // Mixed-fleet park: a foreign single-owner chat2 room
+                        // answers 403 to non-owners forever — retrying burns
+                        // dials for nothing. Park; the registry row flipping
+                        // to gen 3 retires this handle and the reopen dials
+                        // the org-shared room instead.
+                        // ponytail: string-match on the ws upgrade error; a
+                        // typed status would need plumbing through zeron-sync.
+                        if room_gen < 3 && !host.is_host(&chat) && err.to_string().contains("403") {
+                            tracing::info!(chat = %chat,
+                                "chat2 join forbidden (foreign single-owner room); parked until registry flips");
+                            return;
+                        }
                         tracing::warn!(chat = %chat, error = %err,
                             backoff_ms = backoff.as_millis() as u64,
                             "chat2 join failed; retrying");
@@ -1244,9 +1343,12 @@ impl DocHost {
         let snapshot = rebuilt.doc.export_snapshot().map_err(|e| e.to_string())?;
         let frontier = rebuilt.doc.doc().oplog_vv().encode();
         let bearer = edge.bearer().await.ok_or("signed out")?;
+        // role=host claims the chat3 host-user slot when this bootstrap
+        // checkpoint precedes the ws join (harmless on chat2 rooms).
         let url = format!(
-            "{}/chat2/{}/checkpoint?seqCovered=0",
+            "{}/{}/{}/checkpoint?seqCovered=0&role=host",
             edge.url.trim_end_matches('/'),
+            room_prefix(self.minted_room_gen()),
             chat_id
         );
         let res = self
@@ -1303,7 +1405,7 @@ impl DocHost {
         let flipped = self
             .workspace()
             .ok_or("no workspace host")?
-            .set_chat_room_gen(chat_id, 2)
+            .set_chat_room_gen(chat_id, self.minted_room_gen())
             .map_err(|e| e.to_string())?;
         if !flipped {
             return Err("chat row vanished during seed".into());
@@ -1454,13 +1556,15 @@ impl DocHost {
             let http = self.inner.http.clone();
             let edge_tail = edge.clone();
             let chat = chat_id.clone();
+            let prefix = room_prefix(handle.room_gen);
             self.spawn_worker(async move {
                 let Some(bearer) = edge_tail.bearer().await else {
                     return;
                 };
                 let url = format!(
-                    "{}/chat2/{}/tail",
+                    "{}/{}/{}/tail",
                     edge_tail.url.trim_end_matches('/'),
+                    prefix,
                     chat
                 );
                 let _ = http
@@ -1511,14 +1615,18 @@ impl DocHost {
         let seq_covered = stats.cursor;
         let http = self.inner.http.clone();
         let weak_note = Arc::downgrade(handle);
+        let prefix = room_prefix(handle.room_gen);
         self.spawn_worker(async move {
             let Some(bearer) = edge.bearer().await else {
                 in_flight.store(false, Ordering::Release);
                 return;
             };
+            // role=host: claims the chat3 host-user slot if the ws join's
+            // claim hasn't landed yet (no-op for the established host).
             let url = format!(
-                "{}/chat2/{}/checkpoint?seqCovered={}",
+                "{}/{}/{}/checkpoint?seqCovered={}&role=host",
                 edge.url.trim_end_matches('/'),
+                prefix,
                 chat_id,
                 seq_covered
             );
@@ -1706,6 +1814,23 @@ impl DocHost {
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
+        let user = match self.inner.config.user_id.as_str() {
+            "" => None,
+            u => Some(u.to_string()),
+        };
+        self.queue_command_as(chat_id, payload, user, None)
+    }
+
+    /// [`Self::queue_command`] with explicit attribution: `user_id` names the
+    /// issuing user (`agent:{chatId}` for agent-to-agent sends), `origin`
+    /// carries send-chain provenance for hop limiting.
+    pub fn queue_command_as(
+        &self,
+        chat_id: &str,
+        payload: SessionCommandPayload,
+        user_id: Option<String>,
+        origin: Option<CommandOrigin>,
+    ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
         let id = new_id();
         let now = now_ms();
@@ -1722,6 +1847,8 @@ impl DocHost {
             payload,
             issued_by: self.inner.config.device_id.clone(),
             issued_at: now,
+            user_id,
+            origin,
             based_on,
             expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
             status: SessionCommandStatus::Pending,
@@ -1748,6 +1875,67 @@ impl DocHost {
         // for any other reason still executes it).
         self.nudge_remote_host(chat_id);
         Ok(id)
+    }
+
+    /// Agent-to-agent send: queue a Steer into `target_chat`'s doc, attributed
+    /// `agent:{from_chat}`, delivered by the target's host through the normal
+    /// command plane (offline-queued, nudged, deduped). Loop protection:
+    /// hop depth (from the live turn's origin) capped at [`MAX_AGENT_HOPS`],
+    /// plus a per-turn send budget per source chat.
+    pub fn send_to_session(
+        &self,
+        from_chat: &str,
+        target_chat: &str,
+        message: &str,
+    ) -> Result<String, EngineError> {
+        const MAX_AGENT_HOPS: u32 = 4;
+        const MAX_SENDS_PER_TURN: u32 = 8;
+        if from_chat == target_chat {
+            return Err(EngineError::Other("cannot send to the own session".into()));
+        }
+        if message.trim().is_empty() {
+            return Err(EngineError::Other("empty message".into()));
+        }
+        let hops = lock(&self.inner.turn_origins)
+            .get(from_chat)
+            .copied()
+            .unwrap_or(0)
+            + 1;
+        if hops > MAX_AGENT_HOPS {
+            return Err(EngineError::Other(format!(
+                "agent send chain too deep (>{MAX_AGENT_HOPS} hops) — refusing to ping-pong"
+            )));
+        }
+        // ponytail: per-turn counter; per-target token bucket if abuse shows up
+        {
+            let mut budgets = lock(&self.inner.send_budgets);
+            let spent = budgets.entry(from_chat.to_string()).or_insert(0);
+            if *spent >= MAX_SENDS_PER_TURN {
+                return Err(EngineError::Other(format!(
+                    "send budget exhausted ({MAX_SENDS_PER_TURN} per turn)"
+                )));
+            }
+            *spent += 1;
+        }
+        self.queue_command_as(
+            target_chat,
+            SessionCommandPayload::Steer {
+                prompt: message.to_string(),
+                message_id: Some(new_id()),
+            },
+            Some(format!("agent:{from_chat}")),
+            Some(CommandOrigin {
+                from_chat_id: from_chat.to_string(),
+                hops,
+            }),
+        )
+    }
+
+    /// Test seam: pretend `chat_id`'s live turn originated from an agent send
+    /// chain `hops` deep (what `execute` records for real turns).
+    #[cfg(test)]
+    pub(crate) fn set_turn_origin_for_test(&self, chat_id: &str, hops: u32) {
+        lock(&self.inner.turn_origins).insert(chat_id.to_string(), hops);
     }
 
     /// POST `{edge}/device/{host}/nudge {chatId}` when the chat's workspace row names
@@ -2041,6 +2229,43 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        // Attribution: pre-write the user entry with the command's issuing
+        // user (write_user_message is idempotent by id, so the dispatch/steer
+        // path's own write becomes a no-op). Keeps the sessions dispatch
+        // plumbing author-free.
+        if entry.user_id.is_some() {
+            let prewrite = match &entry.payload {
+                SessionCommandPayload::Run {
+                    request,
+                    message_id,
+                } => Some((message_id.as_str(), request.prompt.as_str())),
+                SessionCommandPayload::Steer {
+                    prompt,
+                    message_id: Some(message_id),
+                } => Some((message_id.as_str(), prompt.as_str())),
+                _ => None,
+            };
+            if let Some((message_id, prompt)) = prewrite {
+                handle.write_user_message(
+                    message_id,
+                    prompt,
+                    now_ms(),
+                    entry.user_id.as_deref(),
+                )?;
+            }
+        }
+        // The live turn's agent-send depth: what send_to_session increments.
+        // A new turn also resets the chat's per-turn send budget.
+        if matches!(
+            entry.payload,
+            SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+        ) {
+            lock(&self.inner.turn_origins).insert(
+                chat_id.clone(),
+                entry.origin.as_ref().map(|o| o.hops).unwrap_or(0),
+            );
+            lock(&self.inner.send_budgets).remove(chat_id);
+        }
         match &entry.payload {
             SessionCommandPayload::Run {
                 request,
@@ -2221,6 +2446,7 @@ impl DocHost {
                 .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
             auto_approve: false,
             attachments: Vec::new(),
+            mcp_servers: Vec::new(),
             resume: None,
         })
     }
@@ -2364,5 +2590,87 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 host.evict_over_budget();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_send_tests {
+    use super::*;
+    use zeron_proto::HarnessId;
+
+    fn host() -> (tempfile::TempDir, DocHost) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        (dir, host)
+    }
+
+    fn queued_commands(host: &DocHost, chat: &str) -> Vec<SessionCommandEntry> {
+        host.open(chat).unwrap().doc.read_commands().unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_lands_a_steer_with_agent_attribution_and_hops() {
+        let (_dir, host) = host();
+        host.send_to_session("chat-a", "chat-b", "hello from a")
+            .unwrap();
+        let commands = queued_commands(&host, "chat-b");
+        assert_eq!(commands.len(), 1);
+        let entry = &commands[0];
+        assert_eq!(entry.user_id.as_deref(), Some("agent:chat-a"));
+        let origin = entry.origin.as_ref().expect("origin");
+        assert_eq!(origin.from_chat_id, "chat-a");
+        assert_eq!(origin.hops, 1);
+        assert!(matches!(
+            entry.payload,
+            SessionCommandPayload::Steer { ref prompt, .. } if prompt == "hello from a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn self_send_and_empty_message_are_rejected() {
+        let (_dir, host) = host();
+        assert!(host.send_to_session("chat-a", "chat-a", "loop").is_err());
+        assert!(host.send_to_session("chat-a", "chat-b", "   ").is_err());
+        assert!(queued_commands(&host, "chat-b").is_empty());
+    }
+
+    #[tokio::test]
+    async fn hop_limit_breaks_ping_pong() {
+        let (_dir, host) = host();
+        host.set_turn_origin_for_test("chat-a", 3);
+        assert!(host.send_to_session("chat-a", "chat-b", "hop 4").is_ok());
+        host.set_turn_origin_for_test("chat-a", 4);
+        let err = host
+            .send_to_session("chat-a", "chat-c", "hop 5")
+            .unwrap_err();
+        assert!(err.to_string().contains("too deep"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn per_turn_send_budget_is_enforced_and_reset_on_new_turn() {
+        let (_dir, host) = host();
+        for i in 0..8 {
+            host.send_to_session("chat-a", "chat-b", &format!("m{i}"))
+                .unwrap();
+        }
+        let err = host
+            .send_to_session("chat-a", "chat-b", "one too many")
+            .unwrap_err();
+        assert!(err.to_string().contains("budget"), "{err}");
+        // A fresh turn (execute records the origin and clears the budget).
+        lock(&host.inner.send_budgets).remove("chat-a");
+        assert!(
+            host.send_to_session("chat-a", "chat-b", "next turn")
+                .is_ok()
+        );
     }
 }

@@ -33,6 +33,7 @@ fn entry(
         }],
         created_at: 1_700_000_000_000,
         device_id: "lost-device".into(),
+        user_id: None,
         status,
         continuation_of: None,
     }

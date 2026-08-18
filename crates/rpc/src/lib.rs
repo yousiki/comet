@@ -40,6 +40,12 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    /// Agent-to-agent send (the `zeron mcp-bridge` tool surface): queue a
+    /// Steer into ANOTHER chat's doc with `agent:{fromChatId}` attribution,
+    /// hop-limited and rate-limited. IPC-only; never relay-forwarded —
+    /// delivery to a remote host rides the command plane + nudge, not the
+    /// device relay.
+    pub const SEND_TO_SESSION: &str = "SendToSession";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint

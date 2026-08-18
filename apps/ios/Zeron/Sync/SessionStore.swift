@@ -144,7 +144,19 @@ final class SessionStore {
     /// the row.
     func updateRoomGen(_ gen: Int?) {
         let gen = gen ?? 1
-        if gen > roomGen { roomGen = gen }
+        if gen > roomGen {
+            roomGen = gen
+            // Room generation moved (e.g. chat2 → org-shared chat3): the old
+            // room goes permanently silent from the flip on — drop the client
+            // so the redial below lands on the new room. The doc lineage is
+            // unchanged (2→3 moves the room, not the doc), so the cursor
+            // resets naturally via the fresh hello.
+            if let chatRoom {
+                Task { await chatRoom.stop() }
+                self.chatRoom = nil
+                connected = false
+            }
+        }
         connectIfReady()
     }
 
@@ -226,11 +238,16 @@ final class SessionStore {
             },
             event: { [weak self] event in self?.handle(event) }
         )
+        // Snapshot the generation at dial time: a later flip drops this
+        // client (updateRoomGen) and redials with the new value.
+        let gen = roomGen
         let client = ChatRoomClient(
             chatId: chatId, device: config.deviceId,
-            urlProvider: { [config, chatId] in await config.chat2SocketURL(chatId: chatId) },
+            urlProvider: { [config, chatId] in
+                await config.chat2SocketURL(chatId: chatId, roomGen: gen)
+            },
             checkpointRequest: { [config, chatId] in
-                await config.chat2CheckpointRequest(chatId: chatId)
+                await config.chat2CheckpointRequest(chatId: chatId, roomGen: gen)
             },
             rowsRequest: { [config, chatId] after in
                 await config.chat2RowsRequest(chatId: chatId, after: after)

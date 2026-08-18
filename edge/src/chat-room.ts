@@ -1,8 +1,9 @@
 /**
- * ChatRoom — one Durable Object per chat session (`chat2/{chatId}`), the
- * dumb authenticated log relay replacing SessionRoom's loro-aware s2 rooms
- * (docs/chat2-sync.md workstream B). Modeled line-for-line on RegistryRoom,
- * NOT on SessionRoom: no loro-wasm import anywhere in this class.
+ * ChatRoom — one Durable Object per chat session (`chat2/{chatId}` legacy
+ * single-owner, `chat3/{orgId}/{chatId}` org-shared), the dumb authenticated
+ * log relay replacing SessionRoom's loro-aware s2 rooms (docs/chat2-sync.md
+ * workstream B). Modeled line-for-line on RegistryRoom, NOT on SessionRoom:
+ * no loro-wasm import anywhere in this class.
  *
  * The DO's entire job: append opaque update blobs to a seq-ordered log,
  * relay them to live sockets, store one client-built checkpoint blob, and
@@ -31,7 +32,8 @@ import {
   setMeta
 } from "./chat-log";
 import { decodeFrame, encodeFrame, FRAME } from "./chat-frames";
-import { AUTH_USER_HEADER, type Env } from "./env";
+import { authorizeChatRoom, type ChatOp } from "./chat-room-auth";
+import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** Inbound frame budget: one pushed row (+ header slack). */
@@ -95,14 +97,50 @@ export class ChatRoom implements DurableObject {
     if (!userId) return json({ error: "unauthenticated" }, 401);
 
     const sql = this.ctx.storage.sql;
-    const owner = getMeta(sql, "owner");
+    // Org-shared rooms (chat3, Worker-verified org membership rides the room
+    // name) use host-user discipline via authorizeChatRoom; legacy chat2
+    // rooms keep the s2 claim-on-first-join single-owner discipline. The
+    // header is Worker-controlled (deleted-then-set on every forward).
+    const orgChat = request.headers.get(ROOM_KIND_HEADER) === "org-chat";
+    const roleHost = url.searchParams.get("role") === "host";
+    /** Drain an unread body before answering a denial: responding with the
+     * request stream unconsumed makes workerd abort the connection ("Can't
+     * read from request stream after response has been sent"), which kills
+     * unrelated keep-alive requests riding the same socket. */
+    const deny = async (response: Response): Promise<Response> => {
+      try {
+        await request.arrayBuffer();
+      } catch {
+        /* stream already gone */
+      }
+      return response;
+    };
+    /** null = allowed (an org-chat host claim is persisted as a side effect). */
+    const gate = (op: ChatOp): Response | null => {
+      if (orgChat) {
+        const verdict = authorizeChatRoom(op, userId, getMeta(sql, "hostUser") ?? null, roleHost);
+        if (!verdict.allow) return json({ error: "forbidden" }, 403);
+        if (verdict.claimHost) setMeta(sql, "hostUser", userId);
+        return null;
+      }
+      const owner = getMeta(sql, "owner");
+      if (op === "join" || op === "checkpointPost") {
+        // Claim-on-first-join ownership, then owner-only forever (the s2
+        // discipline: chat ids are client-minted, the first authed user to
+        // dial one owns it). A host may checkpoint before any ws join.
+        if (!owner) setMeta(sql, "owner", userId);
+        else if (owner !== userId) return json({ error: "forbidden" }, 403);
+        return null;
+      }
+      // Everything else reads a claimed room.
+      if (!owner) return json({ error: "not_found" }, 404);
+      if (owner !== userId) return json({ error: "forbidden" }, 403);
+      return null;
+    };
 
     if (url.pathname === "/ws") {
-      // Claim-on-first-join ownership, then owner-only forever (the s2
-      // discipline: chat ids are client-minted, the first authed user to
-      // dial one owns it).
-      if (!owner) setMeta(sql, "owner", userId);
-      else if (owner !== userId) return json({ error: "forbidden" }, 403);
+      const denied = gate("join");
+      if (denied) return deny(denied);
       const device = url.searchParams.get("device") ?? "";
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
@@ -112,8 +150,8 @@ export class ChatRoom implements DurableObject {
     }
 
     if (url.pathname === "/checkpoint" && request.method === "POST") {
-      if (!owner) setMeta(sql, "owner", userId);
-      else if (owner !== userId) return json({ error: "forbidden" }, 403);
+      const denied = gate("checkpointPost");
+      if (denied) return deny(denied);
       const seqCovered = Number(url.searchParams.get("seqCovered") ?? "");
       if (!Number.isInteger(seqCovered) || seqCovered < 0) {
         return json({ error: "bad_seq_covered" }, 400);
@@ -136,11 +174,9 @@ export class ChatRoom implements DurableObject {
       return json({ ok: true, seqFloor: outcome.seqFloor, pruned: outcome.pruned });
     }
 
-    // Everything below reads a claimed room.
-    if (!owner) return json({ error: "not_found" }, 404);
-    if (owner !== userId) return json({ error: "forbidden" }, 403);
-
     if (url.pathname === "/checkpoint" && request.method === "GET") {
+      const denied = gate("checkpointGet");
+      if (denied) return deny(denied);
       const bytes = this.blobs.get(CHECKPOINT_BLOB);
       if (!bytes) return json({ error: "not_found" }, 404);
       // Range-resumable (bytes=N- only): a 1MB load over a 1.2Mbps link that
@@ -255,6 +291,8 @@ export class ChatRoom implements DurableObject {
     }
 
     if ((url.pathname === "/tail" || url.pathname === "/diff") && request.method === "PUT") {
+      const denied = gate("sidecarPut");
+      if (denied) return deny(denied);
       const name = url.pathname === "/tail" ? "sidecar-tail" : "sidecar-diff";
       const body = new Uint8Array(await request.arrayBuffer());
       if (body.byteLength > MAX_SIDECAR_BYTES) return json({ error: "too_large" }, 413);
@@ -264,6 +302,8 @@ export class ChatRoom implements DurableObject {
     }
 
     if ((url.pathname === "/tail" || url.pathname === "/diff") && request.method === "GET") {
+      const denied = gate("sidecarGet");
+      if (denied) return deny(denied);
       const name = url.pathname === "/tail" ? "sidecar-tail" : "sidecar-diff";
       const bytes = this.blobs.get(name);
       if (!bytes) return json({ error: "not_found" }, 404);
@@ -276,6 +316,8 @@ export class ChatRoom implements DurableObject {
     }
 
     if (url.pathname === "/stats" && request.method === "GET") {
+      const denied = gate("stats");
+      if (denied) return deny(denied);
       this.sweepPresence();
       return json({
         ...logStats(sql),
@@ -292,6 +334,8 @@ export class ChatRoom implements DurableObject {
     }
 
     if (url.pathname === "/reset" && request.method === "POST") {
+      const denied = gate("reset");
+      if (denied) return deny(denied);
       // Operator wipe. Recovery is host-driven: the host detects
       // `headSeq < cursor` on its next hello and re-seeds via checkpoint —
       // same shape as the registry reset recipe.
@@ -358,9 +402,12 @@ export class ChatRoom implements DurableObject {
   }
 
   private handleHello(ws: WebSocket, state: SocketState, header: Record<string, unknown>): void {
-    if (typeof header.device === "string" && header.device.length > 0) {
-      state.device = header.device;
-    }
+    // The URL `device` param (Worker-validated against ID_RE) is the ONLY
+    // device source. The hello header's copy is ignored: honoring it let a
+    // client assume another device's identity, which in a shared room would
+    // poison quotas, pushOutcomes, and — worst — excludeOwn backfills
+    // (another user's rows silently omitted while the doc looks converged).
+    void header;
     state.ready = true;
     ws.serializeAttachment(state);
     const sql = this.ctx.storage.sql;
@@ -409,19 +456,19 @@ export class ChatRoom implements DurableObject {
     // rejected batches from their replay queues (an unretireable batch
     // replays on every reconnect forever — the wedge class this replaces).
     if (!state.ready || batchId === "" || batchId.length > 128) {
-      this.recordPush(state.device, false);
+      this.recordPush(attributionKey(state), false);
       send(ws, FRAME.error, { code: "bad_push", message: "hello first / malformed push", batchId });
       return;
     }
-    if (!this.admitQuota(state.device, payload.byteLength)) {
-      this.recordPush(state.device, false);
+    if (!this.admitQuota(attributionKey(state), payload.byteLength)) {
+      this.recordPush(attributionKey(state), false);
       send(ws, FRAME.error, { code: "quota", message: "per-device push quota exceeded", batchId });
       return;
     }
     const sql = this.ctx.storage.sql;
     const outcome = appendRow(sql, state.device, batchId, payload, Date.now());
     if (!outcome.ok) {
-      this.recordPush(state.device, false);
+      this.recordPush(attributionKey(state), false);
       send(ws, FRAME.error, {
         code: outcome.error,
         message: `push rejected: ${outcome.error}`,
@@ -429,7 +476,7 @@ export class ChatRoom implements DurableObject {
       });
       return;
     }
-    this.recordPush(state.device, true);
+    this.recordPush(attributionKey(state), true);
     if (!outcome.dup) {
       this.markBackupDirty();
       // Live relay to every OTHER ready socket — the sender has its own
@@ -463,11 +510,13 @@ export class ChatRoom implements DurableObject {
     this.sweepPresence();
     // Broadcast-only relay of the opaque payload — no EphemeralStore, no
     // storage; a device that joins later simply waits for the next beat.
+    // `user` is additive (old clients ignore unknown header keys): shared
+    // rooms need to know WHO is present, not just which device.
     for (const socket of this.ctx.getWebSockets()) {
       if (socket === ws) continue;
       const socketState = socket.deserializeAttachment() as SocketState | null;
       if (!socketState?.ready) continue;
-      send(socket, FRAME.presence, { device: state.device, at }, payload);
+      send(socket, FRAME.presence, { device: state.device, at, user: state.userId }, payload);
     }
   }
 
@@ -478,10 +527,9 @@ export class ChatRoom implements DurableObject {
     }
   }
 
-  /** Rolling per-device quota. True = admitted. */
-  private admitQuota(device: string, bytes: number): boolean {
+  /** Rolling per-(user, device) quota. True = admitted. */
+  private admitQuota(key: string, bytes: number): boolean {
     const now = Date.now();
-    const key = device === "" ? "(unknown)" : device;
     let window = this.quotas.get(key);
     if (!window || now - window.since > QUOTA_WINDOW_MS) {
       window = { since: now, pushes: 0, bytes: 0 };
@@ -492,9 +540,8 @@ export class ChatRoom implements DurableObject {
     return window.pushes <= QUOTA_MAX_PUSHES && window.bytes <= QUOTA_MAX_BYTES;
   }
 
-  private recordPush(device: string, ok: boolean): void {
+  private recordPush(key: string, ok: boolean): void {
     const sql = this.ctx.storage.sql;
-    const key = device === "" ? "(unknown)" : device;
     const outcomes = JSON.parse(getMeta(sql, "pushOutcomes") ?? "{}") as Record<
       string,
       PushOutcome
@@ -547,6 +594,11 @@ export class ChatRoom implements DurableObject {
     setMeta(sql, "backupDirty", "0");
   }
 }
+
+/** Quota/outcome attribution: `(user, device)` — two users on the same
+ * device string (or a blank one) must never share a window or a ledger row. */
+const attributionKey = (state: SocketState): string =>
+  `${state.userId}:${state.device === "" ? "(unknown)" : state.device}`;
 
 const send = (
   ws: WebSocket,

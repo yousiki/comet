@@ -118,6 +118,9 @@ async fn main() {
         .unwrap_or_else(|| "27802".into())
         .parse()
         .expect("B port");
+    // Optional: assert the user entry's authorship (org-shared sessions —
+    // e2e-shared-org.sh passes the sending engine's user id).
+    let expect_user: Option<String> = args.next();
 
     let a = connect_ws(&format!("ws://127.0.0.1:{a_port}"))
         .await
@@ -240,7 +243,7 @@ async fn main() {
     // list on attach, then `upsert`/`append` deltas. Materialize every frame
     // through the shared parser so candidates persist across incremental frames.
     let mut transcript = Vec::new();
-    let (by_device, text) = wait_stream(
+    let (by_device, text, user_author) = wait_stream(
         &b,
         methods::WATCH_DOC_MESSAGES,
         serde_json::json!({ "chatId": chat_id }),
@@ -255,10 +258,24 @@ async fn main() {
             let device = entry.device_id.clone();
             let text = serde_json::to_string(entry)
                 .unwrap_or_else(|err| fail(&format!("serialize assistant transcript: {err}")));
-            Some((device, text))
+            let user_author = transcript
+                .iter()
+                .find(|e| e.role == zeron_doc::MessageRole::User)
+                .and_then(|e| e.user_id.clone());
+            Some((device, text, user_author))
         },
     )
     .await;
+    if let Some(expected) = &expect_user {
+        match &user_author {
+            Some(author) if author == expected => {
+                pass(&format!("user entry attributed to {expected}"));
+            }
+            other => fail(&format!(
+                "user entry authorship: expected Some({expected}), got {other:?}"
+            )),
+        }
+    }
     if by_device != a_dev {
         fail(&format!(
             "assistant entry written by {by_device}, expected host {a_dev}"

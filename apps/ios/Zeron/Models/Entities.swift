@@ -59,8 +59,11 @@ struct Chat: Identifiable, Hashable {
     var spaceId: String?
     var lastSeenAt: Int64?
     /// Sync room generation (docs/chat2-sync.md M2): absent/1 = legacy s2
-    /// (never dialed from mobile), 2 = chat2. The host flips it when seeding.
+    /// (never dialed from mobile), 2 = chat2, 3 = org-shared chat3. The host
+    /// flips it when seeding/migrating.
     var roomGen: Int? = nil
+    /// Creating user (org-shared registries; absent on pre-attribution rows).
+    var userId: String? = nil
 
     var displayTitle: String {
         if let title, !title.isEmpty { return title }

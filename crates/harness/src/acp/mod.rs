@@ -1665,7 +1665,21 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
+        // Engine-provided MCP servers (the zeron agent bridge): ACP shape
+        // `[{name, command, args, env: [{name, value}]}]`.
+        let mcp_servers: Vec<Value> = request
+            .mcp_servers
+            .iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "command": s.command,
+                    "args": s.args,
+                    "env": s.env.iter().map(|(name, value)| json!({ "name": name, "value": value })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let session_params = json!({ "cwd": request.cwd, "mcpServers": mcp_servers });
         let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
