@@ -3,8 +3,13 @@
  *
  *  - POST /auth/exchange     — WorkOS code → tokens (see `workos.ts`).
  *  - POST /auth/refresh      — WorkOS refresh → fresh tokens (org-scopable).
- *  - GET  /auth/orgs         — the caller's active org memberships.
+ *  - GET  /auth/orgs         — the caller's active org memberships (with roles).
  *  - POST /auth/orgs         — create an org + first (admin) membership.
+ *  - GET  /auth/orgs/:id/members            — team roster (members).
+ *  - POST /auth/orgs/:id/members            — invite/add by email (admin).
+ *  - POST /auth/orgs/:id/members/:mid       — set role admin|member (admin).
+ *  - DELETE /auth/orgs/:id/members/:mid     — remove member (admin).
+ *  - DELETE /auth/orgs/:id                  — delete the workspace (admin).
  *  - GET  /auth/cli/callback — headless sign-in: shows a paste-able code.
  *
  * Exchange/refresh/callback run BEFORE the bearer gate (the caller has no
@@ -15,7 +20,19 @@
  */
 import { bearerFromRequest, verifyToken } from "./auth";
 import type { Env } from "./env";
-import { WorkOsAuthFailed, createOrg, exchange, listOrgs, refresh } from "./workos";
+import {
+  WorkOsAuthFailed,
+  addMemberByEmail,
+  createOrg,
+  deleteOrg,
+  exchange,
+  listMembers,
+  listOrgs,
+  membershipOf,
+  refresh,
+  removeMember,
+  setMemberRole
+} from "./workos";
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
@@ -102,6 +119,108 @@ export const handleAuthRoute = async (
       }
       try {
         return json(await createOrg(apiKey, caller.userId, trimmed));
+      } catch (e) {
+        return authFailed(e);
+      }
+    }
+  }
+
+  // ── org member management: /auth/orgs/:orgId/members[...] ────────────────
+  // Reads are member-open; writes (invite, role change, remove, delete-org)
+  // are admin-only. The admin gate re-checks the caller's LIVE membership via
+  // the API key — the JWT's org claim only proves membership at issue time.
+  if (parts[1] === "orgs" && parts.length >= 3) {
+    if (!apiKey) return notConfigured();
+    const token = bearerFromRequest(request);
+    const caller = token ? await verifyToken(env, token) : undefined;
+    if (!caller) return json({ error: "invalid or missing bearer token" }, 401);
+    const orgId = parts[2];
+    let membership;
+    try {
+      membership = await membershipOf(apiKey, orgId, caller.userId);
+    } catch (e) {
+      return authFailed(e);
+    }
+    if (!membership) return json({ error: "not a member of this workspace" }, 403);
+    const isAdmin = membership.role === "admin";
+
+    // GET /auth/orgs/:orgId/members — the team roster.
+    if (parts[3] === "members" && parts.length === 4 && request.method === "GET") {
+      try {
+        return json({ members: await listMembers(apiKey, orgId) });
+      } catch (e) {
+        return authFailed(e);
+      }
+    }
+
+    // POST /auth/orgs/:orgId/members {email, role?} — invite/add (admin).
+    if (parts[3] === "members" && parts.length === 4 && request.method === "POST") {
+      if (!isAdmin) return json({ error: "only workspace admins can invite members" }, 403);
+      const body = await bodyJson<{ email?: string; role?: string }>(request);
+      const email = body?.email?.trim() ?? "";
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return json({ error: "invalid email" }, 400);
+      }
+      const role = body?.role === "admin" ? "admin" : "member";
+      try {
+        return json(await addMemberByEmail(apiKey, orgId, email, role));
+      } catch (e) {
+        return authFailed(e);
+      }
+    }
+
+    // POST /auth/orgs/:orgId/members/:membershipId {role} — role change (admin).
+    // DELETE /auth/orgs/:orgId/members/:membershipId — remove (admin).
+    if (parts[3] === "members" && parts.length === 5) {
+      if (!isAdmin) return json({ error: "only workspace admins can manage members" }, 403);
+      const membershipId = parts[4];
+      // Last-admin protection: demoting or removing the only admin would
+      // orphan the workspace (nobody could manage or delete it again).
+      const guardLastAdmin = async (): Promise<Response | undefined> => {
+        const members = await listMembers(apiKey, orgId);
+        const target = members.find((m) => m.membershipId === membershipId);
+        if (!target) return json({ error: "no such member" }, 404);
+        const admins = members.filter((m) => m.role === "admin");
+        if (target.role === "admin" && admins.length <= 1) {
+          return json({ error: "cannot remove or demote the last admin" }, 409);
+        }
+        return undefined;
+      };
+      if (request.method === "POST") {
+        const body = await bodyJson<{ role?: string }>(request);
+        const role = body?.role === "admin" ? "admin" : body?.role === "member" ? "member" : null;
+        if (!role) return json({ error: "role must be admin or member" }, 400);
+        try {
+          if (role === "member") {
+            const guard = await guardLastAdmin();
+            if (guard) return guard;
+          }
+          await setMemberRole(apiKey, membershipId, role);
+          return json({ ok: true });
+        } catch (e) {
+          return authFailed(e);
+        }
+      }
+      if (request.method === "DELETE") {
+        try {
+          const guard = await guardLastAdmin();
+          if (guard) return guard;
+          await removeMember(apiKey, membershipId);
+          return json({ ok: true });
+        } catch (e) {
+          return authFailed(e);
+        }
+      }
+    }
+
+    // DELETE /auth/orgs/:orgId — delete the workspace (admin). The registry
+    // and chat DOs are left to hibernate (same shape as every room-name
+    // generation bump); members simply lose the org claim on next refresh.
+    if (parts.length === 3 && request.method === "DELETE") {
+      if (!isAdmin) return json({ error: "only workspace admins can delete a workspace" }, 403);
+      try {
+        await deleteOrg(apiKey, orgId);
+        return json({ ok: true });
       } catch (e) {
         return authFailed(e);
       }

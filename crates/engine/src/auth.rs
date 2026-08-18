@@ -56,6 +56,26 @@ pub struct OrgMembership {
     pub id: String,
     pub organization_id: String,
     pub name: String,
+    /// The caller's role in this org ("admin" | "member"). Additive: absent
+    /// from pre-role edges defaults to member.
+    #[serde(default = "default_role")]
+    pub role: String,
+}
+
+fn default_role() -> String {
+    "member".into()
+}
+
+/// One member of an organization (the Team settings roster).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgMember {
+    pub membership_id: String,
+    pub user_id: String,
+    pub email: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub role: String,
 }
 
 /// AuthStatus stream payload (`SignedOut | NeedsOrganization{user} |
@@ -516,6 +536,128 @@ impl Auth {
             )
             .await?;
         self.select_org(&created.organization_id).await
+    }
+
+    /// First-sign-in default workspace: a user with ZERO memberships gets a
+    /// personal org minted automatically ("{name}'s Space") and is scoped to
+    /// it — the org gate then never appears for the solo path. Idempotent:
+    /// any existing membership short-circuits. Errors are soft (the gate UI
+    /// remains the fallback).
+    pub async fn ensure_default_org(&self) -> Result<(), EngineError> {
+        if self.inner.workos.is_none() {
+            return Ok(());
+        }
+        if !matches!(self.state(), AuthState::NeedsOrganization { .. }) {
+            return Ok(());
+        }
+        if !self.list_orgs().await?.is_empty() {
+            return Ok(());
+        }
+        let name = match self.state() {
+            AuthState::NeedsOrganization { user } => user
+                .name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .map(|n| format!("{n}'s Space"))
+                .unwrap_or_else(|| {
+                    let stem = user.email.split('@').next().unwrap_or("My");
+                    format!("{stem}'s Space")
+                }),
+            _ => return Ok(()),
+        };
+        tracing::info!(org = %name, "first sign-in: creating default personal workspace");
+        self.create_org(&name).await
+    }
+
+    /// The current org's team roster.
+    pub async fn list_members(&self, org_id: &str) -> Result<Vec<OrgMember>, EngineError> {
+        #[derive(Deserialize)]
+        struct Members {
+            #[serde(default)]
+            members: Vec<OrgMember>,
+        }
+        let body: Members = self
+            .authed_json(
+                reqwest::Method::GET,
+                &format!("/auth/orgs/{org_id}/members"),
+                None,
+            )
+            .await?;
+        Ok(body.members)
+    }
+
+    /// Invite/add a member by email (admin only, enforced edge-side).
+    /// Returns `(added, invited)`: an already-registered user is added
+    /// immediately; an unknown email gets a WorkOS invitation.
+    pub async fn invite_member(
+        &self,
+        org_id: &str,
+        email: &str,
+        role: &str,
+    ) -> Result<(bool, bool), EngineError> {
+        #[derive(Deserialize)]
+        struct Outcome {
+            #[serde(default)]
+            added: bool,
+            #[serde(default)]
+            invited: bool,
+        }
+        let body: Outcome = self
+            .authed_json(
+                reqwest::Method::POST,
+                &format!("/auth/orgs/{org_id}/members"),
+                Some(serde_json::json!({ "email": email, "role": role })),
+            )
+            .await?;
+        Ok((body.added, body.invited))
+    }
+
+    /// Set a member's role ("admin" | "member"); admin only, edge-enforced,
+    /// last-admin protected.
+    pub async fn set_member_role(
+        &self,
+        org_id: &str,
+        membership_id: &str,
+        role: &str,
+    ) -> Result<(), EngineError> {
+        let _: serde_json::Value = self
+            .authed_json(
+                reqwest::Method::POST,
+                &format!("/auth/orgs/{org_id}/members/{membership_id}"),
+                Some(serde_json::json!({ "role": role })),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Remove a member (admin only, edge-enforced, last-admin protected).
+    pub async fn remove_member(
+        &self,
+        org_id: &str,
+        membership_id: &str,
+    ) -> Result<(), EngineError> {
+        let _: serde_json::Value = self
+            .authed_json(
+                reqwest::Method::DELETE,
+                &format!("/auth/orgs/{org_id}/members/{membership_id}"),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Delete the org (admin only, edge-enforced). The caller should switch
+    /// to another workspace (or the gate) afterwards — the next token refresh
+    /// drops the org claim.
+    pub async fn delete_org(&self, org_id: &str) -> Result<(), EngineError> {
+        let _: serde_json::Value = self
+            .authed_json(
+                reqwest::Method::DELETE,
+                &format!("/auth/orgs/{org_id}"),
+                None,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Scope the session to an org: one refresh with `organizationId`; the state follows

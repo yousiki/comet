@@ -86,6 +86,13 @@ pub mod methods {
     pub const LIST_ORGS: &str = "ListOrgs";
     pub const CREATE_ORG: &str = "CreateOrg";
     pub const SELECT_ORG: &str = "SelectOrg";
+    // Team management (feature: org-shared sessions). All IPC-only; the edge
+    // enforces admin-ness and last-admin protection — these are thin proxies.
+    pub const LIST_MEMBERS: &str = "ListMembers";
+    pub const INVITE_MEMBER: &str = "InviteMember";
+    pub const SET_MEMBER_ROLE: &str = "SetMemberRole";
+    pub const REMOVE_MEMBER: &str = "RemoveMember";
+    pub const DELETE_ORG: &str = "DeleteOrg";
     /// One-time local→synced profile import: what's importable (unary).
     pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
     /// One-time local→synced profile import: run it (stream of progress items).

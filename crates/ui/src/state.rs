@@ -312,6 +312,21 @@ impl EngineHandle {
                 None => {
                     let mut auth_state = auth.watch_state();
                     while !auth_state.borrow().is_signed_in() {
+                        // First sign-in with zero memberships: mint the
+                        // personal workspace so the org gate never appears on
+                        // the solo path (idempotent; the gate stays as the
+                        // fallback if this fails).
+                        let needs_org = matches!(
+                            &*auth_state.borrow(),
+                            zeron_engine::AuthState::NeedsOrganization { .. }
+                        );
+                        if needs_org && let Err(err) = auth.ensure_default_org().await {
+                            tracing::warn!(error = %err,
+                                "default workspace creation failed; org gate remains");
+                        }
+                        if auth_state.borrow().is_signed_in() {
+                            break;
+                        }
                         if auth_state.changed().await.is_err() {
                             state_tx.send_replace(DeferredEngineState::Failed(
                                 "authentication state closed before workspace onboarding".into(),
@@ -520,12 +535,19 @@ pub use zeron_proto::view::{
 // ---------------------------------------------------------------------------
 
 /// One org membership row (tolerant local mirror of the engine's ListOrgs
-/// reply — `{orgs: [{id, organizationId, name}]}`).
+/// reply — `{orgs: [{id, organizationId, name, role}]}`).
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrgRow {
     pub organization_id: String,
     pub name: String,
+    /// The caller's role in this org; absent on pre-role engines.
+    #[serde(default = "default_member_role")]
+    pub role: String,
+}
+
+fn default_member_role() -> String {
+    "member".into()
 }
 
 /// Parse a ListOrgs reply tolerantly (accepts a bare array too).
