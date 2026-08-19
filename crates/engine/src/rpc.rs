@@ -140,6 +140,19 @@ struct DeleteWorktreeParams {
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
+    /// Include dotfiles (file-explorer tree). The folder picker omits it.
+    #[serde(default)]
+    show_hidden: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadWorkspaceFileParams {
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    space_id: Option<String>,
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -861,6 +874,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_FOLDERS
             | methods::LIST_DRIVES
             | methods::SEARCH_FILES
+            | methods::READ_WORKSPACE_FILE
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             // Checkout diffs are produced on the device holding the checkout.
@@ -1695,10 +1709,29 @@ impl RpcService for EngineRpc {
                 let p: ListFoldersParams = parse_params(params)?;
                 let listing = self
                     .repos
-                    .list_folders(p.path)
+                    .list_folders(p.path, p.show_hidden)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
+            }
+            methods::READ_WORKSPACE_FILE => {
+                let p: ReadWorkspaceFileParams = parse_params(params)?;
+                // Same root resolution + ownership checks as SearchFiles; the
+                // repos layer then jails the read to that checkout.
+                let root = self
+                    .file_search_root(&FileSearchParams {
+                        query: String::new(),
+                        chat_id: p.chat_id,
+                        space_id: p.space_id,
+                        path: None,
+                    })
+                    .await?;
+                let file = self
+                    .repos
+                    .read_workspace_file(root, std::path::PathBuf::from(p.path))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&file)
             }
             methods::LIST_DRIVES => {
                 let drives = self

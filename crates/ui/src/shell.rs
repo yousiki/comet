@@ -30,6 +30,7 @@ use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{
     Composer, ComposerEvent, ComposerInput, ComposerInputEvent, ComposerUnsentRisk,
 };
+use crate::file_explorer::FileExplorer;
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -259,6 +260,9 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
+    /// The file-explorer (tree + read-only viewer) — keys
+    /// [`Shell::file_explorers`].
+    Files(u64),
 }
 
 /// Per-chat panel open flags (zeron parity: `sessionPanels` — the terminal and
@@ -1366,6 +1370,9 @@ pub struct Shell {
     /// [`Transcript`] pinned to its subagent doc.
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
     subagent_seq: u64,
+    /// File-explorer surfaces by id (tree + read-only viewer).
+    file_explorers: std::collections::HashMap<u64, Entity<FileExplorer>>,
+    file_explorer_seq: u64,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -1686,6 +1693,8 @@ impl Shell {
             diff_seq: 0,
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
+            file_explorers: std::collections::HashMap::new(),
+            file_explorer_seq: 0,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
@@ -1813,6 +1822,8 @@ impl Shell {
         self.diff_seq = 0;
         self.subagent_tabs.clear();
         self.subagent_seq = 0;
+        self.file_explorers.clear();
+        self.file_explorer_seq = 0;
         self.right_tabs.clear();
         self.right_tab_drag = None;
         self.right_tab_scroll = gpui::ScrollHandle::new();
@@ -2326,6 +2337,10 @@ impl Shell {
                     .subagent_tabs
                     .get(id)
                     .map(|tab| (*surface, tab.title.clone())),
+                RightSurface::Files(id) => self
+                    .file_explorers
+                    .get(id)
+                    .map(|explorer| (*surface, explorer.read(cx).tab_title())),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -2400,12 +2415,45 @@ impl Shell {
                     changes.update(cx, |changes, cx| changes.ensure_content(cx));
                 }
             }
+            RightSurface::Files(id) => {
+                if let Some(explorer) = self.file_explorers.get(&id).cloned() {
+                    explorer.update(cx, |explorer, cx| explorer.ensure_content(cx));
+                }
+            }
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
             RightSurface::Subagent(_) => {}
             RightSurface::Picker => {}
         }
         cx.notify();
+    }
+
+    /// The picker's Files card / the `+` menu's Files row. One explorer per
+    /// chat is plenty — re-clicking focuses the existing tab.
+    fn add_files_surface(&mut self, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        let existing = self
+            .right_tabs
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .find_map(|surface| match surface {
+                RightSurface::Files(id) if self.file_explorers.contains_key(id) => Some(*id),
+                _ => None,
+            });
+        if let Some(id) = existing {
+            self.set_right_active(RightSurface::Files(id), cx);
+            return;
+        }
+        let explorer = cx.new(|cx| FileExplorer::new(self.state.clone(), cx));
+        self.file_explorer_seq += 1;
+        let id = self.file_explorer_seq;
+        self.file_explorers.insert(id, explorer);
+        self.right_tabs
+            .entry(key)
+            .or_default()
+            .push(RightSurface::Files(id));
+        self.set_right_active(RightSurface::Files(id), cx);
     }
 
     /// The picker's Git card / the `+` menu's Diff row: every click opens a
@@ -2615,6 +2663,10 @@ impl Shell {
                     self.state
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
+            }
+            RightSurface::Files(id) => {
+                // Dropping the entity cancels its in-flight loads.
+                self.file_explorers.remove(&id);
             }
             RightSurface::Picker => {}
         }
@@ -7469,6 +7521,28 @@ impl Shell {
                         .children(pill)
                         .into_any_element()
                 }
+                RightSurface::Files(id) if self.file_explorers.contains_key(&id) => {
+                    let explorer = self.file_explorers.get(&id).cloned().expect("checked");
+                    // Idempotent — also re-roots after a chat switch.
+                    explorer.update(cx, |explorer, cx| explorer.ensure_content(cx));
+                    let controls =
+                        explorer.update(cx, |explorer, cx| explorer.render_header_controls(cx));
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex_none()
+                                .h(px(36.0))
+                                .px(px(8.0))
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .child(controls),
+                        )
+                        .child(div().flex_1().min_h_0().child(explorer))
+                        .into_any_element()
+                }
                 _ => self.render_surface_picker(cx),
             }
         } else {
@@ -7619,7 +7693,12 @@ impl Shell {
                                         }),
                                     ),
                                 )
-                            }),
+                            })
+                            .child(row("surface-card-files", icons::FOLDER, "Files").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.add_files_surface(cx);
+                                }),
+                            )),
                     ),
             )
             .into_any_element()
@@ -7793,6 +7872,7 @@ impl Shell {
             let icon_path = match surface {
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
                 RightSurface::Subagent(_) => icons::BOT,
+                RightSurface::Files(_) => icons::FOLDER,
                 _ => icons::TERMINAL,
             };
             // A live subagent tab swaps its icon for the mini working
@@ -8043,6 +8123,20 @@ impl Shell {
                                 // history and per-commit views too (user
                                 // request; matches the picker card).
                                 .child(SharedString::from("Git")),
+                        )
+                        .child(
+                            popover::menu_row(&theme, false, "right-plus-files")
+                                .id("right-plus-files-row")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_files_surface(cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(
+                                    icon(icons::FOLDER)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Files")),
                         ),
                 )
                 .into_any_element();
@@ -9721,6 +9815,10 @@ mod tests {
             shell.terminal = Some(cx.new(|cx| TerminalPanel::new(state.clone(), cx)));
             shell.right_terminal =
                 Some(cx.new(|cx| TerminalPanel::new_embedded(state.clone(), cx)));
+            shell.file_explorer_seq = 3;
+            shell
+                .file_explorers
+                .insert(3, cx.new(|cx| FileExplorer::new(state.clone(), cx)));
 
             shell.devices_page = Some(cx.new(|cx| DevicesPage::new(state.clone(), cx)));
             shell.team_page = Some(cx.new(|cx| TeamPage::new(state.clone(), cx)));
@@ -9786,6 +9884,8 @@ mod tests {
             assert!(shell.right_tabs.is_empty());
             assert!(shell.terminal.is_none());
             assert!(shell.right_terminal.is_none());
+            assert!(shell.file_explorers.is_empty());
+            assert_eq!(shell.file_explorer_seq, 0);
             assert!(shell.devices_page.is_none());
             assert!(shell.team_page.is_none());
             assert!(shell.archived_page.is_none());

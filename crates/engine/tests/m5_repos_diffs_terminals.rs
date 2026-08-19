@@ -368,7 +368,7 @@ async fn folder_lister_flags_and_ordering() {
     let data = tempfile::tempdir().expect("data dir");
     let repos = test_repos(data.path());
     let listing = repos
-        .list_folders(Some(tmp.path().to_string_lossy().to_string()))
+        .list_folders(Some(tmp.path().to_string_lossy().to_string()), false)
         .await
         .expect("listing");
     assert!(!listing.truncated);
@@ -404,7 +404,7 @@ async fn folder_lister_caps_at_500_with_truncated_flag() {
     let data = tempfile::tempdir().expect("data dir");
     let repos = test_repos(data.path());
     let listing = repos
-        .list_folders(Some(tmp.path().to_string_lossy().to_string()))
+        .list_folders(Some(tmp.path().to_string_lossy().to_string()), false)
         .await
         .expect("listing");
     assert_eq!(listing.entries.len(), 500);
@@ -418,6 +418,7 @@ async fn folder_lister_timeout_path() {
     let err = repos
         .list_folders_with(
             Some(tmp.path().to_string_lossy().to_string()),
+            false,
             Duration::from_millis(50),
             true, // worker never responds
         )
@@ -427,6 +428,109 @@ async fn folder_lister_timeout_path() {
         err.to_string().contains("timed out"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn folder_lister_show_hidden_keeps_dotfiles_but_never_git() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join(".git")).expect("git dir");
+    std::fs::create_dir_all(tmp.path().join(".github")).expect("hidden dir");
+    std::fs::write(tmp.path().join(".gitignore"), "target\n").expect("dotfile");
+    std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").expect("file");
+
+    let data = tempfile::tempdir().expect("data dir");
+    let repos = test_repos(data.path());
+    let listing = repos
+        .list_folders(Some(tmp.path().to_string_lossy().to_string()), true)
+        .await
+        .expect("listing");
+    let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec![".github", ".gitignore", "main.rs"]);
+}
+
+// ---------------------------------------------------------------------------
+// Workspace file read (file-explorer viewer)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn workspace_file_read_text_binary_truncated_and_jail() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("checkout");
+    std::fs::create_dir_all(root.join("src")).expect("dirs");
+    std::fs::write(root.join("src/lib.rs"), "pub fn x() {}\n").expect("text file");
+    std::fs::write(root.join("blob.bin"), b"ab\0cd").expect("binary file");
+    std::fs::write(tmp.path().join("outside.txt"), "secret").expect("outside file");
+
+    let data = tempfile::tempdir().expect("data dir");
+    let repos = test_repos(data.path());
+
+    // Plain text comes back verbatim with its size.
+    let text = repos
+        .read_workspace_file(root.clone(), root.join("src/lib.rs"))
+        .await
+        .expect("text read");
+    assert_eq!(text.text.as_deref(), Some("pub fn x() {}\n"));
+    assert!(!text.binary && !text.truncated);
+    assert_eq!(text.size, 14);
+
+    // Relative paths resolve against the root.
+    let rel = repos
+        .read_workspace_file(root.clone(), std::path::PathBuf::from("src/lib.rs"))
+        .await
+        .expect("relative read");
+    assert_eq!(rel.text.as_deref(), Some("pub fn x() {}\n"));
+
+    // NUL byte → binary, contents withheld.
+    let bin = repos
+        .read_workspace_file(root.clone(), root.join("blob.bin"))
+        .await
+        .expect("binary read");
+    assert!(bin.binary && bin.text.is_none());
+
+    // `..` escape and absolute paths outside the root are both rejected.
+    for escape in [root.join("../outside.txt"), tmp.path().join("outside.txt")] {
+        let err = repos
+            .read_workspace_file(root.clone(), escape)
+            .await
+            .expect_err("escapes the workspace");
+        assert!(
+            err.to_string().contains("escapes the workspace"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // Directories are not regular files.
+    let err = repos
+        .read_workspace_file(root.clone(), root.join("src"))
+        .await
+        .expect_err("directory rejected");
+    assert!(
+        err.to_string().contains("not a regular workspace file"),
+        "unexpected error: {err}"
+    );
+
+    // Symlinks are rejected even when their target lives inside the root.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("src/lib.rs"), root.join("link.rs")).expect("symlink");
+        let err = repos
+            .read_workspace_file(root.clone(), root.join("link.rs"))
+            .await
+            .expect_err("symlink rejected");
+        assert!(
+            err.to_string().contains("not a regular workspace file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // Over the 2 MiB cap → truncated, contents withheld (never partial).
+    std::fs::write(root.join("big.txt"), vec![b'a'; 2 * 1024 * 1024 + 1]).expect("big file");
+    let big = repos
+        .read_workspace_file(root.clone(), root.join("big.txt"))
+        .await
+        .expect("big read");
+    assert!(big.truncated && big.text.is_none() && !big.binary);
+    assert_eq!(big.size, 2 * 1024 * 1024 + 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,6 +1256,28 @@ async fn rpc_dispatch_for_m5_methods() {
             .await
             .is_err(),
         "chat cwd must stay inside its workspace checkout"
+    );
+
+    // ReadWorkspaceFile shares SearchFiles' root resolution, then reads the
+    // jailed file (the file-explorer viewer's path).
+    let read = client
+        .call(
+            methods::READ_WORKSPACE_FILE,
+            serde_json::json!({ "chatId": "search-chat", "path": "file.txt" }),
+        )
+        .await
+        .expect("ReadWorkspaceFile by chat");
+    assert_eq!(read["text"], "hello\n");
+    assert_eq!(read["binary"], false);
+    assert!(
+        client
+            .call(
+                methods::READ_WORKSPACE_FILE,
+                serde_json::json!({ "chatId": "search-chat", "path": "../outside/x" }),
+            )
+            .await
+            .is_err(),
+        "reads must stay inside the checkout"
     );
 
     // ListBranches: default (checked-out) branch first.
