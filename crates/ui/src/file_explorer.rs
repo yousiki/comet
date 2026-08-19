@@ -227,13 +227,21 @@ impl FileExplorer {
 
     fn toggle_dir(&mut self, path: String, cx: &mut Context<Self>) {
         if self.expanded.contains(&path) {
-            self.expanded.remove(&path);
+            // Collapse forgets the whole subtree — cached listings, in-flight
+            // loads, and nested expansion alike. Re-expanding re-fetches one
+            // fresh level, so cached content can never go stale behind a
+            // collapsed chevron and the cache stays bounded to the root plus
+            // currently expanded directories (exactly the set the header
+            // refresh re-requests).
+            let subtree_prefix = format!("{path}/");
+            let in_subtree = |dir: &str| dir == path || dir.starts_with(&subtree_prefix);
+            self.expanded.retain(|dir| !in_subtree(dir));
+            self.listings.retain(|dir, _| !in_subtree(dir));
+            self.load_tasks.retain(|dir, _| !in_subtree(dir));
         } else {
             self.expanded.insert(path.clone());
-            if !self.listings.contains_key(&path) {
-                self.request_listing(path, cx);
-                return; // request_listing already rebuilt.
-            }
+            self.request_listing(path, cx);
+            return; // request_listing already rebuilt.
         }
         self.rebuild_rows();
         cx.notify();

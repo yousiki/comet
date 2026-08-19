@@ -997,11 +997,19 @@ fn list_folders_blocking(target: &Path, show_hidden: bool) -> Result<FolderListi
     })
 }
 
-/// The blocking jailed read (mirrors `diff_sync::read_worktree_source`):
-/// reject symlinks/non-regular files via `symlink_metadata`, canonicalize BOTH
-/// sides so `..` segments and symlinked parents can't escape, then cap.
-/// NUL bytes or invalid UTF-8 → `binary` with no text.
+/// The blocking jailed read. Check-then-read is racy (a concurrent writer —
+/// e.g. a hostile agent in the checkout — could swap a validated path for a
+/// symlink between the check and the read), so the file is OPENED first
+/// (`O_NOFOLLOW` on unix) and every check runs against the held handle:
+/// regular-file via the handle's metadata, containment by re-canonicalizing
+/// the name AND requiring it to be the very inode we hold — any mid-flight
+/// swap fails one of the two. The read itself is capped at the byte limit
+/// through the handle, never trusting a pre-read size. Windows keeps the
+/// weaker name-based check (no `O_NOFOLLOW`; symlink creation is privileged
+/// there). NUL bytes or invalid UTF-8 → `binary` with no text.
 fn read_workspace_file_blocking(root: &Path, path: &Path) -> Result<WorkspaceFileText, EngineError> {
+    use std::io::Read as _;
+
     let canonical_root = std::fs::canonicalize(root)
         .map_err(|e| EngineError::Other(format!("canonical workspace root: {e}")))?;
     let full = if path.is_absolute() {
@@ -1009,9 +1017,29 @@ fn read_workspace_file_blocking(root: &Path, path: &Path) -> Result<WorkspaceFil
     } else {
         root.join(path)
     };
-    let metadata = std::fs::symlink_metadata(&full)
+    // Cheap pre-check for a better error (and the only symlink guard on
+    // non-unix targets).
+    let pre = std::fs::symlink_metadata(&full)
         .map_err(|e| EngineError::Other(format!("read file metadata: {e}")))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if pre.file_type().is_symlink() || !pre.is_file() {
+        return Err(EngineError::Other(
+            "path is not a regular workspace file".into(),
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&full)
+        .map_err(|e| EngineError::Other(format!("open workspace file: {e}")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| EngineError::Other(format!("read file metadata: {e}")))?;
+    if !metadata.is_file() {
         return Err(EngineError::Other(
             "path is not a regular workspace file".into(),
         ));
@@ -1021,8 +1049,23 @@ fn read_workspace_file_blocking(root: &Path, path: &Path) -> Result<WorkspaceFil
     if !canonical.starts_with(&canonical_root) {
         return Err(EngineError::Other("file escapes the workspace".into()));
     }
-    let size = metadata.len();
-    if size > WORKSPACE_FILE_MAX_BYTES {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let named = std::fs::metadata(&canonical)
+            .map_err(|e| EngineError::Other(format!("stat workspace file: {e}")))?;
+        if named.dev() != metadata.dev() || named.ino() != metadata.ino() {
+            return Err(EngineError::Other("file escapes the workspace".into()));
+        }
+    }
+    // Capped read from the handle: one byte past the limit proves oversize
+    // even if the file grew after the fstat above.
+    let mut bytes = Vec::new();
+    file.take(WORKSPACE_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| EngineError::Other(format!("read workspace file: {e}")))?;
+    let size = metadata.len().max(bytes.len() as u64);
+    if bytes.len() as u64 > WORKSPACE_FILE_MAX_BYTES {
         return Ok(WorkspaceFileText {
             text: None,
             binary: false,
@@ -1030,8 +1073,6 @@ fn read_workspace_file_blocking(root: &Path, path: &Path) -> Result<WorkspaceFil
             size,
         });
     }
-    let bytes = std::fs::read(&canonical)
-        .map_err(|e| EngineError::Other(format!("read workspace file: {e}")))?;
     let text = if bytes.contains(&0) {
         None
     } else {
