@@ -136,6 +136,67 @@ impl Harness for ScriptedHarness {
     }
 }
 
+/// Harness used to prove shutdown fan-out ordering. Each run records its
+/// interrupt but keeps the stream open behind a shared barrier, so a serial
+/// shutdown cannot reach the second run until the first one's grace deadline.
+struct ShutdownBarrierHarness {
+    runs_started: Arc<std::sync::atomic::AtomicUsize>,
+    interrupts_seen: Arc<std::sync::atomic::AtomicUsize>,
+    release: tokio_util::sync::CancellationToken,
+}
+
+#[async_trait]
+impl Harness for ShutdownBarrierHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Shutdown barrier"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        if request.prompt.starts_with("blocked run ") {
+            self.runs_started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let interrupts_seen = self.interrupts_seen.clone();
+        let release = self.release.clone();
+        let interrupt = controls.interrupt;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            interrupt.cancelled().await;
+            interrupts_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            release.cancelled().await;
+            drop(tx);
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
 fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
     registry.register(harness);
@@ -373,6 +434,67 @@ async fn session_status_transitions_idle_working_idle() {
         }
     }
     assert_eq!(seen, vec![SessionStatus::Working, SessionStatus::Idle]);
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_all_live_chats_before_waiting_for_settlement() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let interrupts_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = tokio_util::sync::CancellationToken::new();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ShutdownBarrierHarness {
+            runs_started: runs_started.clone(),
+            interrupts_seen: interrupts_seen.clone(),
+            release: release.clone(),
+        }),
+    );
+    let chats = ["chat-shutdown-a", "chat-shutdown-b"];
+    for (index, chat_id) in chats.iter().enumerate() {
+        core.sessions
+            .dispatch(
+                chat_id,
+                HarnessId::Mock,
+                run_request(&format!("blocked run {index}")),
+                Some(format!("message-shutdown-{index}")),
+            )
+            .await
+            .expect("dispatch blocked run");
+    }
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runs_started.load(std::sync::atomic::Ordering::SeqCst) != chats.len() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both harness streams started");
+
+    let sessions = core.sessions.clone();
+    let shutdown = tokio::spawn(async move { sessions.shutdown().await });
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while interrupts_seen.load(std::sync::atomic::Ordering::SeqCst) != chats.len() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("shutdown must interrupt every chat before awaiting any one settlement");
+
+    release.cancel();
+    tokio::time::timeout(Duration::from_secs(1), shutdown)
+        .await
+        .expect("shutdown settles after harness streams are released")
+        .expect("shutdown task joins");
+    for chat_id in chats {
+        assert_eq!(
+            core.sessions
+                .session_status(chat_id)
+                .map(|session| session.status),
+            Some(SessionStatus::Idle)
+        );
+    }
+    core.shutdown().await;
 }
 
 #[tokio::test]

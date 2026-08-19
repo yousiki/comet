@@ -127,7 +127,7 @@ async fn transcript_survives_open_racing_create_chat() {
         // the open itself must land on chat2.
         let handle = core.doc_host.open(CHAT).expect("open before createChat");
         watch_holder = handle.watch_messages();
-        let live_writer_ref = handle.doc_arc();
+        let live_writer_ref = handle.writer_doc().unwrap();
 
         // The mint lands a beat later, exactly as the composer sends it.
         let client = zeron_rpc::memory_client(core.rpc_service());

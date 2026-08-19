@@ -5,13 +5,64 @@
 //! claim-anything behavior (local-only chats must still run).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use zeron_engine::{WorkspaceHost, WorkspaceHostConfig};
+use zeron_doc::SessionCommandPayload;
+use zeron_engine::{EngineCore, HarnessRegistry, WorkspaceHost, WorkspaceHostConfig};
+use zeron_harness::{Harness, HarnessError, RunControls};
+use zeron_proto::{
+    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel, SteeringMode,
+};
 use zeron_sync::DocsStore;
+
+struct CountingHarness {
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Harness for CountingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Counting"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        if request.prompt == "run after registry readiness" {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(futures::stream::empty().boxed())
+    }
+}
 
 fn open_host(dir: &std::path::Path, edge: Option<zeron_engine::EdgeConfig>) -> WorkspaceHost {
     let store = Arc::new(DocsStore::open(dir).expect("store opens"));
@@ -240,6 +291,70 @@ async fn edged_host_opens_claim_gate_only_after_remote_pull() {
     let foreign = host.chat("foreign-chat").unwrap().unwrap();
     assert_eq!(foreign.device_id, "dev-b");
     assert!(!host.is_host("foreign-chat"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn first_registry_sync_redrains_commands_parked_by_claim_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut edge = GatedRegistryEdge::start().await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(CountingHarness { runs: runs.clone() }));
+    let config = zeron_engine::EdgeConfig::with_static_token(&edge.url, "alice");
+    let core = EngineCore::assemble_with_identity(
+        dir.path(),
+        Arc::new(registry),
+        HarnessId::Mock,
+        Some(config),
+        "org-test",
+        "alice",
+    )
+    .expect("engine assembles");
+
+    core.doc_host
+        .queue_command(
+            "pending-before-sync",
+            SessionCommandPayload::Run {
+                request: RunRequest {
+                    prompt: "run after registry readiness".into(),
+                    harness: Some(HarnessId::Mock),
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    cwd: "/tmp".into(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    auto_approve: true,
+                    attachments: Vec::new(),
+                    mcp_servers: Vec::new(),
+                    resume: None,
+                },
+                message_id: "m-before-sync".into(),
+            },
+        )
+        .expect("command queues locally");
+
+    edge.wait_for_fetch().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "fail-closed ownership must park the command before remote state lands"
+    );
+
+    edge.release_fetch();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runs.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first registry sync did not re-drain the parked command");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the readiness retry must not double-dispatch"
+    );
+    core.shutdown().await;
 }
 
 #[tokio::test]

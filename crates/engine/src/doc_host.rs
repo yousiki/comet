@@ -17,7 +17,7 @@
 //! the host's relay receives it and warm-opens the doc, which drains the queue.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use tokio::sync::watch;
@@ -212,6 +212,11 @@ struct DocHostInner {
     /// Tracks every spawned worker so `shutdown_workers` can await them.
     tasks: TaskTracker,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
+    /// Process-lifetime terminal deletion fences. Chat ids are UUIDs and are
+    /// never reused: once DeleteChat/DeleteSpace reaches this host, every
+    /// detached recovery/cutover task must fail closed even if its old handle
+    /// has already left `handles` and therefore cannot be marked directly.
+    purge_fences: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Local room updates waiting for a client, keyed outside the handle so
     /// they survive chat2 -> chat3 handle replacement. This is the in-memory
     /// handoff queue, not a second CRDT authority; bytes stay until installed
@@ -224,6 +229,14 @@ struct DocHostInner {
     /// on every registry change, and a long run would stack a tick loop per
     /// change without this.
     seed_waiting: Mutex<HashSet<String>>,
+    /// Generation cutovers deferred behind a live writer/pending command.
+    /// Registry publishes (including presence-only publishes) must not stack
+    /// one waiter per chat while the same run is still active.
+    cutover_waiting: Mutex<HashSet<String>>,
+    /// Deterministic store-failure seam for frozen-generation recovery tests.
+    /// Production builds call the real store directly with no extra state.
+    #[cfg(test)]
+    injected_cutover_store_failures: AtomicUsize,
     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
     /// discipline — diff_sync's untimed client hung on dead links).
     http: reqwest::Client,
@@ -237,6 +250,13 @@ struct DocHostInner {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutoverDisposition {
+    Removed,
+    Deferred,
+    Superseded,
 }
 
 #[derive(Clone)]
@@ -268,23 +288,153 @@ pub struct ChatDocHandle {
     room_gen: u32,
     /// A threshold checkpoint POST is in flight (review H1: the quiesce
     /// tick must not stack concurrent full-snapshot uploads).
-    checkpointing: Arc<AtomicBool>,
+    checkpoint_state: Arc<Mutex<CheckpointState>>,
+    /// Highest lifetime `ChatStatsSnapshot::rejected` count covered by a
+    /// successful full checkpoint. The stats counter is telemetry and never
+    /// resets; only counts above this watermark are outstanding compensation.
+    checkpointed_rejections: AtomicU64,
     /// Set when a chat2 seed replaced this handle's lineage on disk: every
     /// further snapshot save from this handle is a stale FAT doc that would
     /// clobber the thin one — retired handles never persist again (unless no
     /// thin lineage exists on disk at all; `save_snapshot` double-checks, so
     /// a doc that was never seeded can't lose its only copy).
     retired: AtomicBool,
+    /// Terminal local deletion fence. Unlike a migration freeze, purge must
+    /// never write a recovery snapshot: doing so would resurrect the chat
+    /// after its row and local bytes were deliberately deleted.
+    purged: Arc<AtomicBool>,
+    /// A room-generation seed has detached this handle from its source room
+    /// and is sealing the final checkpoint. `open()` must not hand the old doc
+    /// to a new writer while the replacement checkpoint is in flight.
+    generation_frozen: Arc<AtomicBool>,
+    /// Serializes every EngineChatSink import/persist and local-update enqueue
+    /// with cutover sealing. Lock order is command_drain -> handles -> this
+    /// lifecycle gate -> snapshot_save -> chat2 -> host pending.
+    sink_lifecycle: Arc<Mutex<()>>,
+    /// Invalidates sinks owned by a detached ChatClient. A recovered handle
+    /// may unfreeze and attach a new client without re-enabling late HTTP work
+    /// from the predecessor.
+    sink_generation: Arc<AtomicU64>,
+    /// At least one local update lacks a durable room acknowledgement. A
+    /// snapshot flush then persists cursor=0 so restart replays the full CRDT
+    /// log even if the in-memory pending queue dies with this runtime.
+    replay_from_zero: Arc<AtomicBool>,
+    /// Closes the local-callback vs replay-clear race. Lock order is
+    /// sink_lifecycle (when present) -> replay_fence -> chat2 -> host pending.
+    /// A callback marks replay dirty before waiting for the chat slot; a clear
+    /// cannot overwrite that mark until the update is observably queued.
+    replay_fence: Arc<Mutex<()>>,
+    /// Root-diff/local-update handoff tracking. Loro publishes the root diff
+    /// before the encoded local-update callback; clear must not bless a
+    /// snapshot while a visible local commit is still between those hooks.
+    local_callbacks_pending: Arc<AtomicUsize>,
+    local_mutation_epoch: Arc<AtomicU64>,
+    local_update_tracking: Arc<AtomicBool>,
+    /// Serializes ordinary debounced saves with the migration's recovery and
+    /// target-epoch saves. Without this, a save that exported before the seal
+    /// could land after it and overwrite the final snapshot bytes.
+    snapshot_save: Mutex<()>,
     /// chat2 relay client (docs/chat2-sync.md C3) — populated once the
     /// registry names roomGen 2 for this chat and the join resolves.
     chat2: Mutex<Option<zeron_sync::ChatClient>>,
     /// Local-update feed into the chat2 client (drop = unsubscribe).
     chat2_local_sub: Mutex<Option<loro::Subscription>>,
+    /// One executor pass per doc. Registry-readiness and doc-change kicks can
+    /// race; without serialization both passes can read the same pending entry
+    /// before either writes the processed ledger and dispatch it twice.
+    command_drain: tokio::sync::Mutex<()>,
+    /// Fires before local changes become visible, closing the export-before-
+    /// local-update callback window used by replay durability.
+    _pre_commit_sub: loro::Subscription,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
 }
 
+struct LocalUpdateCallbackGuard {
+    pending: Arc<AtomicUsize>,
+    counted: bool,
+}
+
+impl Drop for LocalUpdateCallbackGuard {
+    fn drop(&mut self) {
+        if self.counted {
+            let _ = self
+                .pending
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    pending.checked_sub(1)
+                });
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CheckpointState {
+    running: bool,
+    requested: bool,
+    reason: &'static str,
+}
+
+impl Default for CheckpointState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            requested: false,
+            reason: "unspecified",
+        }
+    }
+}
+
+/// Synchronous cancellation guard for a frozen room-generation seed. Tokio
+/// cancellation drops the seed future at an arbitrary `.await`; once the
+/// source client has been detached, dropping without a recovery save would
+/// strand its last local tail outside both room generations. The guard is
+/// declared after `command_drain`, so its `Drop` runs while the drain fence is
+/// still held and can durably retire/reopen the source handle.
+struct FrozenSeedRecovery {
+    host: DocHost,
+    chat_id: String,
+    handle: Arc<ChatDocHandle>,
+    armed: bool,
+}
+
+impl FrozenSeedRecovery {
+    fn new(host: &DocHost, chat_id: &str, handle: &Arc<ChatDocHandle>) -> Self {
+        Self {
+            host: host.clone(),
+            chat_id: chat_id.to_string(),
+            handle: handle.clone(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FrozenSeedRecovery {
+    fn drop(&mut self) {
+        if self.armed {
+            self.host
+                .recover_frozen_generation_seed(&self.chat_id, &self.handle);
+        }
+    }
+}
+
 impl ChatDocHandle {
+    fn ensure_mutable(&self) -> Result<(), DocError> {
+        if self.generation_frozen.load(Ordering::Acquire)
+            || self.retired.load(Ordering::Acquire)
+            || self.purged.load(Ordering::Acquire)
+        {
+            return Err(DocError::Schema(format!(
+                "chat {} is frozen for room-generation cutover",
+                self.chat_id
+            )));
+        }
+        Ok(())
+    }
+
     pub fn chat_id(&self) -> &str {
         &self.chat_id
     }
@@ -293,8 +443,13 @@ impl ChatDocHandle {
         &self.doc
     }
 
-    pub fn doc_arc(&self) -> Arc<SessionDoc> {
-        self.doc.clone()
+    /// Acquire a writer lease while serialized with generation freeze. The
+    /// extra doc Arc is itself the cutover's live-writer signal, so it must be
+    /// minted before a run publishes any durable message/status side effect.
+    pub fn writer_doc(&self) -> Result<Arc<SessionDoc>, DocError> {
+        let _lifecycle = lock(&self.sink_lifecycle);
+        self.ensure_mutable()?;
+        Ok(self.doc.clone())
     }
 
     /// Joined transcript watch — re-sent on every doc change (WatchDocMessages).
@@ -340,6 +495,8 @@ impl ChatDocHandle {
         created_at: i64,
         author: Option<&str>,
     ) -> Result<(), DocError> {
+        let _lifecycle = lock(&self.sink_lifecycle);
+        self.ensure_mutable()?;
         if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
             return Ok(());
         }
@@ -364,6 +521,8 @@ impl ChatDocHandle {
     /// way). Returns the stamped entries' `(id, created_at)` — recovery uses
     /// them for the resume-freshness check.
     pub fn mark_abandoned_streams(&self, note: &str) -> Result<Vec<(String, i64)>, DocError> {
+        let _lifecycle = lock(&self.sink_lifecycle);
+        self.ensure_mutable()?;
         let mut stamped = Vec::new();
         for entry in self.doc.read_entries()? {
             if entry.role == MessageRole::Assistant
@@ -432,9 +591,13 @@ impl DocHost {
                 shutdown: CancellationToken::new(),
                 tasks: TaskTracker::new(),
                 handles: Mutex::new(HashMap::new()),
+                purge_fences: Mutex::new(HashMap::new()),
                 chat2_pending_local: Mutex::new(HashMap::new()),
                 seeding: Mutex::new(HashSet::new()),
                 seed_waiting: Mutex::new(HashSet::new()),
+                cutover_waiting: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                injected_cutover_store_failures: AtomicUsize::new(0),
                 http: reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
@@ -445,39 +608,331 @@ impl DocHost {
         }
     }
 
-    fn buffer_chat2_update(inner: &DocHostInner, chat_id: &str, bytes: Vec<u8>) {
-        lock(&inner.chat2_pending_local)
+    fn purge_fence(inner: &DocHostInner, chat_id: &str) -> Arc<AtomicBool> {
+        lock(&inner.purge_fences)
             .entry(chat_id.to_string())
-            .or_default()
-            .push(bytes);
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    fn chat_was_purged(inner: &DocHostInner, chat_id: &str) -> bool {
+        lock(&inner.purge_fences)
+            .get(chat_id)
+            .is_some_and(|fence| fence.load(Ordering::Acquire))
+    }
+
+    fn buffer_chat2_update(inner: &DocHostInner, chat_id: &str, bytes: Vec<u8>) {
+        let fence = Self::purge_fence(inner, chat_id);
+        if fence.load(Ordering::Acquire) {
+            return;
+        }
+        {
+            lock(&inner.chat2_pending_local)
+                .entry(chat_id.to_string())
+                .or_default()
+                .push(bytes);
+        }
+        // Purge may have cleared the queue between our first check and push.
+        // Its own removal wins when it happens second; this removal wins when
+        // our append happens second.
+        if fence.load(Ordering::Acquire) {
+            lock(&inner.chat2_pending_local).remove(chat_id);
+        }
     }
 
     fn prepend_chat2_update(inner: &DocHostInner, chat_id: &str, bytes: Vec<u8>) {
-        lock(&inner.chat2_pending_local)
-            .entry(chat_id.to_string())
-            .or_default()
-            .insert(0, bytes);
+        let fence = Self::purge_fence(inner, chat_id);
+        if fence.load(Ordering::Acquire) {
+            return;
+        }
+        {
+            lock(&inner.chat2_pending_local)
+                .entry(chat_id.to_string())
+                .or_default()
+                .insert(0, bytes);
+        }
+        if fence.load(Ordering::Acquire) {
+            lock(&inner.chat2_pending_local).remove(chat_id);
+        }
+    }
+
+    /// Install the local-update feed for one thin-room handle. Recovery uses
+    /// the same callback as first construction so an I/O failure cannot leave
+    /// a mapped, writable doc without a path into its room replay queue.
+    fn install_chat2_local_subscription(&self, handle: &Arc<ChatDocHandle>) {
+        if lock(&handle.chat2_local_sub).is_some() {
+            return;
+        }
+        let weak_push = Arc::downgrade(handle);
+        let weak_host = Arc::downgrade(&self.inner);
+        let pending_chat = handle.chat_id.clone();
+        let callback_pending = handle.local_callbacks_pending.clone();
+        let sub = handle
+            .doc
+            .doc()
+            .subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
+                let _callback = LocalUpdateCallbackGuard {
+                    counted: callback_pending.load(Ordering::Acquire) > 0,
+                    pending: callback_pending.clone(),
+                };
+                if let Some(handle) = weak_push.upgrade() {
+                    let _replay = lock(&handle.replay_fence);
+                    if handle.generation_frozen.load(Ordering::Acquire)
+                        || handle.retired.load(Ordering::Acquire)
+                        || handle.purged.load(Ordering::Acquire)
+                    {
+                        return true;
+                    }
+                    // Mark before waiting for the chat slot. Snapshot save may
+                    // own that slot while exporting this just-committed change;
+                    // it must observe cursor-zero durability even though the
+                    // enqueue is not visible yet.
+                    handle.replay_from_zero.store(true, Ordering::Release);
+                    let client_guard = lock(&handle.chat2);
+                    if handle.generation_frozen.load(Ordering::Acquire)
+                        || handle.retired.load(Ordering::Acquire)
+                        || handle.purged.load(Ordering::Acquire)
+                    {
+                        return true;
+                    }
+                    match &*client_guard {
+                        Some(client) => {
+                            if let Err(bytes) = client.try_enqueue_update(bytes.clone())
+                                && let Some(inner) = weak_host.upgrade()
+                            {
+                                DocHost::buffer_chat2_update(&inner, &pending_chat, bytes);
+                            }
+                        }
+                        None => {
+                            if let Some(inner) = weak_host.upgrade() {
+                                DocHost::buffer_chat2_update(&inner, &pending_chat, bytes.clone());
+                            }
+                        }
+                    }
+                }
+                true
+            }));
+        let mut slot = lock(&handle.chat2_local_sub);
+        if slot.is_none() {
+            *slot = Some(sub);
+            handle.local_update_tracking.store(true, Ordering::Release);
+        }
     }
 
     /// Install a room client and atomically hand it every update buffered for
     /// this chat, including updates carried across an older generation's
     /// handle. The local-update callback takes the same client lock before
     /// choosing client vs host-level queue, closing the install/enqueue gap.
+    #[cfg(test)]
     fn install_chat2_client(
         &self,
         handle: &ChatDocHandle,
         client: zeron_sync::ChatClient,
     ) -> usize {
-        let mut client_slot = lock(&handle.chat2);
-        let pending = lock(&self.inner.chat2_pending_local)
-            .remove(&handle.chat_id)
-            .unwrap_or_default();
-        let count = pending.len();
-        for update in pending {
-            client.enqueue_update(update);
+        let generation = handle.sink_generation.load(Ordering::Acquire);
+        self.install_chat2_client_for_generation(handle, client, generation)
+    }
+
+    fn install_chat2_client_for_generation(
+        &self,
+        handle: &ChatDocHandle,
+        client: zeron_sync::ChatClient,
+        client_generation: u64,
+    ) -> usize {
+        let mut count = 0usize;
+        loop {
+            if handle.purged.load(Ordering::Acquire)
+                || Self::chat_was_purged(&self.inner, &handle.chat_id)
+            {
+                lock(&self.inner.chat2_pending_local).remove(&handle.chat_id);
+                return 0;
+            }
+            // Enqueue only while we own the client and hold no lifecycle or
+            // client-slot lock. The sync actor may hold its shared-state mutex
+            // while entering the sink; calling enqueue under the lifecycle
+            // gate would invert that order and deadlock.
+            let pending = lock(&self.inner.chat2_pending_local)
+                .remove(&handle.chat_id)
+                .unwrap_or_default();
+            count += pending.len();
+            for update in pending {
+                client.enqueue_update(update);
+            }
+
+            let _lifecycle = lock(&handle.sink_lifecycle);
+            if handle.generation_frozen.load(Ordering::Acquire)
+                || handle.retired.load(Ordering::Acquire)
+                || handle.purged.load(Ordering::Acquire)
+                || handle.sink_generation.load(Ordering::Acquire) != client_generation
+            {
+                drop(_lifecycle);
+                self.carry_parked_updates(handle, Some(client));
+                return 0;
+            }
+            let mut client_slot = lock(&handle.chat2);
+            // A callback that observed the still-empty slot must append under
+            // this same slot lock. If such a suffix exists, release all gates,
+            // enqueue it while owning the client, and retry. An empty suffix
+            // lets us publish the client atomically with the decision.
+            let late = lock(&self.inner.chat2_pending_local)
+                .remove(&handle.chat_id)
+                .unwrap_or_default();
+            if late.is_empty() {
+                *client_slot = Some(client);
+                return count;
+            }
+            drop(client_slot);
+            drop(_lifecycle);
+            count += late.len();
+            for update in late {
+                client.enqueue_update(update);
+            }
         }
-        *client_slot = Some(client);
-        count
+    }
+
+    /// Retry updates that a local Loro callback could not enqueue without
+    /// blocking on the sync actor's shared-state lock. Taking temporary
+    /// ownership of the client lets the ordinary install handoff drain the
+    /// host buffer while holding no lifecycle gate during `enqueue_update`.
+    fn flush_buffered_chat2_updates(&self, handle: &ChatDocHandle) -> usize {
+        if handle.purged.load(Ordering::Acquire) {
+            lock(&self.inner.chat2_pending_local).remove(&handle.chat_id);
+            return 0;
+        }
+        let has_pending = lock(&self.inner.chat2_pending_local)
+            .get(&handle.chat_id)
+            .is_some_and(|pending| !pending.is_empty());
+        if !has_pending {
+            return 0;
+        }
+        let generation = handle.sink_generation.load(Ordering::Acquire);
+        let Some(client) = lock(&handle.chat2).take() else {
+            return 0;
+        };
+        self.install_chat2_client_for_generation(handle, client, generation)
+    }
+
+    /// Clear the conservative full-replay marker only after the client proves
+    /// every local batch is gone and the sink's matching non-zero cursor is
+    /// already durable in the same room epoch. Call with `sink_lifecycle`
+    /// held; all shared-state observations under the chat slot are try-only.
+    fn maybe_clear_replay_from_zero_locked(&self, handle: &ChatDocHandle) {
+        let _replay = lock(&handle.replay_fence);
+        if !handle.replay_from_zero.load(Ordering::Acquire)
+            || handle.generation_frozen.load(Ordering::Acquire)
+            || handle.retired.load(Ordering::Acquire)
+            || handle.purged.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if handle.local_callbacks_pending.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let mutation_epoch = handle.local_mutation_epoch.load(Ordering::Acquire);
+        let client_slot = lock(&handle.chat2);
+        let Some(stats) = client_slot
+            .as_ref()
+            .and_then(zeron_sync::ChatClient::try_stats)
+        else {
+            return;
+        };
+        if stats.pending_pushes != 0
+            || stats.rejected > handle.checkpointed_rejections.load(Ordering::Acquire)
+            || stats.cursor == 0
+        {
+            return;
+        }
+        if lock(&self.inner.chat2_pending_local)
+            .get(&handle.chat_id)
+            .is_some_and(|pending| !pending.is_empty())
+        {
+            return;
+        }
+        let Ok(durable_before) = self.inner.store.load_snapshot_with_cursor(&handle.chat_id) else {
+            return;
+        };
+        if durable_before
+            .as_ref()
+            .is_some_and(|(_, _, epoch)| *epoch > handle.room_gen)
+        {
+            return; // a newer room lineage owns this id
+        }
+        // Cursor-zero replay can be retired by either an own-row ack or a full
+        // checkpoint that covers every rejected batch. Only the former reaches
+        // EngineChatSink::advance_cursor and proves ownership of the target
+        // generation. Preserve the sink-owned epoch here; stamping room_gen
+        // after checkpoint-only coverage let the still-epoch-2 sink overwrite
+        // that row back to epoch 2 on its next remote apply.
+        let persist_epoch = durable_before
+            .as_ref()
+            .map(|(_, _, epoch)| *epoch)
+            .unwrap_or(crate::chat2_host::CHAT2_DOC_EPOCH)
+            .max(crate::chat2_host::CHAT2_DOC_EPOCH)
+            .min(handle.room_gen);
+        let Ok(snapshot) = handle.doc.export_snapshot() else {
+            return;
+        };
+        if self
+            .inner
+            .store
+            .save_snapshot_with_cursor(&handle.chat_id, &snapshot, stats.cursor, persist_epoch)
+            .is_err()
+        {
+            return;
+        }
+        handle
+            .snapshot_bytes
+            .store(snapshot.len(), Ordering::Relaxed);
+        if handle.purged.load(Ordering::Acquire) {
+            let _ = self.inner.store.delete_snapshot(&handle.chat_id);
+            return;
+        }
+        let mutation_arrived = || {
+            handle.local_callbacks_pending.load(Ordering::Acquire) != 0
+                || handle.local_mutation_epoch.load(Ordering::Acquire) != mutation_epoch
+        };
+        let persist_zero = || {
+            handle.replay_from_zero.store(true, Ordering::Release);
+            if let Ok(latest) = handle.doc.export_snapshot() {
+                let _ = self.inner.store.save_snapshot_with_cursor(
+                    &handle.chat_id,
+                    &latest,
+                    0,
+                    persist_epoch,
+                );
+                handle.snapshot_bytes.store(latest.len(), Ordering::Relaxed);
+                if handle.purged.load(Ordering::Acquire) {
+                    let _ = self.inner.store.delete_snapshot(&handle.chat_id);
+                }
+            }
+        };
+        if mutation_arrived() {
+            persist_zero();
+            return;
+        }
+        let durable_exact = self
+            .inner
+            .store
+            .load_snapshot_with_cursor(&handle.chat_id)
+            .ok()
+            .flatten()
+            .is_some_and(|(_, cursor, epoch)| cursor == stats.cursor && epoch == persist_epoch);
+        if !durable_exact {
+            return;
+        }
+        handle.replay_from_zero.store(false, Ordering::Release);
+        // Close the final store(false) race: pre-commit does not need the
+        // replay mutex, so it may publish a new epoch immediately around this
+        // instruction. If it did, restore cursor-zero durability before
+        // releasing the chat slot/lifecycle gate.
+        if mutation_arrived() {
+            persist_zero();
+        }
+    }
+
+    fn maybe_clear_replay_from_zero(&self, handle: &ChatDocHandle) {
+        let _lifecycle = lock(&handle.sink_lifecycle);
+        self.maybe_clear_replay_from_zero_locked(handle);
     }
 
     /// Park an access-denied room client without dropping local work. Pending
@@ -485,17 +940,48 @@ impl DocHost {
     /// chat2 -> chat3 replacement; later local updates see `None` under the
     /// same client lock and append to that queue too.
     fn park_chat2_client(&self, handle: &ChatDocHandle) -> usize {
-        let mut client_slot = lock(&handle.chat2);
-        let pending = client_slot
-            .take()
+        let client = {
+            let _lifecycle = lock(&handle.sink_lifecycle);
+            self.detach_chat2_client_locked(handle)
+        };
+        self.carry_parked_updates(handle, client)
+    }
+
+    /// Invalidate and detach a client while `sink_lifecycle` is held. Do not
+    /// drain its pending queue here: the sync actor invokes its sink while
+    /// holding its own shared-state mutex, so waiting for that mutex while we
+    /// hold the sink lifecycle would invert the order and deadlock. Advancing
+    /// the generation first makes every late sink call a no-op once the gate
+    /// is released.
+    fn detach_chat2_client_locked(&self, handle: &ChatDocHandle) -> Option<zeron_sync::ChatClient> {
+        // Invalidate the sink before aborting its actor. Detached HTTPS work
+        // may outlive the actor task; its generation check then fails under
+        // the lifecycle gate before any import or cursor persist.
+        handle.sink_generation.fetch_add(1, Ordering::AcqRel);
+        lock(&handle.chat2).take()
+    }
+
+    /// Drain a detached client's replay queue after releasing the lifecycle
+    /// gate. The local-update callback already sees an empty client slot, so
+    /// concurrent deltas append to the same host buffer without a handoff gap.
+    fn carry_parked_updates(
+        &self,
+        handle: &ChatDocHandle,
+        client: Option<zeron_sync::ChatClient>,
+    ) -> usize {
+        let pending = client
             .map(zeron_sync::ChatClient::into_pending_updates)
             .unwrap_or_default();
         let count = pending.len();
-        if !pending.is_empty() {
-            lock(&self.inner.chat2_pending_local)
-                .entry(handle.chat_id.clone())
-                .or_default()
-                .extend(pending);
+        if handle.purged.load(Ordering::Acquire)
+            || Self::chat_was_purged(&self.inner, &handle.chat_id)
+        {
+            lock(&self.inner.chat2_pending_local).remove(&handle.chat_id);
+        } else if !pending.is_empty() {
+            handle.replay_from_zero.store(true, Ordering::Release);
+            for update in pending {
+                Self::buffer_chat2_update(&self.inner, &handle.chat_id, update);
+            }
         }
         count
     }
@@ -563,6 +1049,13 @@ impl DocHost {
         self.inner.shutdown.cancel();
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
+        // No join task can reinstall after the tracker has drained. Park
+        // every client before the final snapshot so unacknowledged local
+        // batches become both host-buffered and cursor-zero durable.
+        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
+        for handle in &handles {
+            self.park_chat2_client(handle);
+        }
         // Snapshot open docs BEFORE releasing their handles: the handles map
         // holds the only strong doc refs, and an unflushed doc dies with it.
         self.flush_all();
@@ -571,6 +1064,7 @@ impl DocHost {
         drop(handles);
         lock(&self.inner.seeding).clear();
         lock(&self.inner.seed_waiting).clear();
+        lock(&self.inner.cutover_waiting).clear();
         lock(&self.inner.sessions).take();
     }
 
@@ -625,20 +1119,31 @@ impl DocHost {
                 });
                 let Some(chat) = candidate else { continue };
                 attempted.insert(chat.id.clone(), now);
-                // chat2 → chat3 needs NO rebuild: the doc lineage is already
-                // thin and unchanged, only the room moves. Flip the row; the
-                // cutover watcher retires the stale handle and the reopen
-                // dials chat3 with role=host, where the bootstrap-checkpoint
-                // heal seeds the fresh room from the same lineage. (Rebuilding
-                // would mint a NEW lineage and duplicate transcripts on every
-                // reader that already holds the chat2 one.)
+                // chat2 → chat3 keeps the same thin lineage, but the fresh
+                // room still needs a checkpoint BEFORE the registry advertises
+                // it. Open cold chats on chat2 so their latest rows land, then
+                // the quiet seeder checkpoints that exact lineage into chat3
+                // and flips the row last. A bare row flip left cold sessions
+                // permanently blank until somebody happened to open them on
+                // the owning device.
                 if chat.room_gen.unwrap_or(1) >= 2 {
-                    match ws.set_chat_room_gen(&chat.id, minted) {
-                        Ok(true) => tracing::info!(chat = %chat.id, gen = minted,
-                            "migration sweep: flipped chat2 room to org-shared chat3"),
-                        Ok(false) => {}
-                        Err(err) => tracing::warn!(chat = %chat.id, error = %err,
-                            "migration sweep: gen flip failed"),
+                    let cached = lock(&host.inner.handles).get(&chat.id).cloned();
+                    let handle = match cached {
+                        Some(handle) => Some(handle),
+                        None => match host.open(&chat.id) {
+                            Ok(handle) => Some(handle),
+                            Err(err) => {
+                                tracing::warn!(chat = %chat.id, error = %err,
+                                    "migration sweep: cold chat2 open failed");
+                                None
+                            }
+                        },
+                    };
+                    if let Some(handle) = handle
+                        && handle.room_gen < minted
+                        && !handle.retired.load(Ordering::Relaxed)
+                    {
+                        host.spawn_room_seed_when_quiet(edge, &chat.id, &handle);
                     }
                     continue;
                 }
@@ -650,7 +1155,7 @@ impl DocHost {
                     Some(handle) => {
                         if handle.room_gen < 2 && !handle.retired.load(Ordering::Relaxed) {
                             tracing::debug!(chat = %chat.id, "migration sweep: arming seed on warm s2 chat");
-                            host.spawn_chat2_seed_when_quiet(edge, &chat.id, &handle);
+                            host.spawn_room_seed_when_quiet(edge, &chat.id, &handle);
                         }
                     }
                     None => {
@@ -674,14 +1179,80 @@ impl DocHost {
     /// turn's doc ref) is left alone — the host never flips mid-run, and a
     /// racing writer must never lose its doc out from under it.
     fn spawn_cutover_watcher(&self, mut chats: watch::Receiver<Vec<zeron_proto::Chat>>) {
+        // Capture the receiver's baseline before the task is scheduled. A
+        // DeleteChat can otherwise publish between `set_workspace` and the
+        // watcher's first poll; Tokio watch retains only the latest value, so
+        // taking `previous_ids` inside the task would forget the deleted row
+        // and the first-cycle suppression would silently miss its tombstone.
+        let baseline = self
+            .workspace()
+            .and_then(|workspace| workspace.read_chats().ok())
+            .unwrap_or_else(|| chats.borrow().clone());
+        let mut previous_ids: HashSet<String> = baseline.into_iter().map(|chat| chat.id).collect();
         let host = self.clone();
         self.spawn_worker(async move {
+            let mut first = true;
+            let mut ownership_ready_seen = host.inner.config.edge.is_none();
             loop {
-                if chats.changed().await.is_err() {
+                if !first && chats.changed().await.is_err() {
                     return; // workspace host gone (shutdown)
                 }
-                let flipped: Vec<(String, u32)> = chats
-                    .borrow_and_update()
+                let initial = first;
+                first = false;
+
+                // The initial command drain deliberately fails closed while an
+                // org-shared registry has not synced. Registry readiness is a
+                // workspace event, not a doc mutation, so no chat task would
+                // otherwise revisit those durable pending commands. Re-drain
+                // every warm handle exactly once when that gate opens.
+                if !ownership_ready_seen
+                    && host.workspace().is_some_and(WorkspaceHost::ownership_ready)
+                {
+                    ownership_ready_seen = true;
+                    let handles: Vec<_> = lock(&host.inner.handles).values().cloned().collect();
+                    for handle in handles {
+                        let worker_host = host.clone();
+                        host.spawn_worker(async move {
+                            worker_host.drain_commands(&handle).await;
+                        });
+                    }
+                }
+
+                // The watch publisher is intentionally asynchronous. On the
+                // first cycle its cached value may predate local mutations
+                // that are already visible in RegistryDoc, so compare our
+                // synchronous baseline with the authoritative overlay. Later
+                // cycles are driven by the watch and use its published value.
+                let published = if initial {
+                    host.workspace()
+                        .and_then(|workspace| workspace.read_chats().ok())
+                        .unwrap_or_else(|| chats.borrow_and_update().clone())
+                } else {
+                    chats.borrow_and_update().clone()
+                };
+                let current_ids: HashSet<String> =
+                    published.iter().map(|chat| chat.id.clone()).collect();
+                let removed: Vec<String> = previous_ids.difference(&current_ids).cloned().collect();
+                for chat_id in removed {
+                    tracing::info!(chat = %chat_id,
+                        "registry row removed; purging local chat lifecycle");
+                    // Tombstone synchronously before asking the run to stop:
+                    // no late writer/sink/recovery may persist while the
+                    // asynchronous interrupt unwinds.
+                    host.purge_chat(&chat_id);
+                    if let Some(sessions) = lock(&host.inner.sessions).clone() {
+                        let chat = chat_id.clone();
+                        host.spawn_worker(async move {
+                            if let Err(err) = sessions.interrupt(&chat).await {
+                                tracing::debug!(chat = %chat, error = %err,
+                                    "remote chat deletion interrupt skipped");
+                            }
+                        });
+                    }
+                }
+                previous_ids = current_ids;
+
+                let flipped: Vec<(String, u32)> = published
                     .iter()
                     .filter(|c| c.room_gen.unwrap_or(1) >= 2)
                     .map(|c| (c.id.clone(), c.room_gen.unwrap_or(1)))
@@ -690,50 +1261,39 @@ impl DocHost {
                     continue;
                 }
                 let mut dropped: Vec<String> = Vec::new();
-                let mut stuck_live: Vec<(String, Arc<ChatDocHandle>)> = Vec::new();
-                {
-                    let mut handles = lock(&host.inner.handles);
-                    for (chat_id, row_gen) in flipped {
-                        let Some(handle) = handles.get(&chat_id) else {
-                            continue;
-                        };
-                        if handle.room_gen >= row_gen {
-                            continue; // already on (or past) the named room
-                        }
-                        let live_writer = Arc::strong_count(&handle.doc) > 1;
-                        if live_writer && handle.room_gen >= 2 {
-                            // chat2 → chat3 under a live run: same lineage,
-                            // no seed needed — leave the run writing (local
-                            // persistence is unaffected); the next open after
-                            // it quiesces dials the chat3 room.
-                            continue;
-                        }
-                        if live_writer {
-                            // A run is writing into this s2 doc while the
-                            // registry already says chat2 — the born-gen2
-                            // race (this open beat its own CreateChat mint,
-                            // 2026-08-11: transcript never reached any other
-                            // device). No thin lineage exists on disk yet,
-                            // so retiring here would suppress the doc's only
-                            // persistence and abort the quiet-seed. Leave it
-                            // live; seed once the run quiesces — the seed
-                            // posts the chat2 checkpoint, persists the thin
-                            // lineage, and retires the handle itself.
-                            stuck_live.push((chat_id, handle.clone()));
-                            continue;
-                        }
-                        handle.retired.store(true, Ordering::Relaxed);
-                        handles.remove(&chat_id);
-                        tracing::info!(chat = %chat_id,
-                            "s2 handle dropped on chat2 cutover; watchers resubscribe onto the new room");
-                        dropped.push(chat_id);
+                for (chat_id, row_gen) in flipped {
+                    let handle = lock(&host.inner.handles).get(&chat_id).cloned();
+                    let Some(handle) = handle else { continue };
+                    if handle.room_gen >= row_gen
+                        || handle.generation_frozen.load(Ordering::Acquire)
+                    {
+                        continue;
                     }
-                }
-                for (chat_id, handle) in stuck_live {
-                    if host.is_host(&chat_id)
+
+                    // A host-side fat source must checkpoint/rebuild rather
+                    // than be discarded into an already-named thin room. The
+                    // quiet seeder owns its drain/writer coordination.
+                    if handle.room_gen < crate::chat2_host::CHAT2_DOC_EPOCH
+                        && host.is_host(&chat_id)
                         && let Some(edge) = host.inner.config.edge.clone()
                     {
-                        host.spawn_chat2_seed_when_quiet(edge, &chat_id, &handle);
+                        host.spawn_room_seed_when_quiet(edge, &chat_id, &handle);
+                        continue;
+                    }
+
+                    match host.try_cutover_handle(&chat_id, &handle, row_gen) {
+                        Ok(CutoverDisposition::Removed) => {
+                            tracing::info!(chat = %chat_id, from_gen = handle.room_gen,
+                                to_gen = row_gen,
+                                "stale handle durably handed off on room-generation cutover");
+                            dropped.push(chat_id);
+                        }
+                        Ok(CutoverDisposition::Deferred) => {
+                            host.spawn_cutover_when_quiet(&chat_id, &handle);
+                        }
+                        Ok(CutoverDisposition::Superseded) => {}
+                        Err(err) => tracing::warn!(chat = %chat_id, error = %err,
+                            "room-generation cutover failed closed"),
                     }
                 }
                 // Watchers resubscribe on their own — but a NUDGE-opened
@@ -761,6 +1321,285 @@ impl DocHost {
         });
     }
 
+    /// A registry generation can advance while a run still owns the old doc.
+    /// Keep that writer alive, then retire/reopen the exact stale handle as
+    /// soon as its writer and durable command work quiesce. The per-chat set
+    /// coalesces repeated workspace publishes into one waiter.
+    fn spawn_cutover_when_quiet(&self, chat_id: &str, handle: &Arc<ChatDocHandle>) {
+        if !lock(&self.inner.cutover_waiting).insert(chat_id.to_string()) {
+            return;
+        }
+        const TICK: std::time::Duration = std::time::Duration::from_millis(250);
+        let host = self.clone();
+        let chat = chat_id.to_string();
+        let weak = Arc::downgrade(handle);
+        self.spawn_worker(async move {
+            async {
+                loop {
+                    tokio::time::sleep(TICK).await;
+                    let Some(handle) = weak.upgrade() else { return };
+                    let row_gen = match host
+                        .workspace()
+                        .and_then(|ws| ws.chat(&chat).ok().flatten())
+                    {
+                        Some(row) => row.room_gen.unwrap_or(1),
+                        None => return,
+                    };
+                    if row_gen <= handle.room_gen {
+                        return; // row rolled back/vanished or another path converged it
+                    }
+                    if handle.generation_frozen.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if Arc::strong_count(&handle.doc) > 1 {
+                        continue;
+                    }
+                    match host.cutover_handle(&chat, &handle, row_gen).await {
+                        Ok(CutoverDisposition::Removed) => {
+                            tracing::info!(chat = %chat, from_gen = handle.room_gen, to_gen = row_gen,
+                                "deferred room-generation cutover resumed after writer quiesced");
+                            if host.is_host(&chat)
+                                && let Err(err) = host.open(&chat)
+                            {
+                                tracing::warn!(chat = %chat, error = %err,
+                                    "room reopen after deferred cutover failed");
+                            }
+                            return;
+                        }
+                        Ok(CutoverDisposition::Deferred) => continue,
+                        Ok(CutoverDisposition::Superseded) => return,
+                        Err(err) => {
+                            tracing::warn!(chat = %chat, error = %err,
+                                "deferred room-generation cutover failed closed");
+                            return;
+                        }
+                    }
+                }
+            }
+            .await;
+            lock(&host.inner.cutover_waiting).remove(&chat);
+        });
+    }
+
+    /// Activity checks used while the caller ALREADY owns `command_drain`.
+    /// Watchers are intentionally not a blocker: removing the map's handle
+    /// closes their stream and they reopen on the registry-named room.
+    fn cutover_blocked_without_drain(&self, handle: &Arc<ChatDocHandle>) -> bool {
+        if Arc::strong_count(&handle.doc) > 1 {
+            return true;
+        }
+        if !self.is_host(&handle.chat_id) {
+            return false;
+        }
+        let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+        match handle.doc.read_commands() {
+            Ok(commands) => commands
+                .iter()
+                .any(|c| c.status == SessionCommandStatus::Pending && !is_processed(&c.id)),
+            Err(_) => true,
+        }
+    }
+
+    /// Persist a cutover handoff while `sink_lifecycle` + `snapshot_save` are
+    /// held and the old room client has already been parked. Thin generations
+    /// share one Loro lineage, so a cached gen2 tail can be merged into an
+    /// already-durable gen3 snapshot and stamped cursor=0 for crash-safe full
+    /// replay. A fat gen1 source remains a rollback/adopt input and is never
+    /// merged into the rebuilt thin lineage.
+    #[cfg(test)]
+    fn inject_cutover_store_failure(&self) -> Result<(), EngineError> {
+        if self
+            .inner
+            .injected_cutover_store_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(EngineError::Other(
+                "injected cutover snapshot store failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn persist_cutover_snapshot_locked(
+        &self,
+        handle: &ChatDocHandle,
+        target_gen: u32,
+    ) -> Result<(), EngineError> {
+        if handle.purged.load(Ordering::Acquire) {
+            let _ = self.inner.store.delete_snapshot(&handle.chat_id);
+            return Err(EngineError::Other(format!(
+                "chat {} was deleted during snapshot persistence",
+                handle.chat_id
+            )));
+        }
+        let source = handle.doc.export_snapshot()?;
+        handle.snapshot_bytes.store(source.len(), Ordering::Relaxed);
+        let stored = self
+            .inner
+            .store
+            .load_snapshot_with_cursor(&handle.chat_id)?;
+
+        if handle.room_gen >= crate::chat2_host::CHAT2_DOC_EPOCH && target_gen > handle.room_gen {
+            let (bytes, epoch) = match stored {
+                Some((target, _, epoch)) if epoch >= target_gen => {
+                    let merged = loro::LoroDoc::new();
+                    merged.import(&target).map_err(|err| {
+                        EngineError::Other(format!("target snapshot import failed: {err}"))
+                    })?;
+                    merged.import(&source).map_err(|err| {
+                        EngineError::Other(format!("source tail merge failed: {err}"))
+                    })?;
+                    let merged = SessionDoc::from_doc(merged).export_snapshot()?;
+                    (merged, epoch)
+                }
+                _ => (source, target_gen),
+            };
+            #[cfg(test)]
+            self.inject_cutover_store_failure()?;
+            self.inner.store.save_snapshot_with_cursor(
+                &handle.chat_id,
+                &bytes,
+                0,
+                epoch.max(target_gen),
+            )?;
+            if handle.purged.load(Ordering::Acquire) {
+                let _ = self.inner.store.delete_snapshot(&handle.chat_id);
+                return Err(EngineError::Other(format!(
+                    "chat {} was deleted during snapshot persistence",
+                    handle.chat_id
+                )));
+            }
+            handle.replay_from_zero.store(true, Ordering::Release);
+            return Ok(());
+        }
+
+        let newer_lineage = stored
+            .as_ref()
+            .is_some_and(|(_, _, epoch)| *epoch > handle.room_gen);
+        if newer_lineage {
+            if handle.room_gen < crate::chat2_host::CHAT2_DOC_EPOCH {
+                let rollback_id = format!("{}.pre-chat2", handle.chat_id);
+                if !self.inner.store.has_snapshot(&rollback_id)? {
+                    self.inner.store.save_snapshot(&rollback_id, &source)?;
+                }
+            }
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        self.inject_cutover_store_failure()?;
+
+        if handle.replay_from_zero.load(Ordering::Acquire)
+            && handle.room_gen >= crate::chat2_host::CHAT2_DOC_EPOCH
+        {
+            let epoch = stored
+                .as_ref()
+                .map(|(_, _, epoch)| *epoch)
+                .unwrap_or(crate::chat2_host::CHAT2_DOC_EPOCH)
+                .max(crate::chat2_host::CHAT2_DOC_EPOCH)
+                .min(handle.room_gen);
+            self.inner
+                .store
+                .save_snapshot_with_cursor(&handle.chat_id, &source, 0, epoch)?;
+        } else {
+            self.inner.store.save_snapshot(&handle.chat_id, &source)?;
+        }
+        // Linearizes with purge without adding a global blocking lock: if the
+        // save crossed the terminal fence, remove the just-written row. If the
+        // fence flips after this load, purge's own delete necessarily runs
+        // after our completed save instead.
+        if handle.purged.load(Ordering::Acquire) {
+            let _ = self.inner.store.delete_snapshot(&handle.chat_id);
+            return Err(EngineError::Other(format!(
+                "chat {} was deleted during snapshot persistence",
+                handle.chat_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// One room-generation replacement coordinator. Callers MUST acquire the
+    /// async command drain first; this function then enforces the remaining
+    /// global order: handles -> lifecycle -> snapshot -> chat2 -> host pending.
+    /// Once frozen, late drains, mutators, and old sinks all fail closed.
+    fn cutover_handle_with_drain(
+        &self,
+        chat_id: &str,
+        handle: &Arc<ChatDocHandle>,
+        target_gen: u32,
+    ) -> Result<CutoverDisposition, EngineError> {
+        let mut handles = lock(&self.inner.handles);
+        let Some(current) = handles.get(chat_id).cloned() else {
+            return Ok(CutoverDisposition::Superseded);
+        };
+        if !Arc::ptr_eq(&current, handle) || current.room_gen >= target_gen {
+            return Ok(CutoverDisposition::Superseded);
+        }
+        if current.generation_frozen.load(Ordering::Acquire)
+            || self.cutover_blocked_without_drain(&current)
+        {
+            return Ok(CutoverDisposition::Deferred);
+        }
+
+        let _lifecycle = lock(&current.sink_lifecycle);
+        if current.generation_frozen.swap(true, Ordering::AcqRel) {
+            return Ok(CutoverDisposition::Deferred);
+        }
+        if self.cutover_blocked_without_drain(&current) {
+            current.generation_frozen.store(false, Ordering::Release);
+            return Ok(CutoverDisposition::Deferred);
+        }
+        let _save = lock(&current.snapshot_save);
+        // Persist before invalidating any live plumbing. On an I/O failure we
+        // can simply unfreeze and leave the subscription/client intact for an
+        // automatic retry; detaching first left a permanently frozen handle
+        // in the map with no route to recover.
+        let persisted = self.persist_cutover_snapshot_locked(&current, target_gen);
+        if let Err(err) = persisted {
+            current.generation_frozen.store(false, Ordering::Release);
+            drop(_save);
+            drop(_lifecycle);
+            return Err(err);
+        }
+        // Stop local callbacks only after the durable handoff exists. The doc
+        // is quiescent by the writer/command checks above; all unacked bytes
+        // already resident in the client move to the host replay buffer.
+        drop(lock(&current.chat2_local_sub).take());
+        let parked = self.detach_chat2_client_locked(&current);
+        current.retired.store(true, Ordering::Release);
+        drop(_save);
+        drop(_lifecycle);
+        handles.remove(chat_id);
+        drop(handles);
+        self.carry_parked_updates(&current, parked);
+        Ok(CutoverDisposition::Removed)
+    }
+
+    fn try_cutover_handle(
+        &self,
+        chat_id: &str,
+        handle: &Arc<ChatDocHandle>,
+        target_gen: u32,
+    ) -> Result<CutoverDisposition, EngineError> {
+        let Ok(_drain) = handle.command_drain.try_lock() else {
+            return Ok(CutoverDisposition::Deferred);
+        };
+        self.cutover_handle_with_drain(chat_id, handle, target_gen)
+    }
+
+    async fn cutover_handle(
+        &self,
+        chat_id: &str,
+        handle: &Arc<ChatDocHandle>,
+        target_gen: u32,
+    ) -> Result<CutoverDisposition, EngineError> {
+        let _drain = handle.command_drain.lock().await;
+        self.cutover_handle_with_drain(chat_id, handle, target_gen)
+    }
+
     /// The workspace host, once wired (tests may assemble a DocHost without one).
     pub fn workspace(&self) -> Option<&WorkspaceHost> {
         self.inner.workspace.get()
@@ -784,6 +1623,12 @@ impl DocHost {
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
+        let purge_fence = Self::purge_fence(&self.inner, chat_id);
+        if purge_fence.load(Ordering::Acquire) {
+            return Err(EngineError::Other(format!(
+                "chat {chat_id} has been deleted"
+            )));
+        }
         // The registry names the sync room generation (docs/chat2-sync.md
         // M2): absent row / absent field = legacy s2. Read it BEFORE the
         // cached-handle check — a cached s2-mode handle for a chat another
@@ -807,27 +1652,52 @@ impl DocHost {
             Some(row) => row.room_gen.unwrap_or(1),
             None => self.minted_room_gen(),
         };
-        {
-            let mut handles = lock(&self.inner.handles);
-            if let Some(handle) = handles.get(chat_id) {
-                // Stale = built for an older room generation than the registry
-                // names (s2→chat2 seed, or the chat2→chat3 org-share flip).
-                let stale = registry_gen >= 2 && handle.room_gen < registry_gen;
-                if (stale || handle.retired.load(Ordering::Relaxed)) && !self.pinned(handle) {
-                    // A seed flipped this chat under a cached fat handle
-                    // (review B1): drop it so this open converges onto the
-                    // thin lineage + chat2 room. Retire only at the drop:
-                    // marking a PINNED stale handle retired while it kept
-                    // serving suppressed the only persistence a stuck-live
-                    // doc had and aborted its quiet-seed (born-gen2 race,
-                    // 2026-08-11) — the cutover watcher and the seed itself
-                    // own converging pinned handles.
-                    handle.retired.store(true, Ordering::Relaxed);
-                    handles.remove(chat_id);
-                } else {
-                    handle.touch();
-                    return Ok(handle.clone());
+        // Bind the lookup separately: a MutexGuard temporary in an `if let`
+        // scrutinee lives through the whole body, and the stale branch enters
+        // the cutover coordinator which must lock this map again.
+        let cached = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(handle) = cached {
+            if handle.generation_frozen.load(Ordering::Acquire) {
+                return Err(EngineError::Other(format!(
+                    "chat {chat_id} is completing a room-generation migration; retry shortly"
+                )));
+            }
+            // Stale = built for an older room generation than the registry
+            // names (s2→chat2 seed, or the chat2→chat3 org-share flip).
+            let stale = registry_gen >= 2 && handle.room_gen < registry_gen;
+            if stale {
+                // A host-side fat source needs a checkpoint-first rebuild;
+                // direct adopt would strand its tail in the discarded lineage.
+                if handle.room_gen < crate::chat2_host::CHAT2_DOC_EPOCH
+                    && self.is_host(chat_id)
+                    && let Some(edge) = self.inner.config.edge.clone()
+                {
+                    self.spawn_room_seed_when_quiet(edge, chat_id, &handle);
+                    return Err(EngineError::Other(format!(
+                        "chat {chat_id} is sealing its legacy room; retry shortly"
+                    )));
                 }
+                match self.try_cutover_handle(chat_id, &handle, registry_gen)? {
+                    CutoverDisposition::Removed => {}
+                    CutoverDisposition::Deferred => {
+                        self.spawn_cutover_when_quiet(chat_id, &handle);
+                        return Err(EngineError::Other(format!(
+                            "chat {chat_id} has active work during room cutover; retry shortly"
+                        )));
+                    }
+                    CutoverDisposition::Superseded => {
+                        // Another coordinator won; retry the cache lookup so
+                        // this call never returns the stale handle.
+                        return self.open(chat_id);
+                    }
+                }
+            } else if handle.retired.load(Ordering::Acquire) {
+                return Err(EngineError::Other(format!(
+                    "chat {chat_id} is retiring its previous room; retry shortly"
+                )));
+            } else {
+                handle.touch();
+                return Ok(handle);
             }
         }
         // B2/M5 guard: the LOCAL epoch is the second cutover signal. A crash
@@ -950,13 +1820,18 @@ impl DocHost {
                     // since (caught by the restart_resume suite: first-turn
                     // transcripts vanished on reopen).
                     let doc = SessionDoc::init(chat_id)?;
-                    if let Ok(snapshot) = doc.export_snapshot() {
+                    if !purge_fence.load(Ordering::Acquire)
+                        && let Ok(snapshot) = doc.export_snapshot()
+                    {
                         let _ = self.inner.store.save_snapshot_with_cursor(
                             chat_id,
                             &snapshot,
                             0,
                             crate::chat2_host::CHAT2_DOC_EPOCH,
                         );
+                        if purge_fence.load(Ordering::Acquire) {
+                            let _ = self.inner.store.delete_snapshot(chat_id);
+                        }
                     }
                     doc
                 }
@@ -975,7 +1850,25 @@ impl DocHost {
         };
         let doc = Arc::new(doc);
 
+        let replay_from_zero = Arc::new(AtomicBool::new(false));
+        let replay_fence = Arc::new(Mutex::new(()));
+        let local_callbacks_pending = Arc::new(AtomicUsize::new(0));
+        let local_mutation_epoch = Arc::new(AtomicU64::new(0));
+        let local_update_tracking = Arc::new(AtomicBool::new(false));
+
         let (changed_tx, changed_rx) = watch::channel(0u64);
+        let root_replay = replay_from_zero.clone();
+        let root_pending = local_callbacks_pending.clone();
+        let root_epoch = local_mutation_epoch.clone();
+        let root_tracking = local_update_tracking.clone();
+        let pre_commit_sub = doc.doc().subscribe_pre_commit(Box::new(move |_| {
+            if root_tracking.load(Ordering::Acquire) {
+                root_replay.store(true, Ordering::Release);
+                root_pending.fetch_add(1, Ordering::AcqRel);
+                root_epoch.fetch_add(1, Ordering::AcqRel);
+            }
+            true
+        }));
         let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
@@ -994,19 +1887,26 @@ impl DocHost {
             snapshot_bytes: AtomicUsize::new(snapshot_len),
             room_gen,
             retired: AtomicBool::new(false),
-            checkpointing: Arc::new(AtomicBool::new(false)),
+            purged: purge_fence.clone(),
+            // Construction reservation. This handle is not published until
+            // its room callback/tracking are installed below.
+            generation_frozen: Arc::new(AtomicBool::new(true)),
+            sink_lifecycle: Arc::new(Mutex::new(())),
+            sink_generation: Arc::new(AtomicU64::new(0)),
+            replay_from_zero,
+            replay_fence,
+            local_callbacks_pending,
+            local_mutation_epoch,
+            local_update_tracking,
+            snapshot_save: Mutex::new(()),
+            checkpoint_state: Arc::new(Mutex::new(CheckpointState::default())),
+            checkpointed_rejections: AtomicU64::new(0),
             chat2: Mutex::new(None),
             chat2_local_sub: Mutex::new(None),
+            command_drain: tokio::sync::Mutex::new(()),
+            _pre_commit_sub: pre_commit_sub,
             _sub: sub,
         });
-        {
-            let mut handles = lock(&self.inner.handles);
-            if let Some(existing) = handles.get(chat_id) {
-                return Ok(existing.clone()); // racing open — keep the first
-            }
-            handles.insert(chat_id.to_string(), handle.clone());
-        }
-
         // Edge room join — offline-tolerant AND supervised. `ChatClient` only
         // self-reconnects AFTER a first successful join; a one-shot attempt
         // here (the pre-LRU design) left the doc silently local-only until
@@ -1017,40 +1917,16 @@ impl DocHost {
         // retried: the exact "transcript frozen until restart" report.
         // Retry on the workspace host's capped, jittered backoff; a system
         // wake redials immediately; eviction/purge ends the loop via `weak`.
+        let mut join_edge = None;
+        let mut seed_edge = None;
         if let Some(edge) = &self.inner.config.edge {
             if room_gen >= 2 {
                 // Subscription BEFORE the dial (review B3): every local
                 // commit lands in the client when connected, else in the
                 // pending buffer the join drains — nothing composed during
                 // (or before) the dial is lost to the room.
-                let weak_push = Arc::downgrade(&handle);
-                let weak_host = Arc::downgrade(&self.inner);
-                let pending_chat = chat_id.to_string();
-                let sub = doc
-                    .doc()
-                    .subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
-                        if let Some(handle) = weak_push.upgrade() {
-                            // The buffer push happens WHILE HOLDING the client
-                            // lock (verify pass: releasing it between the None
-                            // check and the push let the join's store+drain
-                            // slip between, orphaning the update forever).
-                            let client_guard = lock(&handle.chat2);
-                            match &*client_guard {
-                                Some(client) => client.enqueue_update(bytes.clone()),
-                                None => {
-                                    if let Some(inner) = weak_host.upgrade() {
-                                        DocHost::buffer_chat2_update(
-                                            &inner,
-                                            &pending_chat,
-                                            bytes.clone(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        true
-                    }));
-                *lock(&handle.chat2_local_sub) = Some(sub);
+                self.install_chat2_local_subscription(&handle);
+                handle.generation_frozen.store(false, Ordering::Release);
                 // Re-queue survives the adopt: our own pending commands
                 // become fresh entries in the new lineage (the
                 // processed_commands ledger still guards double execution).
@@ -1080,7 +1956,9 @@ impl DocHost {
                     // the full log and preserve the carry-over suffix: on
                     // success the repeats are idempotent; on rejection the
                     // small deltas can still drain after an owner seed.
+                    let _replay = lock(&handle.replay_fence);
                     let _client_guard = lock(&handle.chat2);
+                    handle.replay_from_zero.store(true, Ordering::Release);
                     match doc
                         .doc()
                         .export(loro::ExportMode::updates(&loro::VersionVector::default()))
@@ -1095,8 +1973,9 @@ impl DocHost {
                         }
                     }
                 }
-                self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor, chat2_epoch);
+                join_edge = Some(edge.clone());
             } else {
+                handle.generation_frozen.store(false, Ordering::Release);
                 // Straggler gen-1 chat (the s2 client is gone — post-cutover,
                 // no device reads or writes an s2 room). The local fat doc
                 // serves reads as-is; if we host the chat, seed it onto chat2
@@ -1108,9 +1987,34 @@ impl DocHost {
                     // Quiescent-only (review B1): a seed under a live run or
                     // watched transcript would strand everything written
                     // after the rebuild instant in a retired fat lineage.
-                    self.spawn_chat2_seed_when_quiet(edge.clone(), chat_id, &handle);
+                    seed_edge = Some(edge.clone());
                 }
             }
+        } else {
+            handle.generation_frozen.store(false, Ordering::Release);
+        }
+        // Publish only after pre-commit/local-update tracking and the initial
+        // cursor-zero replay batch are ready. A racing open can no longer
+        // obtain a writable handle in the subscription gap.
+        {
+            let mut handles = lock(&self.inner.handles);
+            if purge_fence.load(Ordering::Acquire) {
+                drop(handles);
+                let _ = self.inner.store.delete_snapshot(chat_id);
+                return Err(EngineError::Other(format!(
+                    "chat {chat_id} has been deleted"
+                )));
+            }
+            if let Some(existing) = handles.get(chat_id) {
+                return Ok(existing.clone()); // racing open — keep the first
+            }
+            handles.insert(chat_id.to_string(), handle.clone());
+        }
+        if let Some(edge) = join_edge {
+            self.spawn_chat2_join(edge, &handle, chat2_cursor, chat2_epoch);
+        }
+        if let Some(edge) = seed_edge {
+            self.spawn_room_seed_when_quiet(edge, chat_id, &handle);
         }
         self.spawn_worker(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
         self.evict_over_budget();
@@ -1137,14 +2041,25 @@ impl DocHost {
         let weak = Arc::downgrade(handle);
         let host = self.clone();
         let mut token_changes = edge.token_changes();
+        let client_generation = handle.sink_generation.load(Ordering::Acquire);
+        let sink_lifecycle = handle.sink_lifecycle.clone();
+        let sink_generation = handle.sink_generation.clone();
+        let generation_frozen = handle.generation_frozen.clone();
+        let replay_from_zero = handle.replay_from_zero.clone();
+        let replay_fence = handle.replay_fence.clone();
         self.spawn_worker(async move {
-            let sink = Arc::new(crate::chat2_host::EngineChatSink::new(
+            let sink = Arc::new(crate::chat2_host::EngineChatSink::new_with_lifecycle(
                 &doc,
                 store,
                 chat.clone(),
                 room_gen,
                 cursor,
                 cursor_epoch,
+                sink_lifecycle,
+                sink_generation,
+                generation_frozen,
+                replay_from_zero,
+                replay_fence,
             ));
             // The sink holds only a Weak doc ref (a strong one made every
             // chat2 handle read as perma-pinned — LRU eviction dead); this
@@ -1216,7 +2131,11 @@ impl DocHost {
                                 "chat2 join forbidden (foreign single-owner room); parked until registry flips");
                             return;
                         }
-                        host.install_chat2_client(&handle, client);
+                        host.install_chat2_client_for_generation(
+                            &handle,
+                            client,
+                            client_generation,
+                        );
                         tracing::info!(chat = %chat, "chat2 room joined (converged)");
                         // Bootstrap heal: a room with NO checkpoint can't
                         // cover its rows' causal deps for cold readers — a
@@ -1233,25 +2152,29 @@ impl DocHost {
                             let weak = weak.clone();
                             host.clone().spawn_worker(async move {
                                 // With the pull-first transport the client
-                                // constructs before any state answer — wait
-                                // until the server's view is KNOWN (bounded)
-                                // or the all-zero placeholder stats would
-                                // misread as "no checkpoint" and upload a
-                                // spurious full-doc heal on a thin link.
-                                for _ in 0..40u32 {
+                                // constructs before any state answer. Busy and
+                                // unknown are not negative verdicts: this is a
+                                // one-shot recovery duty, so keep it armed until
+                                // a real server view arrives or the handle dies.
+                                let no_checkpoint = loop {
                                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                     let Some(handle) = weak.upgrade() else { return };
-                                    let known = lock(&handle.chat2)
-                                        .as_ref()
-                                        .is_some_and(|c| c.stats().server_known);
-                                    if known {
-                                        break;
+                                    if handle.generation_frozen.load(Ordering::Acquire)
+                                        || handle.retired.load(Ordering::Acquire)
+                                        || handle.purged.load(Ordering::Acquire)
+                                    {
+                                        return;
                                     }
-                                }
+                                    let stats = lock(&handle.chat2)
+                                        .as_ref()
+                                        .and_then(zeron_sync::ChatClient::try_stats);
+                                    if let Some(stats) = stats
+                                        && stats.server_known
+                                    {
+                                        break stats.checkpoint_size == 0;
+                                    }
+                                };
                                 let Some(handle) = weak.upgrade() else { return };
-                                let no_checkpoint = lock(&handle.chat2)
-                                    .as_ref()
-                                    .is_some_and(|c| c.stats().server_known && c.stats().checkpoint_size == 0);
                                 let has_content = handle
                                     .doc
                                     .read_entries()
@@ -1313,14 +2236,22 @@ impl DocHost {
                             }
                             tokio::select! {
                                 event = lifecycle_events.recv() => match event {
+                                    Ok(zeron_sync::chat_client::ChatEvent::Applied) => {
+                                        if let Some(handle) = weak.upgrade() {
+                                            host.maybe_clear_replay_from_zero(&handle);
+                                        }
+                                    }
                                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                                 },
                                 _ = crate::workspace_host::token_changed(&mut token_changes) => {
                                     if edge.bearer().await.is_none() {
                                         if let Some(handle) = weak.upgrade() {
-                                            lock(&handle.chat2).take();
-                                            lock(&handle.chat2_local_sub).take();
+                                            // Preserve unacknowledged rows and
+                                            // keep buffering local shutdown
+                                            // mutations after credentials are
+                                            // revoked.
+                                            host.park_chat2_client(&handle);
                                         }
                                         tracing::info!(chat = %chat,
                                             "chat2 credentials removed; leaving room");
@@ -1356,17 +2287,13 @@ impl DocHost {
         });
     }
 
-    /// Host-side chat2 seed (docs/chat2-sync.md M1/M2): rebuild thin, POST
-    /// the seed checkpoint, persist the thin lineage locally, THEN flip the
-    /// registry — each step idempotent, a crash before the flip leaves the
-    /// chat on s2 and the next open retries (M5).
-    /// Defer a chat2 seed until the chat is verifiably quiet: the s2 room has
-    /// joined (the rebuild must include every row the room holds — seeding
-    /// from the pre-backfill local doc forked other devices' rows into the
-    /// retired lineage) and the doc frontier has stopped moving (a
-    /// nudge-burst in flight — an incoming queued command — must land and
-    /// execute first). Holds only a weak handle: eviction ends the wait.
-    fn spawn_chat2_seed_when_quiet(
+    /// Defer a room-generation seed until the doc frontier is quiet and no
+    /// writer/command work is live. Gen-1 sources use the historical rebuild
+    /// path. Gen-2 sources additionally wait until the chat2 client has an
+    /// acknowledged, caught-up server view, then copy that unchanged thin
+    /// lineage into chat3 before advertising the new registry generation.
+    /// Holds only a weak handle while waiting: eviction ends the wait.
+    fn spawn_room_seed_when_quiet(
         &self,
         edge: EdgeConfig,
         chat_id: &str,
@@ -1382,11 +2309,6 @@ impl DocHost {
         let weak = Arc::downgrade(handle);
         self.spawn_worker(async move {
             async {
-                // The old join-wait gate (seed only after the s2 room had
-                // backfilled) is gone with the s2 client: no device writes
-                // an s2 room anymore, so the host's local doc IS the
-                // authority for a straggler gen-1 chat. Only the quiet gate
-                // remains (no seed under a moving frontier).
                 let mut quiet = 0u32;
                 let mut last_vv: Option<Vec<u8>> = None;
                 loop {
@@ -1396,12 +2318,21 @@ impl DocHost {
                         return;
                     }
                     let vv = handle.doc.doc().oplog_vv().encode();
+                    let source_ready = handle.room_gen < crate::chat2_host::CHAT2_DOC_EPOCH
+                        || Self::source_room_converged(&handle);
+                    if host.seed_blocked(&handle) || !source_ready {
+                        quiet = 0;
+                        last_vv = Some(vv);
+                        continue;
+                    }
                     if last_vv.as_ref() == Some(&vv) {
                         quiet += 1;
                         if quiet >= QUIET_TICKS {
-                            let doc = handle.doc.clone();
-                            drop(handle);
-                            host.spawn_chat2_seed(edge, &chat, doc);
+                            if handle.room_gen >= crate::chat2_host::CHAT2_DOC_EPOCH {
+                                host.spawn_thin_generation_seed(edge, &chat, handle);
+                            } else {
+                                host.spawn_chat2_seed(edge, &chat, handle);
+                            }
                             return;
                         }
                     } else {
@@ -1417,7 +2348,580 @@ impl DocHost {
         });
     }
 
-    fn spawn_chat2_seed(&self, edge: EdgeConfig, chat_id: &str, doc: Arc<SessionDoc>) {
+    /// The source room has answered and this handle includes its complete head,
+    /// with no own update still awaiting acknowledgement.
+    fn source_room_converged(handle: &ChatDocHandle) -> bool {
+        lock(&handle.chat2).as_ref().is_some_and(|client| {
+            let Some(stats) = client.try_stats() else {
+                return false;
+            };
+            stats.server_known
+                && stats.cursor == stats.head_seq
+                && stats.pending_pushes == 0
+                && !client.access_denied()
+        })
+    }
+
+    fn spawn_thin_generation_seed(
+        &self,
+        edge: EdgeConfig,
+        chat_id: &str,
+        handle: Arc<ChatDocHandle>,
+    ) {
+        {
+            let mut seeding = lock(&self.inner.seeding);
+            if !seeding.insert(chat_id.to_string()) {
+                return;
+            }
+        }
+        let host = self.clone();
+        let chat = chat_id.to_string();
+        self.spawn_worker(async move {
+            let outcome = host.seed_thin_generation(&edge, &chat, &handle).await;
+            lock(&host.inner.seeding).remove(&chat);
+            match outcome {
+                Ok(()) => tracing::info!(chat = %chat,
+                    "chat3 checkpoint seeded; registry generation flipped"),
+                Err(err) => tracing::warn!(chat = %chat, error = %err,
+                    "chat2 to chat3 seed failed; registry generation left unchanged"),
+            }
+        });
+    }
+
+    async fn post_generation_seed_checkpoint(
+        &self,
+        edge: &EdgeConfig,
+        bearer: &str,
+        chat_id: &str,
+        target_gen: u32,
+        snapshot: &[u8],
+        frontier: &[u8],
+        context: &str,
+    ) -> Result<(), String> {
+        use base64::Engine as _;
+
+        self.ensure_seed_row_alive(chat_id)?;
+
+        let url = format!(
+            "{}/{}/{}/checkpoint?seqCovered=0&role=host",
+            edge.url.trim_end_matches('/'),
+            room_prefix(target_gen),
+            chat_id
+        );
+        let res = self
+            .inner
+            .http
+            .post(&url)
+            .bearer_auth(bearer)
+            .header(
+                "x-chat2-frontier",
+                base64::engine::general_purpose::STANDARD.encode(frontier),
+            )
+            .body(snapshot.to_vec())
+            .send()
+            .await
+            .map_err(|e| format!("{context} checkpoint POST: {e}"))?;
+        if !res.status().is_success() {
+            return Err(format!("{context} checkpoint HTTP {}", res.status()));
+        }
+        // A DeleteChat can win while the POST is in flight. The remote blob is
+        // then unreachable without its registry row, and locally this must be
+        // a terminal purge rather than permission to continue the flip/reopen.
+        self.ensure_seed_row_alive(chat_id)?;
+        Ok(())
+    }
+
+    fn ensure_seed_row_alive(&self, chat_id: &str) -> Result<(), String> {
+        if Self::chat_was_purged(&self.inner, chat_id) {
+            return Err("chat was deleted during room-generation seed".into());
+        }
+        let Some(workspace) = self.workspace() else {
+            return Err("no workspace host".into());
+        };
+        match workspace.chat(chat_id) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                self.purge_chat(chat_id);
+                Err("chat row vanished during room-generation seed".into())
+            }
+            Err(err) => Err(format!("workspace row check during generation seed: {err}")),
+        }
+    }
+
+    /// Rebuild the source-room plumbing after a frozen seed could not make its
+    /// recovery snapshot durable. The exact in-memory doc stays authoritative:
+    /// reinstall its callback, queue a complete replay before unfreezing, and
+    /// fence every sink from the detached client through `sink_generation`.
+    fn restore_frozen_generation_source(&self, chat_id: &str, handle: &Arc<ChatDocHandle>) -> bool {
+        if self.inner.shutdown.is_cancelled() {
+            return false;
+        }
+        let cursor_epoch = {
+            let handles = lock(&self.inner.handles);
+            let Some(current) = handles.get(chat_id).cloned() else {
+                return false;
+            };
+            if !Arc::ptr_eq(&current, handle)
+                || !current.generation_frozen.load(Ordering::Acquire)
+                || current.retired.load(Ordering::Acquire)
+                || current.purged.load(Ordering::Acquire)
+            {
+                return false;
+            }
+
+            let _lifecycle = lock(&current.sink_lifecycle);
+            if current.retired.load(Ordering::Acquire) || current.purged.load(Ordering::Acquire) {
+                return false;
+            }
+            self.install_chat2_local_subscription(&current);
+            let full_replay = match current
+                .doc
+                .doc()
+                .export(loro::ExportMode::updates(&loro::VersionVector::default()))
+            {
+                Ok(bytes) => Some(bytes),
+                Err(update_err) => match current.doc.export_snapshot() {
+                    Ok(bytes) => {
+                        tracing::warn!(chat = %chat_id, error = %update_err,
+                            "frozen generation recovery update-log export failed; using snapshot replay");
+                        Some(bytes)
+                    }
+                    Err(snapshot_err) => {
+                        tracing::error!(chat = %chat_id,
+                            update_error = %update_err,
+                            snapshot_error = %snapshot_err,
+                            "frozen generation recovery could not export a complete replay");
+                        None
+                    }
+                },
+            };
+            let _replay = lock(&current.replay_fence);
+            let _client_slot = lock(&current.chat2);
+            current.replay_from_zero.store(true, Ordering::Release);
+            match full_replay {
+                Some(bytes) if !bytes.is_empty() => {
+                    // We already hold the exact handle in the map, so insert
+                    // directly instead of taking `purge_fences` in the inverse
+                    // of purge's fence -> handles lock order.
+                    lock(&self.inner.chat2_pending_local)
+                        .entry(chat_id.to_string())
+                        .or_default()
+                        .insert(0, bytes);
+                }
+                Some(_) | None => {}
+            }
+            if current.purged.load(Ordering::Acquire) {
+                lock(&self.inner.chat2_pending_local).remove(chat_id);
+                return false;
+            }
+            let epoch = self
+                .inner
+                .store
+                .load_snapshot_with_cursor(chat_id)
+                .ok()
+                .flatten()
+                .map(|(_, _, epoch)| epoch)
+                .unwrap_or(current.room_gen)
+                .max(crate::chat2_host::CHAT2_DOC_EPOCH)
+                .min(current.room_gen);
+            current.generation_frozen.store(false, Ordering::Release);
+            epoch
+        };
+
+        if let Some(edge) = self.inner.config.edge.clone() {
+            self.spawn_chat2_join(edge, handle, 0, cursor_epoch);
+        }
+        self.spawn_frozen_recovery_snapshot_retry(handle);
+        true
+    }
+
+    /// A transient disk failure must not leave the only complete tail solely
+    /// in RAM forever. Retry the cursor-zero snapshot while the restored handle
+    /// remains current, then re-arm the normal quiet generation seeder.
+    fn spawn_frozen_recovery_snapshot_retry(&self, handle: &Arc<ChatDocHandle>) {
+        let host = self.clone();
+        let weak = Arc::downgrade(handle);
+        self.spawn_worker(async move {
+            let mut backoff = std::time::Duration::from_millis(25);
+            loop {
+                tokio::time::sleep(backoff).await;
+                let Some(handle) = weak.upgrade() else { return };
+                let saved = {
+                    let handles = lock(&host.inner.handles);
+                    if !handles
+                        .get(&handle.chat_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &handle))
+                        || handle.generation_frozen.load(Ordering::Acquire)
+                        || handle.retired.load(Ordering::Acquire)
+                        || handle.purged.load(Ordering::Acquire)
+                    {
+                        return;
+                    }
+                    let _lifecycle = lock(&handle.sink_lifecycle);
+                    let _save = lock(&handle.snapshot_save);
+                    host.persist_cutover_snapshot_locked(&handle, handle.room_gen)
+                };
+                match saved {
+                    Ok(()) => {
+                        if let Some(edge) = host.inner.config.edge.clone() {
+                            host.spawn_room_seed_when_quiet(edge, &handle.chat_id, &handle);
+                        }
+                        return;
+                    }
+                    Err(err) => tracing::warn!(chat = %handle.chat_id, error = %err,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "frozen generation recovery snapshot retry failed"),
+                }
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+            }
+        });
+    }
+
+    /// Durably retire a frozen source handle and rebuild its room plumbing.
+    /// This is deliberately synchronous: [`FrozenSeedRecovery::drop`] runs
+    /// when Tokio cancels a seed future, including during engine shutdown.
+    /// If a target epoch already exists, the target snapshot wins and `open`
+    /// takes the interrupted-flip repair; otherwise the complete source doc is
+    /// persisted with cursor zero whenever detached work still needs replay.
+    fn recover_frozen_generation_seed(&self, chat_id: &str, handle: &Arc<ChatDocHandle>) {
+        if handle.purged.load(Ordering::Acquire) {
+            return;
+        }
+        let mut parked = None;
+        let mut restore_source = false;
+        let recovered = {
+            let mut handles = lock(&self.inner.handles);
+            match handles.get(chat_id).cloned() {
+                None => true,
+                Some(current)
+                    if Arc::ptr_eq(&current, handle)
+                        && current.generation_frozen.load(Ordering::Acquire) =>
+                {
+                    let _lifecycle = lock(&current.sink_lifecycle);
+                    let _save = lock(&current.snapshot_save);
+                    drop(lock(&current.chat2_local_sub).take());
+                    parked = self.detach_chat2_client_locked(&current);
+                    match self.persist_cutover_snapshot_locked(&current, current.room_gen) {
+                        Ok(()) => {
+                            current.retired.store(true, Ordering::Release);
+                            drop(_save);
+                            drop(_lifecycle);
+                            handles.remove(chat_id);
+                            true
+                        }
+                        Err(err) => {
+                            tracing::error!(chat = %chat_id, error = %err,
+                                "frozen generation recovery save failed; restoring source room");
+                            restore_source = true;
+                            false
+                        }
+                    }
+                }
+                Some(_) => false,
+            }
+        };
+        self.carry_parked_updates(handle, parked);
+        if handle.purged.load(Ordering::Acquire) {
+            lock(&self.inner.chat2_pending_local).remove(chat_id);
+            let _ = self.inner.store.delete_snapshot(chat_id);
+            return;
+        }
+        let (row_exists, row_deleted) = match self.workspace() {
+            Some(workspace) => match workspace.chat(chat_id) {
+                Ok(Some(_)) => (true, false),
+                Ok(None) => {
+                    // A DeleteChat won while the seed was between its target
+                    // POST and registry flip. Publish the same terminal fence
+                    // as the workspace watcher now; never synthesize a new
+                    // local doc for a vanished row.
+                    self.purge_chat(chat_id);
+                    (false, true)
+                }
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err,
+                        "workspace row check failed during frozen generation recovery");
+                    (false, false)
+                }
+            },
+            None => (false, false),
+        };
+        if restore_source
+            && !row_deleted
+            && !handle.purged.load(Ordering::Acquire)
+            && !self.inner.shutdown.is_cancelled()
+        {
+            let restored = self.restore_frozen_generation_source(chat_id, handle);
+            if !restored {
+                tracing::error!(chat = %chat_id,
+                    "frozen generation source could not be restored");
+            }
+        }
+        if recovered
+            && row_exists
+            && !handle.purged.load(Ordering::Acquire)
+            && !self.inner.shutdown.is_cancelled()
+        {
+            if let Err(err) = self.open(chat_id) {
+                tracing::warn!(chat = %chat_id, error = %err,
+                    "room reopen after frozen generation recovery failed");
+            }
+        }
+    }
+
+    /// Move an already-thin lineage to the next room generation. Checkpoint
+    /// first, persist the new cursor namespace second, registry flip last.
+    /// Unlike the gen-1 migration this must not rebuild: doing so would fork
+    /// message identities already shared by chat2 readers.
+    async fn seed_thin_generation(
+        &self,
+        edge: &EdgeConfig,
+        chat_id: &str,
+        handle: &Arc<ChatDocHandle>,
+    ) -> Result<(), String> {
+        self.ensure_seed_row_alive(chat_id)?;
+        let target_gen = self.minted_room_gen();
+        if !lock(&self.inner.handles)
+            .get(chat_id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            return Err("source handle changed before generation seed".into());
+        }
+        if handle.room_gen >= target_gen {
+            return Ok(());
+        }
+        if self.seed_blocked(handle) || !Self::source_room_converged(handle) {
+            return Err("source room became active or fell behind before seed".into());
+        }
+        let vv_at_seed = handle.doc.doc().oplog_vv().encode();
+        let snapshot = handle.doc.export_snapshot().map_err(|e| e.to_string())?;
+        let bearer = edge.bearer().await.ok_or("signed out")?;
+        self.post_generation_seed_checkpoint(
+            edge,
+            &bearer,
+            chat_id,
+            target_gen,
+            &snapshot,
+            &vv_at_seed,
+            "generation seed",
+        )
+        .await?;
+
+        // From the freeze onward, a command executor and the generation
+        // coordinator are one transaction: an already-running command must
+        // publish its outcome first, and no new drain may start on the source
+        // lineage until it is either recovered or replaced.
+        let _drain = handle.command_drain.lock().await;
+
+        // Freeze the exact source handle before producing the authoritative
+        // snapshot. Pending local batches are moved outside the handle so the
+        // target client inherits them. The final caught-up check deliberately
+        // allows pending pushes: a local tail written during the first POST is
+        // precisely what this seal must preserve and re-checkpoint.
+        let parked = {
+            let handles = lock(&self.inner.handles);
+            let Some(current) = handles.get(chat_id).cloned() else {
+                return Err("source handle evicted during generation seed".into());
+            };
+            if !Arc::ptr_eq(&current, handle)
+                || current.room_gen >= target_gen
+                || current.generation_frozen.load(Ordering::Acquire)
+                || self.cutover_blocked_without_drain(&current)
+            {
+                return Err("source handle changed or became active during generation seed".into());
+            }
+            // Read client state before taking the sink lifecycle: the sync
+            // actor can hold its internal state mutex while entering the
+            // sink, so the opposite order would deadlock.
+            let client_slot = lock(&current.chat2);
+            let stats = client_slot
+                .as_ref()
+                .ok_or_else(|| "source room client vanished during generation seed".to_string())?
+                .try_stats()
+                .ok_or_else(|| "source room client was busy during generation seed".to_string())?;
+            let access_denied = client_slot
+                .as_ref()
+                .is_some_and(zeron_sync::ChatClient::access_denied);
+            if !stats.server_known || stats.cursor != stats.head_seq || access_denied {
+                return Err("source room fell behind during generation seed".into());
+            }
+            drop(client_slot);
+
+            let _lifecycle = lock(&current.sink_lifecycle);
+            if current.generation_frozen.load(Ordering::Acquire)
+                || self.cutover_blocked_without_drain(&current)
+                || lock(&current.chat2).is_none()
+            {
+                return Err("source handle became active while generation seed fenced".into());
+            }
+            current.generation_frozen.store(true, Ordering::Release);
+            // Take, then DROP: retaining the Subscription value would leave
+            // its callback live until the end of the function.
+            drop(lock(&current.chat2_local_sub).take());
+            self.detach_chat2_client_locked(&current)
+        };
+        let mut recovery = FrozenSeedRecovery::new(self, chat_id, handle);
+        self.carry_parked_updates(handle, parked);
+
+        // Establish a durable source-room recovery point before the next
+        // await. If a local batch was parked, the replay flag forces cursor
+        // zero so a process crash cannot discard that in-memory queue.
+        {
+            let handles = lock(&self.inner.handles);
+            let Some(current) = handles.get(chat_id).cloned() else {
+                return Err("frozen source handle disappeared before recovery save".into());
+            };
+            if !Arc::ptr_eq(&current, handle) || !current.generation_frozen.load(Ordering::Acquire)
+            {
+                return Err("frozen source handle changed before recovery save".into());
+            }
+            let _lifecycle = lock(&current.sink_lifecycle);
+            let _save = lock(&current.snapshot_save);
+            self.persist_cutover_snapshot_locked(&current, current.room_gen)
+                .map_err(|e| e.to_string())?;
+        }
+
+        let mut posted_vv = vv_at_seed;
+        let frozen_result = async {
+            // A cancelled Tokio task can finish its current synchronous sink
+            // call before observing abort. Require a snapshot whose VV stays
+            // unchanged across a scheduler turn, then revalidate it under the
+            // handle and snapshot-save gates.
+            for _ in 0..8 {
+                let mut sealed = None;
+                for _ in 0..32 {
+                    tokio::task::yield_now().await;
+                    let before = handle.doc.doc().oplog_vv().encode();
+                    let snapshot = handle.doc.export_snapshot().map_err(|e| e.to_string())?;
+                    let after = handle.doc.doc().oplog_vv().encode();
+                    tokio::task::yield_now().await;
+                    if before == after && handle.doc.doc().oplog_vv().encode() == after {
+                        sealed = Some((after, snapshot));
+                        break;
+                    }
+                }
+                let Some((sealed_vv, sealed_snapshot)) = sealed else {
+                    return Err("source doc did not stabilize after room client shutdown".into());
+                };
+
+                let recovery_saved = {
+                    let handles = lock(&self.inner.handles);
+                    let Some(current) = handles.get(chat_id) else {
+                        return Err(
+                            "frozen source handle disappeared during generation seed".into()
+                        );
+                    };
+                    if !Arc::ptr_eq(current, handle)
+                        || !current.generation_frozen.load(Ordering::Acquire)
+                        || current.room_gen >= target_gen
+                    {
+                        return Err("frozen source handle changed during generation seed".into());
+                    }
+                    if self.cutover_blocked_without_drain(current) {
+                        return Err(
+                            "source doc became active while generation seed was frozen".into()
+                        );
+                    }
+                    let _lifecycle = lock(&current.sink_lifecycle);
+                    let _save = lock(&current.snapshot_save);
+                    if current.doc.doc().oplog_vv().encode() != sealed_vv {
+                        false
+                    } else {
+                        self.persist_cutover_snapshot_locked(current, current.room_gen)
+                            .map_err(|e| e.to_string())?;
+                        true
+                    }
+                };
+                if !recovery_saved {
+                    continue;
+                }
+
+                if sealed_vv != posted_vv {
+                    self.post_generation_seed_checkpoint(
+                        edge,
+                        &bearer,
+                        chat_id,
+                        target_gen,
+                        &sealed_snapshot,
+                        &sealed_vv,
+                        "generation reseal",
+                    )
+                    .await?;
+                    posted_vv = sealed_vv.clone();
+                }
+
+                // Final seal, target-epoch save, registry flip, retirement,
+                // and removal share one handles critical section. `open()` can
+                // neither install a writer nor observe a half-cut-over cache.
+                let flip_result = {
+                    let mut handles = lock(&self.inner.handles);
+                    let Some(current) = handles.get(chat_id).cloned() else {
+                        return Err("frozen source handle disappeared before cutover".into());
+                    };
+                    if !Arc::ptr_eq(&current, handle)
+                        || !current.generation_frozen.load(Ordering::Acquire)
+                        || current.room_gen >= target_gen
+                        || self.cutover_blocked_without_drain(&current)
+                    {
+                        return Err("frozen source handle changed before cutover".into());
+                    }
+                    let _lifecycle = lock(&current.sink_lifecycle);
+                    let _save = lock(&current.snapshot_save);
+                    if current.purged.load(Ordering::Acquire) {
+                        return Err("chat was deleted before generation cutover".into());
+                    }
+                    if current.doc.doc().oplog_vv().encode() != posted_vv {
+                        None
+                    } else {
+                        current.retired.store(true, Ordering::Release);
+                        if let Err(err) = self.inner.store.save_snapshot_with_cursor(
+                            chat_id,
+                            &sealed_snapshot,
+                            0,
+                            target_gen,
+                        ) {
+                            current.retired.store(false, Ordering::Release);
+                            Some(Err(err.to_string()))
+                        } else if current.purged.load(Ordering::Acquire) {
+                            let _ = self.inner.store.delete_snapshot(chat_id);
+                            Some(Err("chat was deleted during generation cutover".into()))
+                        } else {
+                            drop(_save);
+                            let flipped = self
+                                .workspace()
+                                .ok_or_else(|| "no workspace host".to_string())
+                                .and_then(|workspace| {
+                                    workspace
+                                        .set_chat_room_gen(chat_id, target_gen)
+                                        .map_err(|e| e.to_string())
+                                });
+                            handles.remove(chat_id);
+                            Some(flipped)
+                        }
+                    }
+                };
+                match flip_result {
+                    None => continue,
+                    Some(Ok(true)) => return Ok(()),
+                    Some(Ok(false)) => {
+                        return Err("chat row vanished during generation seed".into());
+                    }
+                    Some(Err(err)) => return Err(err),
+                }
+            }
+            Err("source doc kept advancing during generation seed".into())
+        }
+        .await;
+
+        frozen_result?;
+        recovery.disarm();
+
+        // Keep the owning device attached to the newly seeded room even for a
+        // cold migration; this also installs the new cursor/push machinery.
+        self.open(chat_id).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn spawn_chat2_seed(&self, edge: EdgeConfig, chat_id: &str, handle: Arc<ChatDocHandle>) {
         {
             let mut seeding = lock(&self.inner.seeding);
             if !seeding.insert(chat_id.to_string()) {
@@ -1427,7 +2931,7 @@ impl DocHost {
         let host = self.clone();
         let chat = chat_id.to_string();
         self.spawn_worker(async move {
-            let outcome = host.seed_chat2(&edge, &chat, doc).await;
+            let outcome = host.seed_chat2(&edge, &chat, &handle).await;
             lock(&host.inner.seeding).remove(&chat);
             match outcome {
                 Ok(()) => {
@@ -1445,17 +2949,18 @@ impl DocHost {
         &self,
         edge: &EdgeConfig,
         chat_id: &str,
-        doc: Arc<SessionDoc>,
+        handle: &Arc<ChatDocHandle>,
     ) -> Result<(), String> {
-        use base64::Engine as _;
-        let vv_at_rebuild = doc.doc().oplog_vv().encode();
-        let rebuilt = zeron_doc::rebuild::rebuild_thin_doc(&doc).map_err(|e| e.to_string())?;
-        // The seed's own doc ref must be gone before the pinned re-check
-        // below: `pinned` reads `Arc::strong_count(&handle.doc) > 1`, and
-        // holding this clone made that true unconditionally — every seed
-        // aborted "became active mid-seed" and the cutover never flipped a
-        // single chat (v0.1.32 DOA).
-        drop(doc);
+        self.ensure_seed_row_alive(chat_id)?;
+        if !lock(&self.inner.handles)
+            .get(chat_id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            return Err("source handle changed before seed".into());
+        }
+        let vv_at_rebuild = handle.doc.doc().oplog_vv().encode();
+        let rebuilt =
+            zeron_doc::rebuild::rebuild_thin_doc(&handle.doc).map_err(|e| e.to_string())?;
         if !rebuilt.sidecar.is_empty() {
             // Sidecar PARKED (docs/chat2-sync.md A2): full outputs are not
             // uploaded; they survive in the rollback snapshot + run journal.
@@ -1468,95 +2973,96 @@ impl DocHost {
         let target_gen = self.minted_room_gen();
         // role=host claims the chat3 host-user slot when this bootstrap
         // checkpoint precedes the ws join (harmless on chat2 rooms).
-        let url = format!(
-            "{}/{}/{}/checkpoint?seqCovered=0&role=host",
-            edge.url.trim_end_matches('/'),
-            room_prefix(target_gen),
-            chat_id
-        );
-        let res = self
-            .inner
-            .http
-            .post(&url)
-            .bearer_auth(&bearer)
-            .header(
-                "x-chat2-frontier",
-                base64::engine::general_purpose::STANDARD.encode(&frontier),
-            )
-            .body(snapshot.clone())
-            .send()
-            .await
-            .map_err(|e| format!("seed checkpoint POST: {e}"))?;
-        if !res.status().is_success() {
-            return Err(format!("seed checkpoint HTTP {}", res.status()));
-        }
-        // PINNED RE-CHECK before anything irreversible (review B1): if a
-        // run/watcher attached during the rebuild+POST, abort — everything
-        // they write would fork away from the thin lineage. The orphan
-        // checkpoint in the chat2 room is harmless (wholly replaced by the
-        // next seed's seqCovered=0 POST); the chat stays on s2 and the next
-        // quiet open retries.
-        {
-            let handles = lock(&self.inner.handles);
-            if let Some(handle) = handles.get(chat_id) {
-                if self.seed_blocked(handle) {
-                    return Err("chat became active mid-seed; aborted before flip".into());
-                }
-                // Frontier seal (review B1's TOCTOU): ANY doc movement since
-                // the rebuild — a synced remote row, a local write that has
-                // already released its doc ref — means the thin lineage is
-                // missing it. Borrowed read (no Arc clone: that would trip
-                // the pinned check we just passed).
-                if handle.doc.doc().oplog_vv().encode() != vv_at_rebuild {
-                    return Err("doc advanced mid-seed; aborted before flip".into());
-                }
-            }
-        }
-        // Rollback copy of the fat lineage BEFORE the thin one replaces it —
-        // never overwriting an existing copy (review B5).
-        let rollback_id = format!("{chat_id}.pre-chat2");
-        if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None))
-            && let Ok(Some(old)) = self.inner.store.load_snapshot(chat_id)
-        {
-            let _ = self.inner.store.save_snapshot(&rollback_id, &old);
-        }
-        self.inner
-            .store
-            .save_snapshot_with_cursor(chat_id, &snapshot, 0, target_gen)
-            .map_err(|e| e.to_string())?;
-        // Registry flip LAST — the cutover signal every device dials by.
-        let flipped = self
-            .workspace()
-            .ok_or("no workspace host")?
-            .set_chat_room_gen(chat_id, target_gen)
-            .map_err(|e| e.to_string())?;
-        if !flipped {
-            return Err("chat row vanished during seed".into());
-        }
-        // The live handle still holds the FAT doc on the s2 room. Retire it:
-        // it must never persist again (it would clobber the thin lineage);
-        // drop it entirely when unpinned so the next open converges onto
-        // chat2. A pinned (watched/running) handle keeps working against s2
-        // until it closes — the flip is registry-side, readers already moved.
-        let dropped = {
+        self.post_generation_seed_checkpoint(
+            edge, &bearer, chat_id, target_gen, &snapshot, &frontier, "seed",
+        )
+        .await?;
+        let _drain = handle.command_drain.lock().await;
+        // Exact-handle seal + rollback + target save + registry flip + retire
+        // + removal are one critical section. Releasing the handles lock after
+        // only the VV check let a racing `open()` install a new gen-1 writer
+        // whose work was immediately stranded behind the thin lineage.
+        let flip_result = {
             let mut handles = lock(&self.inner.handles);
-            if let Some(handle) = handles.get(chat_id) {
-                handle.retired.store(true, Ordering::Relaxed);
-                // Drop unless a live WRITER holds the doc. Watchers do not
-                // keep the fat handle alive: their streams end with it and
-                // they resubscribe onto the chat2 adopt path (the same
-                // contract the cutover watcher enforces for remote flips).
-                if Arc::strong_count(&handle.doc) == 1 {
-                    handles.remove(chat_id);
-                    true
-                } else {
-                    false
+            let Some(current) = handles.get(chat_id).cloned() else {
+                return Err("source handle evicted during seed".into());
+            };
+            if !Arc::ptr_eq(&current, handle)
+                || current.room_gen >= target_gen
+                || current.generation_frozen.load(Ordering::Acquire)
+                || self.cutover_blocked_without_drain(&current)
+            {
+                return Err("source handle changed or became active during seed".into());
+            }
+            let _lifecycle = lock(&current.sink_lifecycle);
+            let save = lock(&current.snapshot_save);
+            // Re-check after waiting for an in-flight debounced save. Any doc
+            // movement since rebuild means the posted thin lineage omitted it.
+            if self.cutover_blocked_without_drain(&current)
+                || current.doc.doc().oplog_vv().encode() != vv_at_rebuild
+            {
+                return Err("doc advanced or became active during seed".into());
+            }
+
+            current.generation_frozen.store(true, Ordering::Release);
+            current.retired.store(true, Ordering::Release);
+            // Rollback copy of the fat lineage BEFORE the thin one replaces
+            // it, never overwriting the first (authoritative) copy.
+            let rollback_id = format!("{chat_id}.pre-chat2");
+            if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None))
+                && let Ok(Some(old)) = self.inner.store.load_snapshot(chat_id)
+            {
+                let _ = self.inner.store.save_snapshot(&rollback_id, &old);
+            }
+            if let Err(err) = self
+                .inner
+                .store
+                .save_snapshot_with_cursor(chat_id, &snapshot, 0, target_gen)
+            {
+                current.retired.store(false, Ordering::Release);
+                current.generation_frozen.store(false, Ordering::Release);
+                return Err(err.to_string());
+            }
+            if current.purged.load(Ordering::Acquire) {
+                let _ = self.inner.store.delete_snapshot(chat_id);
+                let _ = self.inner.store.delete_snapshot(&rollback_id);
+                return Err("chat was deleted during seed snapshot save".into());
+            }
+            drop(save);
+
+            // Registry flip LAST — the cutover signal every device dials by.
+            let flipped = self
+                .workspace()
+                .ok_or_else(|| "no workspace host".to_string())
+                .and_then(|workspace| {
+                    workspace
+                        .set_chat_room_gen(chat_id, target_gen)
+                        .map_err(|e| e.to_string())
+                });
+            handles.remove(chat_id);
+            flipped
+        };
+        let flipped = match flip_result {
+            Ok(flipped) => flipped,
+            Err(err) => {
+                // The target epoch is durable and the exact fat handle is no
+                // longer cached. Reopen only when the source row still exists;
+                // a missing row is terminal deletion, not a born-chat race.
+                match self.workspace().map(|workspace| workspace.chat(chat_id)) {
+                    Some(Ok(Some(_))) if !Self::chat_was_purged(&self.inner, chat_id) => {
+                        let _ = self.open(chat_id);
+                    }
+                    Some(Ok(None)) => self.purge_chat(chat_id),
+                    _ => {}
                 }
-            } else {
-                false
+                return Err(err);
             }
         };
-        tracing::info!(chat = %chat_id, handle_dropped = dropped, "chat2 seed complete");
+        if !flipped {
+            self.purge_chat(chat_id);
+            return Err("chat row vanished during seed".into());
+        }
+        tracing::info!(chat = %chat_id, handle_dropped = true, "chat2 seed complete");
         Ok(())
     }
 
@@ -1632,6 +3138,8 @@ impl DocHost {
         if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None)) {
             let _ = self.inner.store.save_snapshot(&rollback_id, &bytes);
         }
+        let _lifecycle = lock(&handle.sink_lifecycle);
+        handle.ensure_mutable().map_err(|e| e.to_string())?;
         // Re-check emptiness at the last instant: a run that started during
         // the room fetch must not get history interleaved under it.
         if !handle
@@ -1664,7 +3172,10 @@ impl DocHost {
             return;
         }
         let stats = match &*lock(&handle.chat2) {
-            Some(client) => client.stats(),
+            Some(client) => match client.try_stats() {
+                Some(stats) => stats,
+                None => return,
+            },
             None => return,
         };
         let Some(edge) = self.inner.config.edge.clone() else {
@@ -1717,71 +3228,170 @@ impl DocHost {
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
         };
-        let stats = match &*lock(&handle.chat2) {
-            Some(client) => client.stats(),
-            None => return,
-        };
-        let chat_id = handle.chat_id.clone();
-        if handle
-            .checkpointing
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+        if handle.generation_frozen.load(Ordering::Acquire)
+            || handle.retired.load(Ordering::Acquire)
+            || handle.purged.load(Ordering::Acquire)
         {
             return;
         }
-        let in_flight = handle.checkpointing.clone();
-        let Ok(snapshot) = handle.doc.export_snapshot() else {
-            in_flight.store(false, Ordering::Release);
-            return;
+        let should_spawn = {
+            let mut state = lock(&handle.checkpoint_state);
+            state.requested = true;
+            state.reason = reason;
+            if state.running {
+                false
+            } else {
+                state.running = true;
+                true
+            }
         };
-        let frontier = handle.doc.doc().oplog_vv().encode();
-        let seq_covered = stats.cursor;
+        if !should_spawn {
+            return;
+        }
+
+        const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(25);
+        const POST_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
+        const POST_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let host = self.clone();
+        let weak = Arc::downgrade(handle);
+        let state = handle.checkpoint_state.clone();
         let http = self.inner.http.clone();
-        let weak_note = Arc::downgrade(handle);
-        let prefix = room_prefix(handle.room_gen);
         self.spawn_worker(async move {
-            let Some(bearer) = edge.bearer().await else {
-                in_flight.store(false, Ordering::Release);
-                return;
-            };
-            // role=host: claims the chat3 host-user slot if the ws join's
-            // claim hasn't landed yet (no-op for the established host).
-            let url = format!(
-                "{}/{}/{}/checkpoint?seqCovered={}&role=host",
-                edge.url.trim_end_matches('/'),
-                prefix,
-                chat_id,
-                seq_covered
-            );
-            let size = snapshot.len() as u64;
-            match http
-                .post(&url)
-                .bearer_auth(&bearer)
-                .header(
-                    "x-chat2-frontier",
-                    base64::engine::general_purpose::STANDARD.encode(&frontier),
-                )
-                .body(snapshot)
-                .send()
-                .await
-            {
-                Ok(res) if res.status().is_success() => {
-                    tracing::info!(chat = %chat_id, seq_covered, reason, "chat2 checkpoint posted");
-                    if let Some(handle) = weak_note.upgrade()
-                        && let Some(client) = &*lock(&handle.chat2)
-                    {
-                        client.note_checkpoint(seq_covered, size);
+            loop {
+                // Claim one coalesced request. `running=false` and the empty
+                // request decision happen under the same mutex as producers,
+                // so a trigger can neither be lost at worker exit nor spawn a
+                // second uploader while this one still owns the slot.
+                let reason = {
+                    let mut checkpoint = lock(&state);
+                    if !checkpoint.requested {
+                        checkpoint.running = false;
+                        return;
                     }
-                }
-                Ok(res) => {
-                    tracing::warn!(chat = %chat_id, status = res.status().as_u16(),
-                        "chat2 checkpoint rejected");
-                }
-                Err(err) => {
-                    tracing::warn!(chat = %chat_id, error = %err, "chat2 checkpoint POST failed");
+                    checkpoint.requested = false;
+                    checkpoint.reason
+                };
+
+                let mut post_backoff = POST_RETRY_BASE;
+                loop {
+                    let Some(handle) = weak.upgrade() else {
+                        let mut checkpoint = lock(&state);
+                        checkpoint.requested = false;
+                        checkpoint.running = false;
+                        return;
+                    };
+                    let current = lock(&host.inner.handles)
+                        .get(&handle.chat_id)
+                        .is_some_and(|candidate| Arc::ptr_eq(candidate, &handle));
+                    if !current
+                        || handle.generation_frozen.load(Ordering::Acquire)
+                        || handle.retired.load(Ordering::Acquire)
+                        || handle.purged.load(Ordering::Acquire)
+                    {
+                        let mut checkpoint = lock(&state);
+                        checkpoint.requested = false;
+                        checkpoint.running = false;
+                        return;
+                    }
+
+                    // Never wait on ChatClient shared state while owning the
+                    // engine chat slot. Busy and a temporarily-empty slot are
+                    // retryable observations, not reasons to drop a recovery
+                    // event.
+                    let stats = lock(&handle.chat2)
+                        .as_ref()
+                        .and_then(zeron_sync::ChatClient::try_stats);
+                    let Some(stats) = stats else {
+                        drop(handle);
+                        tokio::time::sleep(BUSY_RETRY).await;
+                        continue;
+                    };
+                    let Ok(snapshot) = handle.doc.export_snapshot() else {
+                        drop(handle);
+                        tokio::time::sleep(post_backoff).await;
+                        post_backoff = (post_backoff * 2).min(POST_RETRY_CAP);
+                        continue;
+                    };
+                    let frontier = handle.doc.doc().oplog_vv().encode();
+                    let seq_covered = stats.cursor;
+                    let rejected_covered = stats.rejected;
+                    let size = snapshot.len() as u64;
+                    let chat_id = handle.chat_id.clone();
+                    let room_gen = handle.room_gen;
+                    drop(handle);
+
+                    let Some(bearer) = edge.bearer().await else {
+                        tokio::time::sleep(post_backoff).await;
+                        post_backoff = (post_backoff * 2).min(POST_RETRY_CAP);
+                        continue;
+                    };
+                    let still_current = weak.upgrade().is_some_and(|handle| {
+                        !handle.generation_frozen.load(Ordering::Acquire)
+                            && !handle.retired.load(Ordering::Acquire)
+                            && !handle.purged.load(Ordering::Acquire)
+                            && lock(&host.inner.handles)
+                                .get(&chat_id)
+                                .is_some_and(|candidate| Arc::ptr_eq(candidate, &handle))
+                    });
+                    if !still_current {
+                        let mut checkpoint = lock(&state);
+                        checkpoint.requested = false;
+                        checkpoint.running = false;
+                        return;
+                    }
+
+                    // role=host: claims the chat3 host-user slot if the ws
+                    // join's claim hasn't landed yet (no-op for the established
+                    // host).
+                    let url = format!(
+                        "{}/{}/{}/checkpoint?seqCovered={}&role=host",
+                        edge.url.trim_end_matches('/'),
+                        room_prefix(room_gen),
+                        chat_id,
+                        seq_covered
+                    );
+                    match http
+                        .post(&url)
+                        .bearer_auth(&bearer)
+                        .header(
+                            "x-chat2-frontier",
+                            base64::engine::general_purpose::STANDARD.encode(&frontier),
+                        )
+                        .body(snapshot)
+                        .send()
+                        .await
+                    {
+                        Ok(res) if res.status().is_success() => {
+                            tracing::info!(chat = %chat_id, seq_covered, reason,
+                                "chat2 checkpoint posted");
+                            if let Some(handle) = weak.upgrade() {
+                                handle
+                                    .checkpointed_rejections
+                                    .fetch_max(rejected_covered, Ordering::AcqRel);
+                                {
+                                    let client_slot = lock(&handle.chat2);
+                                    if let Some(client) = &*client_slot {
+                                        client.try_note_checkpoint(seq_covered, size);
+                                    }
+                                }
+                                host.maybe_clear_replay_from_zero(&handle);
+                            }
+                            break;
+                        }
+                        Ok(res) => {
+                            tracing::warn!(chat = %chat_id, status = res.status().as_u16(), reason,
+                                "chat2 checkpoint rejected; retrying");
+                        }
+                        Err(err) => {
+                            tracing::warn!(chat = %chat_id, error = %err, reason,
+                                "chat2 checkpoint POST failed; retrying");
+                        }
+                    }
+                    tokio::time::sleep(post_backoff).await;
+                    post_backoff = (post_backoff * 2).min(POST_RETRY_CAP);
                 }
             }
-            in_flight.store(false, Ordering::Release);
         });
     }
 
@@ -1822,48 +3432,71 @@ impl DocHost {
             if count <= WARM_DOC_CAP && estimate <= zeron_doc::DOC_LRU_BYTE_BUDGET {
                 return;
             }
-            let evicted = {
-                let mut handles = lock(&self.inner.handles);
-                match handles.get(&chat_id) {
-                    Some(handle) if !self.pinned(handle) => handles.remove(&chat_id),
-                    _ => None,
-                }
+            let candidate = lock(&self.inner.handles).get(&chat_id).cloned();
+            let Some(candidate) = candidate else { continue };
+            // Match the generation coordinator's order. An active executor
+            // owns the doc until its outcome has landed and is never evicted.
+            let Ok(_drain) = candidate.command_drain.try_lock() else {
+                continue;
             };
-            if let Some(handle) = evicted {
-                // Final flush outside the map lock; ≤1s of changes could be
-                // pending in the snapshot debounce.
-                self.save_snapshot(&handle);
-                tracing::debug!(chat = %handle.chat_id, "doc evicted (LRU)");
+            let evicted = (|| -> Result<_, EngineError> {
+                let mut handles = lock(&self.inner.handles);
+                let Some(current) = handles.get(&chat_id).cloned() else {
+                    return Ok(None);
+                };
+                if !Arc::ptr_eq(&current, &candidate) || self.pinned_without_drain(&current) {
+                    return Ok(None);
+                }
+                let _lifecycle = lock(&current.sink_lifecycle);
+                if self.pinned_without_drain(&current) {
+                    return Ok(None);
+                }
+                let _save = lock(&current.snapshot_save);
+                // The client replay queue is process-local. Persist the full
+                // thin lineage at cursor zero before detaching it so restart
+                // remains correct even if the host buffer never survives.
+                if current.room_gen >= crate::chat2_host::CHAT2_DOC_EPOCH {
+                    current.replay_from_zero.store(true, Ordering::Release);
+                }
+                self.persist_cutover_snapshot_locked(&current, current.room_gen)?;
+                current.retired.store(true, Ordering::Release);
+                drop(lock(&current.chat2_local_sub).take());
+                let parked = self.detach_chat2_client_locked(&current);
+                drop(_save);
+                drop(_lifecycle);
+                handles.remove(&chat_id);
+                Ok(Some((current, parked)))
+            })();
+            match evicted {
+                Ok(Some((handle, parked))) => {
+                    self.carry_parked_updates(&handle, parked);
+                    tracing::debug!(chat = %handle.chat_id, "doc evicted (LRU)");
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(chat = %chat_id, error = %err,
+                    "doc eviction snapshot failed; keeping handle resident"),
             }
         }
     }
 
-    /// Seed-specific activity gate: a live WRITER (a run's doc ref) or
-    /// pending host commands block a seed — watchers do NOT. Pure readers
+    /// Seed-specific activity gate: a live WRITER (a run's doc ref), an active
+    /// command drain, or pending host commands block a seed — watchers do NOT. Pure readers
     /// cannot lose writes, and the flip drops the handle so their streams
     /// end and resubscribe onto the chat2 adopt path. `pinned()` below keeps
     /// counting watchers for EVICTION, where a watched doc must stay
     /// resident. (Watcher-pinned seeds made "open a chat to look at it"
     /// self-defeating: the act of viewing blocked its own migration.)
     fn seed_blocked(&self, handle: &Arc<ChatDocHandle>) -> bool {
-        if Arc::strong_count(&handle.doc) > 1 {
+        if handle.command_drain.try_lock().is_err() {
             return true;
         }
-        if self.is_host(&handle.chat_id) {
-            let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
-            match handle.doc.read_commands() {
-                Ok(commands) => commands
-                    .iter()
-                    .any(|c| c.status == SessionCommandStatus::Pending && !is_processed(&c.id)),
-                // Unreadable ledger: never flip blind.
-                Err(_) => true,
-            }
-        } else {
-            false
-        }
+        self.cutover_blocked_without_drain(handle)
     }
 
-    fn pinned(&self, handle: &Arc<ChatDocHandle>) -> bool {
+    fn pinned_without_drain(&self, handle: &Arc<ChatDocHandle>) -> bool {
+        if handle.generation_frozen.load(Ordering::Acquire) {
+            return true;
+        }
         if handle.messages_tx.receiver_count() > 0 {
             return true;
         }
@@ -1910,7 +3543,9 @@ impl DocHost {
             .map(|h| {
                 (
                     h.chat_id.clone(),
-                    lock(&h.chat2).as_ref().map(|client| client.stats()),
+                    lock(&h.chat2)
+                        .as_ref()
+                        .and_then(zeron_sync::ChatClient::try_stats),
                 )
             })
             .collect();
@@ -1922,11 +3557,50 @@ impl DocHost {
     /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
     /// stream end; a racing writer keeps its orphaned doc until the run ends.
     pub fn purge_chat(&self, chat_id: &str) {
-        let removed = lock(&self.inner.handles).remove(chat_id);
-        drop(removed);
+        // Publish the process-lifetime tombstone before looking in `handles`.
+        // A migration may already have removed the source handle and be about
+        // to carry pending bytes or reopen; the shared Arc fence still reaches
+        // that detached task and makes every continuation fail closed.
+        let purge_fence = Self::purge_fence(&self.inner, chat_id);
+        purge_fence.store(true, Ordering::Release);
+        let detached = {
+            let mut handles = lock(&self.inner.handles);
+            let current = handles.get(chat_id).cloned();
+            match current {
+                Some(handle) => {
+                    let _lifecycle = lock(&handle.sink_lifecycle);
+                    handle.purged.store(true, Ordering::Release);
+                    handle.generation_frozen.store(true, Ordering::Release);
+                    handle.retired.store(true, Ordering::Release);
+                    handle.sink_generation.fetch_add(1, Ordering::AcqRel);
+                    drop(lock(&handle.chat2_local_sub).take());
+                    // Close the callback's client-vs-host-buffer decision and
+                    // clear both destinations before releasing the slot. A
+                    // callback that passed its first frozen check performs a
+                    // second one after this lock and cannot repopulate either.
+                    let client = lock(&handle.chat2).take();
+                    lock(&self.inner.chat2_pending_local).remove(chat_id);
+                    handles.remove(chat_id);
+                    client
+                }
+                None => {
+                    lock(&self.inner.chat2_pending_local).remove(chat_id);
+                    None
+                }
+            }
+        };
+        // Drop/abort the actor only after releasing engine lifecycle locks.
+        drop(detached);
         if let Err(err) = self.inner.store.delete_snapshot(chat_id) {
             tracing::warn!(chat = %chat_id, error = %err, "snapshot delete failed");
         }
+        let rollback_id = format!("{chat_id}.pre-chat2");
+        if let Err(err) = self.inner.store.delete_snapshot(&rollback_id) {
+            tracing::warn!(chat = %chat_id, error = %err, "rollback snapshot delete failed");
+        }
+        lock(&self.inner.seeding).remove(chat_id);
+        lock(&self.inner.seed_waiting).remove(chat_id);
+        lock(&self.inner.cutover_waiting).remove(chat_id);
     }
 
     /// Composer path: append an immutable pending command entry (rule 1). Durable by
@@ -1955,6 +3629,8 @@ impl DocHost {
         origin: Option<CommandOrigin>,
     ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
+        let _lifecycle = lock(&handle.sink_lifecycle);
+        handle.ensure_mutable()?;
         let id = new_id();
         let now = now_ms();
         let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
@@ -2023,7 +3699,12 @@ impl DocHost {
             .get(from_chat)
             .copied()
             .unwrap_or(0)
-            + 1;
+            .checked_add(1)
+            .ok_or_else(|| {
+                EngineError::Other(format!(
+                    "agent send chain too deep (>{MAX_AGENT_HOPS} hops) — refusing to ping-pong"
+                ))
+            })?;
         if hops > MAX_AGENT_HOPS {
             return Err(EngineError::Other(format!(
                 "agent send chain too deep (>{MAX_AGENT_HOPS} hops) — refusing to ping-pong"
@@ -2256,6 +3937,19 @@ impl DocHost {
     /// Drain pending commands (host-only): evaluate → mark processed BEFORE execute →
     /// execute → write the outcome as the sole outcome writer.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
+        let _drain = handle.command_drain.lock().await;
+        // A queued worker can lose the race to a room-generation cutover
+        // before it obtains the drain lock. Never execute or resolve commands
+        // against a detached source lineage.
+        let current = lock(&self.inner.handles)
+            .get(&handle.chat_id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle));
+        if !current
+            || handle.generation_frozen.load(Ordering::Acquire)
+            || handle.retired.load(Ordering::Acquire)
+        {
+            return;
+        }
         let Some(sessions) = self.sessions() else {
             return; // executor not wired yet (or retired); the set_sessions kick re-drains
         };
@@ -2332,6 +4026,16 @@ impl DocHost {
         status: SessionCommandStatus,
         resolution: Option<&str>,
     ) {
+        let _lifecycle = lock(&handle.sink_lifecycle);
+        if let Err(err) = handle.ensure_mutable() {
+            tracing::warn!(
+                chat = %handle.chat_id,
+                command = %command_id,
+                error = %err,
+                "command outcome skipped on retired room generation"
+            );
+            return;
+        }
         if let Err(err) = handle
             .doc
             .set_command_status(command_id, status, resolution)
@@ -2575,31 +4279,25 @@ impl DocHost {
     }
 
     fn save_snapshot(&self, handle: &ChatDocHandle) {
-        if handle.retired.load(Ordering::Relaxed) {
-            // A chat2 seed replaced this lineage on disk; persisting this
-            // handle's fat doc would clobber the thin one. But retired with
-            // NO thin lineage on disk (a stuck handle from the born-gen2
-            // race) means this doc is its transcript's only copy — skipping
-            // the save turned an app quit into total loss (2026-08-11);
-            // persist it, and let the adopt path convert it on reopen.
-            let thin_on_disk = matches!(
-                self.inner.store.load_snapshot_with_cursor(&handle.chat_id),
-                Ok(Some((_, _, epoch))) if epoch >= crate::chat2_host::CHAT2_DOC_EPOCH
-            );
-            if thin_on_disk {
-                return;
-            }
+        let _lifecycle = lock(&handle.sink_lifecycle);
+        if handle.purged.load(Ordering::Acquire) {
+            return;
         }
-        match handle.doc.export_snapshot() {
-            Ok(bytes) => {
-                handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
-                if let Err(err) = self.inner.store.save_snapshot(&handle.chat_id, &bytes) {
-                    tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot export failed");
-            }
+        self.maybe_clear_replay_from_zero_locked(handle);
+        let _save = lock(&handle.snapshot_save);
+        // Close the callback's client-vs-host-buffer decision while deciding
+        // replay durability. We deliberately do not inspect ChatClient's
+        // internal stats here: its actor enters the sink while holding that
+        // state mutex, which would invert the lifecycle order.
+        let _client_slot = lock(&handle.chat2);
+        if lock(&self.inner.chat2_pending_local)
+            .get(&handle.chat_id)
+            .is_some_and(|pending| !pending.is_empty())
+        {
+            handle.replay_from_zero.store(true, Ordering::Release);
+        }
+        if let Err(err) = self.persist_cutover_snapshot_locked(handle, handle.room_gen) {
+            tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
         }
     }
 
@@ -2616,8 +4314,10 @@ impl DocHost {
     pub fn disconnect_edge(&self) {
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
-            lock(&handle.chat2).take();
-            lock(&handle.chat2_local_sub).take();
+            // Keep the local subscription alive while SessionsEngine settles
+            // its active turns. New deltas then enter the host replay buffer
+            // even though account-scoped transport has already been revoked.
+            self.park_chat2_client(&handle);
         }
     }
 }
@@ -2682,6 +4382,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
     // mirror stays lazy — it materializes on the first watch attach.
     {
         let Some(handle) = weak.upgrade() else { return };
+        host.flush_buffered_chat2_updates(&handle);
         host.drain_commands(&handle).await;
     }
     let mut save_deadline: Option<tokio::time::Instant> = None;
@@ -2694,6 +4395,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 }
                 let Some(handle) = weak.upgrade() else { break };
                 handle.publish_messages_if_watched();
+                host.flush_buffered_chat2_updates(&handle);
                 host.drain_commands(&handle).await;
                 if save_deadline.is_none() {
                     save_deadline = Some(
@@ -2705,6 +4407,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
             _ = tokio::time::sleep_until(sleep_until), if save_deadline.is_some() => {
                 save_deadline = None;
                 let Some(handle) = weak.upgrade() else { break };
+                host.flush_buffered_chat2_updates(&handle);
                 host.save_snapshot(&handle);
                 // chat2 host duties ride the same quiesce tick (C3):
                 // threshold checkpoints + the tail sidecar publish.
@@ -2766,6 +4469,216 @@ mod agent_send_tests {
         }
     }
 
+    struct ChatMigrationEdge {
+        url: String,
+        checkpoint: Arc<Mutex<Option<Vec<u8>>>>,
+        checkpoints: Arc<Mutex<Vec<Vec<u8>>>>,
+        checkpoint_requests: Arc<AtomicUsize>,
+        first_checkpoint_started: Arc<tokio::sync::Notify>,
+        release_first_checkpoint: Arc<tokio::sync::Notify>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ChatMigrationEdge {
+        async fn start() -> Self {
+            Self::start_with_first_checkpoint_gate(false).await
+        }
+
+        async fn start_gated() -> Self {
+            Self::start_with_first_checkpoint_gate(true).await
+        }
+
+        async fn start_with_first_checkpoint_gate(gate_first: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let checkpoint = Arc::new(Mutex::new(None));
+            let checkpoints = Arc::new(Mutex::new(Vec::new()));
+            let checkpoint_requests = Arc::new(AtomicUsize::new(0));
+            let first_checkpoint_started = Arc::new(tokio::sync::Notify::new());
+            let release_first_checkpoint = Arc::new(tokio::sync::Notify::new());
+            let checkpoint_server = checkpoint.clone();
+            let checkpoints_server = checkpoints.clone();
+            let requests_server = checkpoint_requests.clone();
+            let started_server = first_checkpoint_started.clone();
+            let release_server = release_first_checkpoint.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let checkpoint = checkpoint_server.clone();
+                    let checkpoints = checkpoints_server.clone();
+                    let requests = requests_server.clone();
+                    let started = started_server.clone();
+                    let release = release_server.clone();
+                    tokio::spawn(async move {
+                        serve_chat_migration_request(
+                            stream,
+                            checkpoint,
+                            checkpoints,
+                            requests,
+                            started,
+                            release,
+                            gate_first,
+                        )
+                        .await;
+                    });
+                }
+            });
+            Self {
+                url,
+                checkpoint,
+                checkpoints,
+                checkpoint_requests,
+                first_checkpoint_started,
+                release_first_checkpoint,
+                task,
+            }
+        }
+
+        async fn wait_for_first_checkpoint(&self) {
+            loop {
+                let notified = self.first_checkpoint_started.notified();
+                if self.checkpoint_requests.load(Ordering::Acquire) > 0 {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release_first_checkpoint(&self) {
+            self.release_first_checkpoint.notify_one();
+        }
+    }
+
+    impl Drop for ChatMigrationEdge {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn read_http_request(
+        stream: &mut tokio::net::TcpStream,
+    ) -> Option<(String, String, Vec<u8>)> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]);
+        let mut lines = head.lines();
+        let mut request = lines.next()?.split_whitespace();
+        let method = request.next()?.to_string();
+        let target = request.next()?.to_string();
+        let content_length = lines
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < content_length {
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        body.truncate(content_length);
+        Some((method, target, body))
+    }
+
+    async fn write_http_response(
+        stream: &mut tokio::net::TcpStream,
+        status: &str,
+        content_type: &str,
+        body: &[u8],
+    ) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let head = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes()).await;
+        let _ = stream.write_all(body).await;
+    }
+
+    fn length_prefix(frame: Vec<u8>, output: &mut Vec<u8>) {
+        output.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        output.extend_from_slice(&frame);
+    }
+
+    async fn serve_chat_migration_request(
+        mut stream: tokio::net::TcpStream,
+        checkpoint: Arc<Mutex<Option<Vec<u8>>>>,
+        checkpoints: Arc<Mutex<Vec<Vec<u8>>>>,
+        checkpoint_requests: Arc<AtomicUsize>,
+        first_checkpoint_started: Arc<tokio::sync::Notify>,
+        release_first_checkpoint: Arc<tokio::sync::Notify>,
+        gate_first: bool,
+    ) {
+        let Some((method, target, body)) = read_http_request(&mut stream).await else {
+            return;
+        };
+        if method == "GET" && target.contains("/rows?") {
+            let mut response = Vec::new();
+            length_prefix(
+                zeron_sync::chat_frames::encode(
+                    zeron_sync::chat_frames::frame_type::STATE,
+                    &serde_json::json!({
+                        "headSeq": 1,
+                        "seqFloor": 0,
+                        "checkpointSeq": 0,
+                        "checkpointSize": 0,
+                        "rowCount": 1,
+                        "rowBytes": 1,
+                    }),
+                    &[],
+                ),
+                &mut response,
+            );
+            length_prefix(
+                zeron_sync::chat_frames::encode(
+                    zeron_sync::chat_frames::frame_type::ROWS_DONE,
+                    &serde_json::json!({ "headSeq": 1 }),
+                    &[],
+                ),
+                &mut response,
+            );
+            write_http_response(&mut stream, "200 OK", "application/octet-stream", &response).await;
+        } else if method == "POST" && target.contains("/checkpoint?") {
+            let request = checkpoint_requests.fetch_add(1, Ordering::AcqRel);
+            *lock(&checkpoint) = Some(body.clone());
+            lock(&checkpoints).push(body);
+            if request == 0 {
+                first_checkpoint_started.notify_waiters();
+                if gate_first {
+                    release_first_checkpoint.notified().await;
+                }
+            }
+            write_http_response(&mut stream, "200 OK", "application/json", b"{}").await;
+        } else {
+            // The WebSocket transport is intentionally unavailable; the test
+            // exercises the production HTTPS pull plus checkpoint path.
+            write_http_response(
+                &mut stream,
+                "503 Service Unavailable",
+                "application/json",
+                br#"{"error":"unavailable"}"#,
+            )
+            .await;
+        }
+    }
+
     fn host() -> (tempfile::TempDir, DocHost) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
@@ -2786,12 +4699,16 @@ mod agent_send_tests {
     }
 
     async fn local_first_chat_client() -> zeron_sync::ChatClient {
+        local_first_chat_client_at(0).await
+    }
+
+    async fn local_first_chat_client_at(cursor: u64) -> zeron_sync::ChatClient {
         zeron_sync::ChatClient::connect_via_transport(
             Arc::new(zeron_sync::StaticUrl("ws://127.0.0.1:9".into())),
             Arc::new(NoopChatSink),
             Arc::new(ClosedFetcher),
             "dev-a",
-            0,
+            cursor,
             Arc::new(ClosedTransport),
         )
         .await
@@ -2893,6 +4810,1427 @@ mod agent_send_tests {
             .unwrap()
             .into_pending_updates();
         assert_eq!(recovered, vec![vec![1, 2], vec![3, 4]]);
+    }
+
+    #[tokio::test]
+    async fn active_command_drain_finishes_before_registry_cutover_replaces_handle() {
+        let (_dir, host) = host();
+        let workspace = WorkspaceHost::open(
+            host.inner.store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("drain-cutover", None, Some("dev-a"), None, None)
+            .unwrap();
+        host.set_workspace(workspace.clone());
+        let old = host.open("drain-cutover").unwrap();
+        for _ in 0..64 {
+            if Arc::strong_count(&old.doc) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let drain = old.command_drain.lock().await;
+        assert!(workspace.set_chat_room_gen("drain-cutover", 3).unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert!(
+            lock(&host.inner.handles)
+                .get("drain-cutover")
+                .is_some_and(|current| Arc::ptr_eq(current, &old)),
+            "registry publication must not replace a handle during its command drain"
+        );
+        {
+            let _lifecycle = lock(&old.sink_lifecycle);
+            old.doc
+                .doc()
+                .get_map("meta")
+                .insert("drain-outcome", "committed-before-cutover")
+                .unwrap();
+            old.doc.doc().commit();
+        }
+        drop(drain);
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let replaced = lock(&host.inner.handles)
+                    .get("drain-cutover")
+                    .is_some_and(|current| current.room_gen == 3 && !Arc::ptr_eq(current, &old));
+                if replaced {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cutover did not resume after the active drain completed");
+        let replacement = lock(&host.inner.handles)
+            .get("drain-cutover")
+            .cloned()
+            .unwrap();
+        assert!(matches!(
+            replacement.doc.doc().get_map("meta").get("drain-outcome"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "committed-before-cutover"
+        ));
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn immediate_stale_open_parks_pending_and_persists_tail_at_target_cursor_zero() {
+        let (_dir, host) = host();
+        let workspace = WorkspaceHost::open(
+            host.inner.store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("stale-open", None, Some("dev-b"), None, None)
+            .unwrap();
+        // Install the workspace without its watcher so this test deterministically
+        // exercises open()'s synchronous stale-cache coordinator.
+        assert!(host.inner.workspace.set(workspace.clone()).is_ok());
+        let old = host.open("stale-open").unwrap();
+        for _ in 0..64 {
+            if Arc::strong_count(&old.doc) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let client = local_first_chat_client().await;
+        host.install_chat2_client(&old, client);
+        lock(&old.chat2)
+            .as_ref()
+            .unwrap()
+            .enqueue_update(vec![0xaa, 0xbb]);
+        {
+            let _lifecycle = lock(&old.sink_lifecycle);
+            old.doc
+                .doc()
+                .get_map("meta")
+                .insert("cached-tail", "must-survive")
+                .unwrap();
+            old.doc.doc().commit();
+        }
+
+        assert!(workspace.set_chat_room_gen("stale-open", 3).unwrap());
+        let replacement = host
+            .open("stale-open")
+            .expect("stale cached open must synchronously hand off and reopen");
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert_eq!(replacement.room_gen, 3);
+        assert_eq!(lock(&host.inner.handles).len(), 1);
+        assert!(
+            lock(&host.inner.chat2_pending_local)
+                .get("stale-open")
+                .is_some_and(|pending| pending.iter().any(|bytes| bytes == &[0xaa, 0xbb]))
+        );
+        let (persisted, cursor, epoch) = host
+            .inner
+            .store
+            .load_snapshot_with_cursor("stale-open")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (0, 3));
+        let raw = loro::LoroDoc::new();
+        raw.import(&persisted).unwrap();
+        assert!(matches!(
+            raw.get_map("meta").get("cached-tail"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "must-survive"
+        ));
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_frozen_seed_persists_source_tail_for_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("cancelled-seed", None, Some("dev-a"), None, None)
+            .unwrap();
+        let first_host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        assert!(first_host.inner.workspace.set(workspace.clone()).is_ok());
+        let source = first_host.open("cancelled-seed").unwrap();
+        source
+            .doc
+            .doc()
+            .get_map("meta")
+            .insert("tail-before-cancel", "durable")
+            .unwrap();
+        source.doc.doc().commit();
+        store
+            .save_snapshot_with_cursor(
+                "cancelled-seed",
+                &source.doc.export_snapshot().unwrap(),
+                37,
+                2,
+            )
+            .unwrap();
+        source.replay_from_zero.store(true, Ordering::Release);
+        {
+            let _lifecycle = lock(&source.sink_lifecycle);
+            source.generation_frozen.store(true, Ordering::Release);
+            source.sink_generation.fetch_add(1, Ordering::AcqRel);
+        }
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let guard_host = first_host.clone();
+        let guard_handle = source.clone();
+        let guard_task = tokio::spawn(async move {
+            let _recovery = FrozenSeedRecovery::new(&guard_host, "cancelled-seed", &guard_handle);
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        first_host.inner.shutdown.cancel();
+        guard_task.abort();
+        let _ = guard_task.await;
+
+        assert!(!lock(&first_host.inner.handles).contains_key("cancelled-seed"));
+        let (persisted, cursor, epoch) = store
+            .load_snapshot_with_cursor("cancelled-seed")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (0, 2));
+        let raw = loro::LoroDoc::new();
+        raw.import(&persisted).unwrap();
+        assert!(matches!(
+            raw.get_map("meta").get("tail-before-cancel"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "durable"
+        ));
+        first_host.shutdown_workers().await;
+        drop(source);
+        drop(first_host);
+
+        let second_host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        assert!(second_host.inner.workspace.set(workspace).is_ok());
+        let reopened = second_host.open("cancelled-seed").unwrap();
+        assert!(matches!(
+            reopened.doc.doc().get_map("meta").get("tail-before-cancel"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "durable"
+        ));
+        second_host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn frozen_recovery_store_failure_restores_writer_sync_and_cursor_zero_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("recovery-save-failure", None, Some("dev-a"), None, None)
+            .unwrap();
+        let edge = EdgeConfig::with_static_token("http://127.0.0.1:9", "token");
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(edge),
+            },
+        );
+        host.set_workspace(workspace);
+        let handle = host.open("recovery-save-failure").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while lock(&handle.chat2).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("source client never installed");
+        {
+            let writer = handle.writer_doc().unwrap();
+            writer
+                .doc()
+                .get_map("meta")
+                .insert("tail-before-failed-recovery", "must-survive")
+                .unwrap();
+            writer.doc().commit();
+        }
+
+        // Model the exact FrozenSeedRecovery entry state: the source is still
+        // mapped but its callback/client have already been detached.
+        let parked = {
+            let _lifecycle = lock(&handle.sink_lifecycle);
+            handle.generation_frozen.store(true, Ordering::Release);
+            drop(lock(&handle.chat2_local_sub).take());
+            host.detach_chat2_client_locked(&handle)
+        };
+        host.carry_parked_updates(&handle, parked);
+        host.inner
+            .injected_cutover_store_failures
+            .store(1, Ordering::Release);
+
+        host.recover_frozen_generation_seed("recovery-save-failure", &handle);
+
+        assert!(
+            lock(&host.inner.handles)
+                .get("recovery-save-failure")
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+        );
+        assert!(!handle.generation_frozen.load(Ordering::Acquire));
+        assert!(!handle.retired.load(Ordering::Acquire));
+        assert!(lock(&handle.chat2_local_sub).is_some());
+        assert!(handle.replay_from_zero.load(Ordering::Acquire));
+        assert!(
+            lock(&host.inner.chat2_pending_local)
+                .get("recovery-save-failure")
+                .is_some_and(|pending| !pending.is_empty()),
+            "complete replay must be queued before the writer is unfrozen"
+        );
+        assert!(Arc::ptr_eq(
+            &host.open("recovery-save-failure").unwrap(),
+            &handle
+        ));
+        {
+            let writer = handle.writer_doc().unwrap();
+            writer
+                .doc()
+                .get_map("meta")
+                .insert("write-after-recovery", "accepted")
+                .unwrap();
+            writer.doc().commit();
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let durable = store
+                    .load_snapshot_with_cursor("recovery-save-failure")
+                    .unwrap();
+                let recovered = durable.is_some_and(|(bytes, cursor, epoch)| {
+                    if cursor != 0 || epoch != 2 {
+                        return false;
+                    }
+                    let raw = loro::LoroDoc::new();
+                    raw.import(&bytes).is_ok()
+                        && matches!(
+                            raw.get_map("meta").get("tail-before-failed-recovery"),
+                            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                                if value.as_ref() == "must-survive"
+                        )
+                        && matches!(
+                            raw.get_map("meta").get("write-after-recovery"),
+                            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                                if value.as_ref() == "accepted"
+                        )
+                });
+                if recovered {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restored source tail never became cursor-zero durable");
+        host.shutdown_workers().await;
+    }
+
+    #[test]
+    fn detached_old_sink_cannot_overwrite_newer_epoch_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let old_doc = Arc::new(SessionDoc::init("late-sink").unwrap());
+        let lifecycle = Arc::new(Mutex::new(()));
+        let generation = Arc::new(AtomicU64::new(0));
+        let frozen = Arc::new(AtomicBool::new(false));
+        let replay = Arc::new(AtomicBool::new(false));
+        let replay_fence = Arc::new(Mutex::new(()));
+        let sink = crate::chat2_host::EngineChatSink::new_with_lifecycle(
+            &old_doc,
+            store.clone(),
+            "late-sink",
+            2,
+            7,
+            2,
+            lifecycle.clone(),
+            generation.clone(),
+            frozen.clone(),
+            replay,
+            replay_fence,
+        );
+        sink.advance_cursor(8);
+
+        let target = SessionDoc::init("late-sink").unwrap();
+        target
+            .doc()
+            .get_map("meta")
+            .insert("target-epoch", "three")
+            .unwrap();
+        target.doc().commit();
+        {
+            let _gate = lock(&lifecycle);
+            frozen.store(true, Ordering::Release);
+            generation.fetch_add(1, Ordering::AcqRel);
+            store
+                .save_snapshot_with_cursor("late-sink", &target.export_snapshot().unwrap(), 0, 3)
+                .unwrap();
+            frozen.store(false, Ordering::Release);
+        }
+
+        // A detached HTTP task may finish after the replacement is live. Its
+        // captured generation must make both cursor and bytes writes inert.
+        sink.advance_cursor(999);
+        let (persisted, cursor, epoch) = store
+            .load_snapshot_with_cursor("late-sink")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (0, 3));
+        let raw = loro::LoroDoc::new();
+        raw.import(&persisted).unwrap();
+        assert!(matches!(
+            raw.get_map("meta").get("target-epoch"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "three"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cursor_nonzero_disconnect_persists_full_replay_for_same_generation_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("disconnect-replay", None, Some("dev-a"), None, None)
+            .unwrap();
+        let initial = SessionDoc::init("disconnect-replay").unwrap();
+        store
+            .save_snapshot_with_cursor(
+                "disconnect-replay",
+                &initial.export_snapshot().unwrap(),
+                41,
+                2,
+            )
+            .unwrap();
+        let edge = EdgeConfig::with_static_token("http://127.0.0.1:9", "token");
+        let first_host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(edge.clone()),
+            },
+        );
+        first_host.set_workspace(workspace.clone());
+        let first = first_host.open("disconnect-replay").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while lock(&first.chat2).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first client did not install");
+        first
+            .doc
+            .doc()
+            .get_map("meta")
+            .insert("pending-before-disconnect", "replay-me")
+            .unwrap();
+        first.doc.doc().commit();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let client_pending = lock(&first.chat2)
+                    .as_ref()
+                    .is_some_and(|client| client.stats().pending_pushes > 0);
+                let host_pending = lock(&first_host.inner.chat2_pending_local)
+                    .get("disconnect-replay")
+                    .is_some_and(|pending| !pending.is_empty());
+                if client_pending || host_pending {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("local update never entered a replay queue");
+        first_host.disconnect_edge();
+        first_host.flush_all();
+        let (_, cursor, epoch) = store
+            .load_snapshot_with_cursor("disconnect-replay")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (0, 2));
+        first_host.shutdown_workers().await;
+        drop(first);
+        drop(first_host);
+
+        let second_host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(edge),
+            },
+        );
+        second_host.set_workspace(workspace);
+        let reopened = second_host.open("disconnect-replay").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let ready = lock(&reopened.chat2)
+                    .as_ref()
+                    .is_some_and(|client| client.stats().pending_pushes > 0);
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cursor-zero restart did not enqueue the complete doc");
+        let client = lock(&reopened.chat2).take().unwrap();
+        let updates = client.into_pending_updates();
+        let replay = loro::LoroDoc::new();
+        for update in updates {
+            replay.import(&update).unwrap();
+        }
+        assert!(matches!(
+            replay.get_map("meta").get("pending-before-disconnect"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "replay-me"
+        ));
+        second_host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn replay_clear_persists_the_exact_lower_cursor_before_clearing() {
+        let (_dir, host) = host();
+        let handle = host.open("reset-clear").unwrap();
+        let client = local_first_chat_client_at(5).await;
+        host.install_chat2_client(&handle, client);
+        handle.replay_from_zero.store(true, Ordering::Release);
+        host.inner
+            .store
+            .save_snapshot_with_cursor(
+                "reset-clear",
+                &handle.doc.export_snapshot().unwrap(),
+                41,
+                handle.room_gen,
+            )
+            .unwrap();
+
+        host.maybe_clear_replay_from_zero(&handle);
+
+        assert!(!handle.replay_from_zero.load(Ordering::Acquire));
+        let (_, cursor, epoch) = host
+            .inner
+            .store
+            .load_snapshot_with_cursor("reset-clear")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (5, handle.room_gen));
+        host.save_snapshot(&handle);
+        let (_, cursor, epoch) = host
+            .inner
+            .store
+            .load_snapshot_with_cursor("reset-clear")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (5, handle.room_gen));
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_only_replay_clear_preserves_the_sink_owned_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("checkpoint-epoch", None, Some("dev-a"), None, None)
+            .unwrap();
+        workspace.set_chat_room_gen("checkpoint-epoch", 3).unwrap();
+        let source = SessionDoc::init("checkpoint-epoch").unwrap();
+        store
+            .save_snapshot_with_cursor("checkpoint-epoch", &source.export_snapshot().unwrap(), 0, 2)
+            .unwrap();
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        host.set_workspace(workspace);
+        let handle = host.open("checkpoint-epoch").unwrap();
+        assert_eq!(handle.room_gen, 3);
+        host.install_chat2_client(&handle, local_first_chat_client_at(5).await);
+        handle.replay_from_zero.store(true, Ordering::Release);
+        // A successful checkpoint may cover a rejected replay without an own
+        // row ack. Clearing cursor-zero is then safe, but promoting epoch 2 ->
+        // 3 is not: the live sink still owns epoch 2 until advance_cursor.
+        handle
+            .checkpointed_rejections
+            .store(u64::MAX, Ordering::Release);
+
+        host.maybe_clear_replay_from_zero(&handle);
+
+        assert!(!handle.replay_from_zero.load(Ordering::Acquire));
+        let (_, cursor, epoch) = store
+            .load_snapshot_with_cursor("checkpoint-epoch")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (5, 2));
+        host.save_snapshot(&handle);
+        let (_, cursor, epoch) = store
+            .load_snapshot_with_cursor("checkpoint-epoch")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (5, 2));
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn replay_clear_never_overwrites_a_newer_snapshot_epoch() {
+        let (_dir, host) = host();
+        let handle = host.open("newer-clear").unwrap();
+        let client = local_first_chat_client_at(5).await;
+        host.install_chat2_client(&handle, client);
+        handle.replay_from_zero.store(true, Ordering::Release);
+        host.inner
+            .store
+            .save_snapshot_with_cursor(
+                "newer-clear",
+                &handle.doc.export_snapshot().unwrap(),
+                9,
+                handle.room_gen + 1,
+            )
+            .unwrap();
+
+        host.maybe_clear_replay_from_zero(&handle);
+
+        assert!(handle.replay_from_zero.load(Ordering::Acquire));
+        let (_, cursor, epoch) = host
+            .inner
+            .store
+            .load_snapshot_with_cursor("newer-clear")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (9, handle.room_gen + 1));
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_callback_dirty_mark_cannot_be_overwritten_while_waiting_for_chat_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("replay-fence", None, Some("dev-a"), None, None)
+            .unwrap();
+        let initial = SessionDoc::init("replay-fence").unwrap();
+        store
+            .save_snapshot_with_cursor("replay-fence", &initial.export_snapshot().unwrap(), 5, 2)
+            .unwrap();
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:9", "token")),
+            },
+        );
+        host.set_workspace(workspace);
+        let handle = host.open("replay-fence").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while lock(&handle.chat2).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("local-first client did not install");
+
+        let client_slot = lock(&handle.chat2);
+        let writer = handle.doc.clone();
+        let writer_task = std::thread::spawn(move || {
+            writer
+                .doc()
+                .get_map("meta")
+                .insert("callback-race", "durable")
+                .unwrap();
+            writer.doc().commit();
+        });
+        for _ in 0..200 {
+            if handle.replay_from_zero.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(handle.replay_from_zero.load(Ordering::Acquire));
+
+        let save_host = host.clone();
+        let save_handle = handle.clone();
+        let save_task = std::thread::spawn(move || save_host.save_snapshot(&save_handle));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(client_slot);
+        writer_task.join().unwrap();
+        save_task.join().unwrap();
+
+        assert!(handle.replay_from_zero.load(Ordering::Acquire));
+        let (_, cursor, epoch) = store
+            .load_snapshot_with_cursor("replay-fence")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (0, handle.room_gen));
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn purge_fences_a_removed_handle_recovery_and_late_sink() {
+        let (_dir, host) = host();
+        let workspace = WorkspaceHost::open(
+            host.inner.store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("purge-race", None, Some("dev-a"), None, None)
+            .unwrap();
+        host.set_workspace(workspace);
+        let handle = host.open("purge-race").unwrap();
+        let sink = crate::chat2_host::EngineChatSink::new_with_lifecycle(
+            &handle.doc,
+            host.inner.store.clone(),
+            "purge-race",
+            handle.room_gen,
+            3,
+            handle.room_gen,
+            handle.sink_lifecycle.clone(),
+            handle.sink_generation.clone(),
+            handle.generation_frozen.clone(),
+            handle.replay_from_zero.clone(),
+            handle.replay_fence.clone(),
+        );
+        let client = local_first_chat_client().await;
+        client.enqueue_update(vec![0xaa]);
+        host.install_chat2_client(&handle, client);
+        {
+            let _lifecycle = lock(&handle.sink_lifecycle);
+            handle.generation_frozen.store(true, Ordering::Release);
+        }
+        // Model the narrow seed window after source removal but before its
+        // cancellation guard decides whether to carry/reopen.
+        lock(&host.inner.handles).remove("purge-race");
+
+        host.purge_chat("purge-race");
+        let detached = lock(&handle.chat2).take();
+        host.carry_parked_updates(&handle, detached);
+        host.recover_frozen_generation_seed("purge-race", &handle);
+        sink.advance_cursor(99);
+        sink.apply_row(&[0xff], 100);
+
+        assert!(!lock(&host.inner.handles).contains_key("purge-race"));
+        assert!(!lock(&host.inner.chat2_pending_local).contains_key("purge-race"));
+        assert!(
+            host.inner
+                .store
+                .load_snapshot_with_cursor("purge-race")
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.open("purge-race").is_err());
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn frozen_handle_rejects_new_writer_leases() {
+        let (_dir, host) = host();
+        let handle = host.open("writer-freeze").unwrap();
+        {
+            let _lifecycle = lock(&handle.sink_lifecycle);
+            handle.generation_frozen.store(true, Ordering::Release);
+        }
+        assert!(handle.writer_doc().is_err());
+        host.purge_chat("writer-freeze");
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_request_survives_a_temporarily_empty_client_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("checkpoint-retry", None, Some("dev-a"), None, None)
+            .unwrap();
+        let edge_server = ChatMigrationEdge::start().await;
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(EdgeConfig::with_static_token(&edge_server.url, "token")),
+            },
+        );
+        host.set_workspace(workspace);
+        let handle = host.open("checkpoint-retry").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while lock(&handle.chat2).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("client never installed");
+        let client = lock(&handle.chat2).take().unwrap();
+
+        host.spawn_chat2_checkpoint(&handle, "busy-regression");
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        assert_eq!(edge_server.checkpoint_requests.load(Ordering::Acquire), 0);
+        host.install_chat2_client(&handle, client);
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while edge_server.checkpoint_requests.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("checkpoint request was dropped while the client slot was unavailable");
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn registry_row_removal_purges_warm_handle_pending_and_snapshot() {
+        let (_dir, host) = host();
+        let workspace = WorkspaceHost::open(
+            host.inner.store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("remote-delete", None, Some("dev-a"), None, None)
+            .unwrap();
+        host.set_workspace(workspace.clone());
+        let handle = host.open("remote-delete").unwrap();
+        host.save_snapshot(&handle);
+        DocHost::buffer_chat2_update(&host.inner, "remote-delete", vec![1, 2, 3]);
+
+        workspace.delete_chat("remote-delete").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if DocHost::chat_was_purged(&host.inner, "remote-delete")
+                    && !lock(&host.inner.handles).contains_key("remote-delete")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("registry row removal did not purge the local lifecycle");
+        assert!(!lock(&host.inner.chat2_pending_local).contains_key("remote-delete"));
+        assert!(
+            host.inner
+                .store
+                .load_snapshot_with_cursor("remote-delete")
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.open("remote-delete").is_err());
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn gen1_seed_does_not_reopen_after_row_is_deleted_mid_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("deleted-seed", None, Some("dev-a"), None, None)
+            .unwrap();
+        workspace.set_chat_room_gen("deleted-seed", 1).unwrap();
+        let edge_server = ChatMigrationEdge::start_gated().await;
+        let edge = EdgeConfig::with_static_token(&edge_server.url, "token");
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(edge.clone()),
+            },
+        );
+        host.set_workspace(workspace.clone());
+        let handle = host.open("deleted-seed").unwrap();
+        let seed_host = host.clone();
+        let seed_handle = handle.clone();
+        let seed = tokio::spawn(async move {
+            seed_host
+                .seed_chat2(&edge, "deleted-seed", &seed_handle)
+                .await
+        });
+        edge_server.wait_for_first_checkpoint().await;
+        workspace.delete_chat("deleted-seed").unwrap();
+        edge_server.release_first_checkpoint();
+
+        let err = seed
+            .await
+            .unwrap()
+            .expect_err("deleted row must abort seed");
+        assert!(err.contains("vanished") || err.contains("deleted"), "{err}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(DocHost::chat_was_purged(&host.inner, "deleted-seed"));
+        assert!(!lock(&host.inner.handles).contains_key("deleted-seed"));
+        assert!(
+            store
+                .load_snapshot_with_cursor("deleted-seed")
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.open("deleted-seed").is_err());
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn live_writer_cutover_retries_automatically_after_quiesce() {
+        let (_dir, host) = host();
+        let workspace = WorkspaceHost::open(
+            host.inner.store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("live-cutover", None, Some("dev-a"), None, None)
+            .unwrap();
+        host.set_workspace(workspace.clone());
+
+        let old = host.open("live-cutover").unwrap();
+        assert_eq!(old.room_gen, 2);
+        let live_writer = old.writer_doc().unwrap();
+        live_writer
+            .doc()
+            .get_map("meta")
+            .insert("last-live-write", "must survive")
+            .unwrap();
+        live_writer.doc().commit();
+        assert!(workspace.set_chat_room_gen("live-cutover", 3).unwrap());
+
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert!(
+            lock(&host.inner.handles)
+                .get("live-cutover")
+                .is_some_and(|current| Arc::ptr_eq(current, &old)),
+            "the old handle must remain installed while its writer is live"
+        );
+
+        drop(live_writer);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let replaced = lock(&host.inner.handles)
+                    .get("live-cutover")
+                    .is_some_and(|current| current.room_gen == 3 && !Arc::ptr_eq(current, &old));
+                if replaced {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("stale live handle was not replaced after writer quiesced");
+        let replacement = lock(&host.inner.handles)
+            .get("live-cutover")
+            .cloned()
+            .unwrap();
+        assert!(matches!(
+            replacement.doc.doc().get_map("meta").get("last-live-write"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "must survive"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cold_chat2_migration_seeds_chat3_before_registry_flip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("cold-migration", None, Some("dev-a"), None, None)
+            .unwrap();
+
+        let source = SessionDoc::init("cold-migration").unwrap();
+        source
+            .push_message(&SessionMessageEntry {
+                id: "m-cold".into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "survives the generation move".into(),
+                }],
+                created_at: 1,
+                device_id: "dev-a".into(),
+                user_id: Some("alice".into()),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+            })
+            .unwrap();
+        store
+            .save_snapshot_with_cursor("cold-migration", &source.export_snapshot().unwrap(), 1, 2)
+            .unwrap();
+
+        let edge_server = ChatMigrationEdge::start().await;
+        let edge = EdgeConfig::with_static_token(&edge_server.url, "token");
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(edge.clone()),
+            },
+        );
+        host.set_workspace(workspace.clone());
+        let old = host.open("cold-migration").unwrap();
+        assert_eq!(old.room_gen, 2);
+        host.spawn_room_seed_when_quiet(edge, "cold-migration", &old);
+
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                if workspace
+                    .chat("cold-migration")
+                    .unwrap()
+                    .is_some_and(|chat| chat.room_gen == Some(3))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cold chat never completed the checkpoint-first migration");
+
+        let checkpoint = lock(&edge_server.checkpoint)
+            .clone()
+            .expect("chat3 checkpoint must exist before the row can flip");
+        let raw = loro::LoroDoc::new();
+        raw.import(&checkpoint).unwrap();
+        let migrated = SessionDoc::from_doc(raw);
+        assert!(
+            migrated
+                .read_entries()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == "m-cold"),
+            "the seeded checkpoint must contain the chat2 transcript"
+        );
+        let (_, cursor, epoch) = store
+            .load_snapshot_with_cursor("cold-migration")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (0, 3));
+        assert!(
+            lock(&host.inner.handles)
+                .get("cold-migration")
+                .is_some_and(|handle| handle.room_gen == 3),
+            "the owner must reopen onto chat3 after the cold migration"
+        );
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn cold_chat2_migration_reseals_tail_and_carries_pending_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("reseal-migration", None, Some("dev-a"), None, None)
+            .unwrap();
+
+        let source = SessionDoc::init("reseal-migration").unwrap();
+        source
+            .doc()
+            .get_map("meta")
+            .insert("before-seed", "present")
+            .unwrap();
+        source.doc().commit();
+        store
+            .save_snapshot_with_cursor("reseal-migration", &source.export_snapshot().unwrap(), 1, 2)
+            .unwrap();
+
+        let edge_server = ChatMigrationEdge::start_gated().await;
+        let edge = EdgeConfig::with_static_token(&edge_server.url, "token");
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(edge.clone()),
+            },
+        );
+        host.set_workspace(workspace.clone());
+        let old = host.open("reseal-migration").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !DocHost::source_room_converged(&old) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("source room never converged");
+
+        let seed_host = host.clone();
+        let seed_edge = edge.clone();
+        let seed_handle = old.clone();
+        let seed = tokio::spawn(async move {
+            seed_host
+                .seed_thin_generation(&seed_edge, "reseal-migration", &seed_handle)
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            edge_server.wait_for_first_checkpoint(),
+        )
+        .await
+        .expect("first target checkpoint never started");
+
+        // This commit lands after the body of the first target checkpoint was
+        // already read by the server. Keep its source-room push unacknowledged
+        // so the cutover must transfer both the doc tail and pending batch.
+        old.doc
+            .doc()
+            .get_map("meta")
+            .insert("tail-during-checkpoint", "must-survive")
+            .unwrap();
+        old.doc.doc().commit();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let pending = lock(&old.chat2)
+                    .as_ref()
+                    .map(|client| client.stats().pending_pushes)
+                    .unwrap_or(0);
+                if pending > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("tail update never entered the source pending queue");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        edge_server.release_first_checkpoint();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), seed)
+            .await
+            .expect("generation seed timed out")
+            .expect("generation seed task panicked")
+            .expect("generation seed failed");
+
+        let checkpoints = lock(&edge_server.checkpoints).clone();
+        assert_eq!(
+            checkpoints.len(),
+            2,
+            "a tail after the first POST must force one reseal POST"
+        );
+        let meta_value = |snapshot: &[u8], key: &str| {
+            let raw = loro::LoroDoc::new();
+            raw.import(snapshot).unwrap();
+            match raw.get_map("meta").get(key) {
+                Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value))) => {
+                    Some(value.to_string())
+                }
+                _ => None,
+            }
+        };
+        assert_eq!(meta_value(&checkpoints[0], "tail-during-checkpoint"), None);
+        assert_eq!(
+            meta_value(&checkpoints[1], "tail-during-checkpoint").as_deref(),
+            Some("must-survive")
+        );
+
+        let (persisted, cursor, epoch) = store
+            .load_snapshot_with_cursor("reseal-migration")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (0, 3));
+        assert_eq!(
+            meta_value(&persisted, "tail-during-checkpoint").as_deref(),
+            Some("must-survive")
+        );
+        let replacement = lock(&host.inner.handles)
+            .get("reseal-migration")
+            .cloned()
+            .expect("target handle reopened");
+        assert_eq!(replacement.room_gen, 3);
+        assert!(matches!(
+            replacement.doc.doc().get_map("meta").get("tail-during-checkpoint"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "must-survive"
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let pending = lock(&replacement.chat2)
+                    .as_ref()
+                    .map(|client| client.stats().pending_pushes)
+                    .unwrap_or(0);
+                if pending >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("target client did not inherit full-log plus source pending batches");
+        let target_client = lock(&replacement.chat2)
+            .take()
+            .expect("target client installed");
+        let pending = target_client.into_pending_updates();
+        assert!(pending.len() >= 2);
+        let replay = loro::LoroDoc::new();
+        for update in pending {
+            replay.import(&update).unwrap();
+        }
+        assert!(matches!(
+            replay.get_map("meta").get("tail-during-checkpoint"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "must-survive"
+        ));
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn gen1_seed_rejects_a_replacement_handle_before_local_cutover() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "dev-a".into(),
+                device_name: "Device A".into(),
+                platform: "test".into(),
+                org_id: "org-a".into(),
+                user_id: "alice".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_chat("gen1-exact", None, Some("dev-a"), None, None)
+            .unwrap();
+        assert!(workspace.set_chat_room_gen("gen1-exact", 1).unwrap());
+        let source = SessionDoc::init("gen1-exact").unwrap();
+        source
+            .doc()
+            .get_map("meta")
+            .insert("fat-lineage", "source")
+            .unwrap();
+        source.doc().commit();
+        store
+            .save_snapshot("gen1-exact", &source.export_snapshot().unwrap())
+            .unwrap();
+
+        let edge_server = ChatMigrationEdge::start_gated().await;
+        let edge = EdgeConfig::with_static_token(&edge_server.url, "token");
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "dev-a".into(),
+                user_id: "alice".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(edge.clone()),
+            },
+        );
+        host.set_workspace(workspace.clone());
+        let original = host.open("gen1-exact").unwrap();
+        assert_eq!(original.room_gen, 1);
+
+        let seed_host = host.clone();
+        let seed_edge = edge.clone();
+        let seed_handle = original.clone();
+        let seed = tokio::spawn(async move {
+            seed_host
+                .seed_chat2(&seed_edge, "gen1-exact", &seed_handle)
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            edge_server.wait_for_first_checkpoint(),
+        )
+        .await
+        .expect("gen1 seed checkpoint never started");
+
+        let removed = lock(&host.inner.handles)
+            .remove("gen1-exact")
+            .expect("original handle installed");
+        assert!(Arc::ptr_eq(&removed, &original));
+        let replacement = host.open("gen1-exact").unwrap();
+        assert!(!Arc::ptr_eq(&replacement, &original));
+        assert_eq!(replacement.room_gen, 1);
+        edge_server.release_first_checkpoint();
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), seed)
+            .await
+            .expect("gen1 seed timed out")
+            .expect("gen1 seed task panicked")
+            .expect_err("a different current handle must abort the seed");
+        assert!(err.contains("source handle changed"), "{err}");
+        assert_eq!(
+            workspace.chat("gen1-exact").unwrap().unwrap().room_gen,
+            Some(1)
+        );
+        let (_, _, epoch) = store
+            .load_snapshot_with_cursor("gen1-exact")
+            .unwrap()
+            .unwrap();
+        assert_eq!(epoch, 0, "aborted seed must not stamp the target epoch");
+        host.shutdown_workers().await;
     }
 
     #[tokio::test]
@@ -3080,6 +6418,13 @@ mod agent_send_tests {
             .send_to_session("chat-a", "chat-c", "hop 5")
             .unwrap_err();
         assert!(err.to_string().contains("too deep"), "{err}");
+
+        host.set_turn_origin_for_test("chat-a", u32::MAX);
+        let err = host
+            .send_to_session("chat-a", "chat-d", "overflow must reject")
+            .unwrap_err();
+        assert!(err.to_string().contains("too deep"), "{err}");
+        assert!(queued_commands(&host, "chat-d").is_empty());
     }
 
     #[tokio::test]

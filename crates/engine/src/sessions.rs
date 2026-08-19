@@ -392,6 +392,11 @@ impl SessionsEngine {
 
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
+        // Mint the live-writer lease before the user entry, run table, or
+        // status changes become durable. Generation cutover takes the same
+        // lifecycle fence and then rechecks this Arc count, so it either wins
+        // before this point (and acquisition fails) or waits for the run.
+        let run_doc = handle.writer_doc()?;
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms(), None)?;
 
@@ -471,7 +476,7 @@ impl SessionsEngine {
             run_id.clone(),
             harness,
             request,
-            handle.doc_arc(),
+            run_doc,
             controls,
             engine_rx,
             cancel_rx,
@@ -742,8 +747,17 @@ impl SessionsEngine {
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
-        for chat_id in chats {
-            if let Err(err) = self.interrupt(&chat_id).await {
+        // Arm every run's three-second settle deadline in the same poll turn.
+        // Awaiting them serially made a Team switch cost N × the per-run
+        // grace window even though the runs are independent.
+        let outcomes = futures::future::join_all(
+            chats
+                .iter()
+                .map(|chat_id| async move { (chat_id, self.interrupt(chat_id).await) }),
+        )
+        .await;
+        for (chat_id, outcome) in outcomes {
+            if let Err(err) = outcome {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
             }
         }
@@ -1542,7 +1556,14 @@ async fn drive_run(
             let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
             if !sink_known && !done_only {
                 let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
-                    Ok(handle) => Some(handle.doc_arc()),
+                    Ok(handle) => match handle.writer_doc() {
+                        Ok(doc) => Some(doc),
+                        Err(err) => {
+                            tracing::warn!(doc = %sub_id, error = %err,
+                                "subagent doc retired before writer lease (chip-only)");
+                            None
+                        }
+                    },
                     Err(err) => {
                         tracing::warn!(doc = %sub_id, error = %err, "subagent doc open failed (chip-only)");
                         None

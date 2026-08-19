@@ -8,7 +8,8 @@
 //! restored backup can never disagree with its own cursor — the root cause
 //! of the redownload-forever class the old s2 clients suffered.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures::future::BoxFuture;
 use zeron_doc::SessionDoc;
@@ -40,6 +41,21 @@ pub struct EngineChatSink {
     chat_id: String,
     /// Room generation this client is converging onto.
     target_room_gen: u32,
+    /// Per-handle lifecycle fence shared with DocHost cutover. Every import
+    /// and cursor persist holds this gate; cutover takes the same gate,
+    /// freezes the handle, and advances `lifecycle_generation` before it
+    /// seals the source snapshot. A detached HTTP sync task from the retired
+    /// client can therefore never write through this sink after the seal.
+    lifecycle_gate: Arc<Mutex<()>>,
+    lifecycle_generation: Arc<AtomicU64>,
+    client_generation: u64,
+    generation_frozen: Arc<AtomicBool>,
+    /// A local batch not yet durably acknowledged forces every sink write to
+    /// cursor zero. Otherwise a remote row/ack could persist a snapshot that
+    /// already contains the local op with a non-zero cursor, then a crash
+    /// would lose the only in-memory replay queue.
+    replay_from_zero: Arc<AtomicBool>,
+    replay_fence: Arc<Mutex<()>>,
     /// Serialized cursor/epoch persistence. During a generation handoff,
     /// remote rows may arrive before the full-local-update batch is acked;
     /// those rows keep the old epoch so a crash still resets/requeues. The
@@ -61,17 +77,66 @@ impl EngineChatSink {
         initial_cursor: u64,
         initial_epoch: u32,
     ) -> Self {
+        Self::new_with_lifecycle(
+            doc,
+            store,
+            chat_id,
+            room_gen,
+            initial_cursor,
+            initial_epoch,
+            Arc::new(Mutex::new(())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_lifecycle(
+        doc: &Arc<SessionDoc>,
+        store: Arc<DocsStore>,
+        chat_id: impl Into<String>,
+        room_gen: u32,
+        initial_cursor: u64,
+        initial_epoch: u32,
+        lifecycle_gate: Arc<Mutex<()>>,
+        lifecycle_generation: Arc<AtomicU64>,
+        generation_frozen: Arc<AtomicBool>,
+        replay_from_zero: Arc<AtomicBool>,
+        replay_fence: Arc<Mutex<()>>,
+    ) -> Self {
         let target_room_gen = room_gen.max(CHAT2_DOC_EPOCH);
+        let client_generation = lifecycle_generation.load(Ordering::Acquire);
         Self {
             doc: Arc::downgrade(doc),
             store,
             chat_id: chat_id.into(),
             target_room_gen,
+            lifecycle_gate,
+            lifecycle_generation,
+            client_generation,
+            generation_frozen,
+            replay_from_zero,
+            replay_fence,
             persist: std::sync::Mutex::new(PersistState {
                 cursor: initial_cursor,
                 epoch: initial_epoch.max(CHAT2_DOC_EPOCH).min(target_room_gen),
             }),
         }
+    }
+
+    fn active_lifecycle(&self) -> Option<MutexGuard<'_, ()>> {
+        let guard = self
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.generation_frozen.load(Ordering::Acquire)
+            || self.lifecycle_generation.load(Ordering::Acquire) != self.client_generation
+        {
+            return None;
+        }
+        Some(guard)
     }
 
     /// Export the CURRENT doc and persist it with its cursor in one tx.
@@ -94,12 +159,21 @@ impl EngineChatSink {
         if promote {
             state.epoch = self.target_room_gen;
         }
+        let _replay = self
+            .replay_fence
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let durable_cursor = if self.replay_from_zero.load(Ordering::Acquire) {
+            0
+        } else {
+            state.cursor
+        };
         match doc.export_snapshot() {
             Ok(bytes) => {
                 if let Err(err) = self.store.save_snapshot_with_cursor(
                     &self.chat_id,
                     &bytes,
-                    state.cursor,
+                    durable_cursor,
                     state.epoch,
                 ) {
                     tracing::warn!(chat = %self.chat_id, error = %err,
@@ -116,6 +190,9 @@ impl EngineChatSink {
 
 impl ChatDocSink for EngineChatSink {
     fn apply_row(&self, bytes: &[u8], cursor: u64) {
+        let Some(_lifecycle) = self.active_lifecycle() else {
+            return;
+        };
         let Some(doc) = self.doc.upgrade() else {
             return;
         };
@@ -130,6 +207,9 @@ impl ChatDocSink for EngineChatSink {
     }
 
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
+        let Some(_lifecycle) = self.active_lifecycle() else {
+            return Err("chat handle retired during checkpoint import".into());
+        };
         let doc = self.doc.upgrade().ok_or("doc evicted")?;
         doc.doc()
             .import(bytes)
@@ -139,6 +219,9 @@ impl ChatDocSink for EngineChatSink {
     }
 
     fn contains_frontier(&self, frontier: &[u8]) -> bool {
+        let Some(_lifecycle) = self.active_lifecycle() else {
+            return true;
+        };
         let Some(doc) = self.doc.upgrade() else {
             return true; // evicted: claim contained so the client idles, not refetches
         };
@@ -174,10 +257,16 @@ impl ChatDocSink for EngineChatSink {
     }
 
     fn advance_cursor(&self, cursor: u64) {
+        let Some(_lifecycle) = self.active_lifecycle() else {
+            return;
+        };
         self.persist_with_cursor(cursor, true, false);
     }
 
     fn reset_cursor(&self, cursor: u64) {
+        let Some(_lifecycle) = self.active_lifecycle() else {
+            return;
+        };
         self.persist_with_cursor(cursor, false, true);
     }
 }
@@ -583,5 +672,57 @@ mod frontier_tests {
             (1, 3),
             "post-reset row/ack must not be masked by the old cursor 41"
         );
+    }
+
+    #[test]
+    fn unacked_local_replay_forces_every_sink_persist_to_cursor_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let doc = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        doc.doc()
+            .get_map("meta")
+            .insert("local-unacked", "must-replay")
+            .unwrap();
+        doc.doc().commit();
+        let replay = Arc::new(AtomicBool::new(true));
+        let sink = EngineChatSink::new_with_lifecycle(
+            &doc,
+            store.clone(),
+            "dirty-sink",
+            3,
+            9,
+            3,
+            Arc::new(Mutex::new(())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            replay,
+            Arc::new(Mutex::new(())),
+        );
+
+        // Both a remote import and an own ack can race the debounced host save.
+        // Neither may make a snapshot containing the local op look replay-safe.
+        let remote = loro::LoroDoc::new();
+        remote.get_map("meta").insert("remote", "row").unwrap();
+        remote.commit();
+        sink.apply_row(
+            &remote
+                .export(loro::ExportMode::updates(&loro::VersionVector::default()))
+                .unwrap(),
+            10,
+        );
+        sink.advance_cursor(11);
+
+        let (bytes, cursor, epoch) = store
+            .load_snapshot_with_cursor("dirty-sink")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (0, 3));
+        let restored = loro::LoroDoc::new();
+        restored.import(&bytes).unwrap();
+        assert!(matches!(
+            restored.get_map("meta").get("local-unacked"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value)))
+                if value.as_ref() == "must-replay"
+        ));
     }
 }

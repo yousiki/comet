@@ -99,6 +99,40 @@ struct GatedRowsTransport {
     push_results: Mutex<VecDeque<Result<String, SyncError>>>,
 }
 
+struct CancelledRoundTransport {
+    started: Mutex<Option<oneshot::Sender<()>>>,
+    dropped: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl ChatTransport for CancelledRoundTransport {
+    fn fetch_rows(&self, _after: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
+        let started = lock(&self.started).take().expect("one pull only");
+        let dropped = lock(&self.dropped).take().expect("one pull only");
+        Box::pin(async move {
+            struct DropSignal(Option<oneshot::Sender<()>>);
+            impl Drop for DropSignal {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+
+            let _drop_signal = DropSignal(Some(dropped));
+            let _ = started.send(());
+            std::future::pending::<Result<Vec<u8>, SyncError>>().await
+        })
+    }
+
+    fn push(
+        &self,
+        _batch_id: String,
+        _bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<String, SyncError>> {
+        Box::pin(async { Err(SyncError::Closed) })
+    }
+}
+
 impl ChatTransport for GatedRowsTransport {
     fn fetch_rows(&self, _after: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
         let release = lock(&self.release).take().expect("one pull only");
@@ -346,6 +380,8 @@ fn frame_actor(shared: Arc<Mutex<Shared>>, sink: Arc<RecordingSink>) -> Actor {
         cursor_amnesty_done: std::sync::atomic::AtomicBool::new(false),
         transport: None,
         sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        offline_cancel: CancellationToken::new(),
+        offline_task: Arc::new(Mutex::new(None)),
         resumed: true,
     }
 }
@@ -458,6 +494,69 @@ async fn pending_updates_can_be_recovered_before_parking_the_client() {
     client.enqueue_update(vec![3, 4]);
 
     assert_eq!(client.into_pending_updates(), vec![vec![1, 2], vec![3, 4]]);
+}
+
+#[tokio::test]
+async fn try_shared_operations_return_immediately_while_actor_state_is_busy() {
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let client = ChatClient::connect_with_transport(
+        Arc::new(ErrorConnector {
+            error: SyncError::Closed,
+        }),
+        sink,
+        fetch,
+        "dev-a",
+        7,
+        ChatTuning::default(),
+        Some(Arc::new(ErrorTransport {
+            error: SyncError::Closed,
+        })),
+    )
+    .await
+    .unwrap();
+
+    let shared = lock(&client.shared);
+    assert_eq!(client.try_enqueue_update(vec![1, 2, 3]), Err(vec![1, 2, 3]));
+    assert_eq!(client.try_stats(), None);
+    assert!(!client.try_note_checkpoint(7, 123));
+    drop(shared);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn dropping_client_cancels_the_detached_https_round() {
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let (started_tx, started_rx) = oneshot::channel();
+    let (dropped_tx, dropped_rx) = oneshot::channel();
+    let transport = Arc::new(CancelledRoundTransport {
+        started: Mutex::new(Some(started_tx)),
+        dropped: Mutex::new(Some(dropped_tx)),
+    });
+    let client = ChatClient::connect_with_transport(
+        Arc::new(ErrorConnector {
+            error: SyncError::Closed,
+        }),
+        sink,
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+        Some(transport),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), started_rx)
+        .await
+        .expect("HTTPS round never started")
+        .unwrap();
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+        .await
+        .expect("detached HTTPS round outlived ChatClient")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -997,6 +1096,8 @@ fn stale_websocket_ack_cannot_retire_work_after_http_reset() {
         cursor_amnesty_done: std::sync::atomic::AtomicBool::new(false),
         transport: None,
         sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        offline_cancel: CancellationToken::new(),
+        offline_task: Arc::new(Mutex::new(None)),
         resumed: true,
     };
     let ack = decode(&encode(
@@ -1149,6 +1250,8 @@ async fn failed_http_pull_self_nudges_a_steady_socket_to_repush() {
         cursor_amnesty_done: std::sync::atomic::AtomicBool::new(false),
         transport: Some(transport),
         sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        offline_cancel: CancellationToken::new(),
+        offline_task: Arc::new(Mutex::new(None)),
         resumed: false,
     };
     actor.spawn_offline_sync();

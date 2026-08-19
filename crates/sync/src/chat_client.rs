@@ -23,6 +23,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_util::sync::CancellationToken;
 
 use crate::chat_frames::{self as wire, frame_type};
 use crate::types::{StaticUrl, SyncError, UrlProvider};
@@ -475,6 +476,10 @@ pub struct ChatClient {
     redial: mpsc::Sender<()>,
     presence_out: mpsc::Sender<(i64, Vec<u8>)>,
     flags: Arc<Flags>,
+    /// Cancels the detached HTTPS sibling together with this membership. The
+    /// actor task alone does not own that spawned round.
+    offline_cancel: CancellationToken,
+    offline_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -617,6 +622,8 @@ impl ChatClient {
             ..Shared::default()
         }));
         let flags = Arc::new(Flags::default());
+        let offline_cancel = CancellationToken::new();
+        let offline_task = Arc::new(Mutex::new(None));
 
         let actor = Actor {
             shared: shared.clone(),
@@ -637,6 +644,8 @@ impl ChatClient {
             cursor_amnesty_done: std::sync::atomic::AtomicBool::new(false),
             transport,
             sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            offline_cancel: offline_cancel.clone(),
+            offline_task: offline_task.clone(),
         };
         let task = tokio::spawn(actor.run(ready_tx));
 
@@ -650,13 +659,23 @@ impl ChatClient {
                 redial: redial_tx,
                 presence_out: presence_tx,
                 flags,
+                offline_cancel,
+                offline_task,
                 task: Some(task),
             }),
             Ok(Err(err)) => {
+                offline_cancel.cancel();
+                if let Some(offline) = lock(&offline_task).as_ref() {
+                    offline.abort();
+                }
                 task.abort();
                 Err(err)
             }
             Err(_) => {
+                offline_cancel.cancel();
+                if let Some(offline) = lock(&offline_task).as_ref() {
+                    offline.abort();
+                }
                 task.abort();
                 Err(SyncError::Closed)
             }
@@ -683,6 +702,21 @@ impl ChatClient {
     /// on every reconnect — the exact wedge class chat2 replaces. The ops
     /// stay in the local doc and reach peers via the next checkpoint.
     pub fn enqueue_update(&self, bytes: Vec<u8>) {
+        if let Err(bytes) = self.try_enqueue_update(bytes) {
+            lock(&self.shared).pending.push_back(PendingPush {
+                batch_id: uuid::Uuid::new_v4().to_string(),
+                bytes,
+            });
+            let _ = self.nudge.try_send(());
+        }
+    }
+
+    /// Non-blocking enqueue for a synchronous document callback. A remote
+    /// import can enter the engine sink while holding this client's shared
+    /// state; blocking on that state from a local callback that already owns
+    /// the engine lifecycle fence would invert the two locks. Callers buffer
+    /// the returned bytes externally and retry after the document commit.
+    pub fn try_enqueue_update(&self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
         if bytes.len() > MAX_PUSH_BYTES {
             use std::sync::atomic::Ordering::Relaxed;
             tracing::error!(
@@ -692,16 +726,20 @@ impl ChatClient {
             );
             self.flags.rejected.fetch_add(1, Relaxed);
             let _ = self.events.send(ChatEvent::PushRejected);
-            return;
+            return Ok(());
         }
-        {
-            let mut shared = lock(&self.shared);
-            shared.pending.push_back(PendingPush {
-                batch_id: uuid::Uuid::new_v4().to_string(),
-                bytes,
-            });
-        }
+        let mut shared = match self.shared.try_lock() {
+            Ok(shared) => shared,
+            Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(bytes),
+        };
+        shared.pending.push_back(PendingPush {
+            batch_id: uuid::Uuid::new_v4().to_string(),
+            bytes,
+        });
+        drop(shared);
         let _ = self.nudge.try_send(());
+        Ok(())
     }
 
     /// Stop this client and return every still-unacknowledged local update.
@@ -709,8 +747,12 @@ impl ChatClient {
     /// these bytes after a room-generation cutover is safe because both the
     /// row protocol and Loro imports are at-least-once/idempotent.
     pub fn into_pending_updates(mut self) -> Vec<Vec<u8>> {
+        self.offline_cancel.cancel();
         let _ = self.shutdown.send(true);
         if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Some(task) = lock(&self.offline_task).as_ref() {
             task.abort();
         }
         lock(&self.shared)
@@ -742,6 +784,23 @@ impl ChatClient {
     /// broadcast state after a checkpoint commit).
     pub fn note_checkpoint(&self, seq_covered: u64, size: u64) {
         let mut shared = lock(&self.shared);
+        Self::note_checkpoint_locked(&mut shared, seq_covered, size);
+    }
+
+    /// Non-blocking variant for callers that hold an engine chat-slot guard.
+    /// Skipping one cache hint is harmless; blocking here can close a
+    /// shared-state -> sink-lifecycle -> chat-slot -> shared-state cycle.
+    pub fn try_note_checkpoint(&self, seq_covered: u64, size: u64) -> bool {
+        let mut shared = match self.shared.try_lock() {
+            Ok(shared) => shared,
+            Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        Self::note_checkpoint_locked(&mut shared, seq_covered, size);
+        true
+    }
+
+    fn note_checkpoint_locked(shared: &mut Shared, seq_covered: u64, size: u64) {
         if let Some(server) = &mut shared.server {
             server.checkpoint_seq = seq_covered;
             server.checkpoint_size = size;
@@ -752,8 +811,24 @@ impl ChatClient {
     }
 
     pub fn stats(&self) -> ChatStatsSnapshot {
-        use std::sync::atomic::Ordering::Relaxed;
         let shared = lock(&self.shared);
+        self.stats_locked(&shared)
+    }
+
+    /// Best-effort stats for code that already owns an engine chat-slot
+    /// guard. `None` means the actor is updating shared state right now; the
+    /// caller should skip this observation and retry on its next tick.
+    pub fn try_stats(&self) -> Option<ChatStatsSnapshot> {
+        let shared = match self.shared.try_lock() {
+            Ok(shared) => shared,
+            Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(self.stats_locked(&shared))
+    }
+
+    fn stats_locked(&self, shared: &Shared) -> ChatStatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
         let server = shared.server.unwrap_or(wire::StateHeader {
             head_seq: 0,
             seq_floor: 0,
@@ -785,8 +860,14 @@ impl ChatClient {
 
     /// Leave cleanly and stop the actor.
     pub async fn shutdown(mut self) {
+        self.offline_cancel.cancel();
         let _ = self.shutdown.send(true);
         if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+        let offline = lock(&self.offline_task).take();
+        if let Some(task) = offline {
+            task.abort();
             let _ = task.await;
         }
     }
@@ -794,7 +875,11 @@ impl ChatClient {
 
 impl Drop for ChatClient {
     fn drop(&mut self) {
+        self.offline_cancel.cancel();
         if let Some(task) = &self.task {
+            task.abort();
+        }
+        if let Some(task) = lock(&self.offline_task).as_ref() {
             task.abort();
         }
     }
@@ -826,6 +911,10 @@ struct Actor {
     transport: Option<Arc<dyn ChatTransport>>,
     /// One offline sync in flight at a time.
     sync_busy: Arc<std::sync::atomic::AtomicBool>,
+    /// Ownership for the detached HTTP round: dropping/parking this client
+    /// cancels and aborts it instead of leaving old transport work alive.
+    offline_cancel: CancellationToken,
+    offline_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// False until the first backfill of THIS client instance completes.
     /// (Continuity is instance-scoped: a host that restores an older doc
     /// snapshot must construct a fresh `ChatClient` — C3 wiring contract.)
@@ -1815,10 +1904,15 @@ impl Actor {
         let flags = self.flags.clone();
         let nudge = self.nudge.clone();
         let busy = self.sync_busy.clone();
-        tokio::spawn(async move {
-            offline_sync_once(transport, shared, sink, fetcher, events, flags, nudge).await;
+        let cancel = self.offline_cancel.clone();
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = offline_sync_once(transport, shared, sink, fetcher, events, flags, nudge) => {}
+            }
             busy.store(false, Relaxed);
         });
+        *lock(&self.offline_task) = Some(task);
     }
 
     async fn push_pending(&self, pipe: &mut BinPipe) -> bool {

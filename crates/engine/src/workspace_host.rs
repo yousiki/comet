@@ -605,18 +605,23 @@ impl WorkspaceHost {
     pub fn is_host(&self, chat_id: &str) -> bool {
         match self.read(|doc| doc.chat(chat_id)) {
             Ok(Some(chat)) => chat.device_id == self.inner.config.device_id,
-            Ok(None) => {
-                self.inner.config.edge.is_none()
-                    || self
-                        .inner
-                        .synced_once
-                        .load(std::sync::atomic::Ordering::Acquire)
-            }
+            Ok(None) => self.ownership_ready(),
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry chat read failed");
                 false
             }
         }
+    }
+
+    /// Whether an absent registry row is safe to claim. Edge-backed profiles
+    /// stay fail-closed until the first remote state has landed; DocHost also
+    /// watches this transition so commands parked by that gate are re-drained.
+    pub(crate) fn ownership_ready(&self) -> bool {
+        self.inner.config.edge.is_none()
+            || self
+                .inner
+                .synced_once
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Claim-on-first-command: create the chat row under OUR device id when a run
