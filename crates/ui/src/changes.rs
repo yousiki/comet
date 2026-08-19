@@ -2584,7 +2584,7 @@ impl Changes {
     /// A small hover-washed icon button for the pane header. The header lives
     /// inside the titlebar drag strip, so the button occludes and swallows the
     /// mouse-down (same discipline as the shell's `header_icon_button`).
-    fn header_button(
+    pub(crate) fn header_button(
         id: &'static str,
         icon_path: &'static str,
         theme: &Theme,

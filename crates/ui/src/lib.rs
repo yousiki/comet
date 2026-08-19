@@ -21,6 +21,7 @@ pub mod changes;
 pub mod comments;
 pub mod composer;
 pub mod edge_fade;
+pub mod file_explorer;
 pub mod frost;
 pub mod history;
 pub mod icons;
