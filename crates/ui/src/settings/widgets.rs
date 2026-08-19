@@ -234,7 +234,10 @@ pub fn meta_line(theme: &Theme, fragments: Vec<AnyElement>) -> gpui::Div {
                     .child(SharedString::from("·")),
             );
         }
-        line = line.child(fragment);
+        // min_w_0: a flex item's auto min-width is content-based, so gpui
+        // measures the text at MaxContent, never sets a wrap width, and a long
+        // fragment overflows the card instead of wrapping.
+        line = line.child(div().min_w_0().child(fragment));
         first = false;
     }
     line
