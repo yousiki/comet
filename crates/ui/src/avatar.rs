@@ -20,6 +20,19 @@ pub fn blob_avatar(seed: &str, size: f32) -> Img {
     .flex_none()
 }
 
+/// Square team badge for `seed`, `size` logical pixels on a side. Same palette
+/// and pipeline as [`blob_avatar`], but a mirror-symmetric straight-edged crest
+/// with no eyes: geometry reads as "org", the organic face reads as "person".
+pub fn team_avatar(seed: &str, size: f32) -> Img {
+    let dim = (size * 2.0).round() as u32;
+    img(Arc::new(Image::from_bytes(
+        ImageFormat::Svg,
+        team_svg(seed, dim).into_bytes(),
+    )))
+    .size(px(size))
+    .flex_none()
+}
+
 /// xorshift64 seeded from the FNV-1a hash of the seed string: one stable
 /// stream of unit floats, consumed trait by trait. Reordering draws would
 /// reshuffle every existing avatar, so only append new traits at the end.
@@ -60,14 +73,20 @@ fn hex(color: gpui::Hsla) -> String {
     )
 }
 
+/// Two-stop vertical gradient, hue per seed. Saturation/lightness are pinned to
+/// a band that reads on both the light and dark themes. Consumes exactly one
+/// value from the stream, so both avatar kinds stay hue-compatible.
+fn gradient(t: &mut Traits) -> (String, String) {
+    let hue = t.unit();
+    (
+        hex(gpui::hsla(hue, 0.62, 0.66, 1.0)),
+        hex(gpui::hsla((hue + 0.09) % 1.0, 0.58, 0.52, 1.0)),
+    )
+}
+
 fn svg(seed: &str, dim: u32) -> String {
     let mut t = Traits::new(seed);
-
-    // Hue drives a two-stop vertical gradient; saturation/lightness are
-    // pinned to a band that reads on both the light and dark themes.
-    let hue = t.unit();
-    let top = hex(gpui::hsla(hue, 0.62, 0.66, 1.0));
-    let bottom = hex(gpui::hsla((hue + 0.09) % 1.0, 0.58, 0.52, 1.0));
+    let (top, bottom) = gradient(&mut t);
 
     // Silhouette: 8 spokes with jittered radii around (64, 64) in a 128
     // viewBox, joined by a closed Catmull-Rom spline emitted as cubics.
@@ -112,9 +131,42 @@ fn svg(seed: &str, dim: u32) -> String {
     )
 }
 
+fn team_svg(seed: &str, dim: u32) -> String {
+    let mut t = Traits::new(seed);
+    let (top, bottom) = gradient(&mut t);
+
+    // Crest: 8 spokes from a top vertex, joined by straight edges. Symmetry
+    // and hard corners are what separate a Team from a person at 16px; the
+    // eyes are deliberately absent. Only the right half is generated — the
+    // left is its exact reflection, snapped to whole viewBox units so the
+    // emitted digits mirror too, not just the floats behind them.
+    const N: usize = 8;
+    let right: Vec<(f32, f32)> = (0..=N / 2)
+        .map(|i| {
+            let a = -std::f32::consts::FRAC_PI_2 + i as f32 / N as f32 * std::f32::consts::TAU;
+            let r = 54.0 * t.range(0.80, 1.0);
+            ((64.0 + r * a.cos()).round(), (64.0 + r * a.sin()).round())
+        })
+        .collect();
+    let d = right
+        .iter()
+        .copied()
+        .chain(right[1..N / 2].iter().rev().map(|&(x, y)| (128.0 - x, y)))
+        .enumerate()
+        .map(|(i, (x, y))| format!("{}{x:.0} {y:.0}", if i == 0 { "M" } else { "L" }))
+        .collect::<String>()
+        + "Z";
+
+    // The same outline at half scale, as a light wash: without it two flat
+    // shapes of the same hue only differ by their silhouette.
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{dim}" height="{dim}" viewBox="0 0 128 128"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{top}"/><stop offset="1" stop-color="{bottom}"/></linearGradient></defs><path d="{d}" fill="url(#g)"/><path d="{d}" fill="#ffffff" fill-opacity="0.14" transform="translate(64 64) scale(0.55) translate(-64 -64)"/></svg>"##
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::svg;
+    use super::{svg, team_svg};
 
     #[test]
     fn deterministic_distinct_and_well_formed() {
@@ -124,6 +176,55 @@ mod tests {
             let s = svg(seed, 56);
             assert!(s.starts_with("<svg"), "not an svg: {s}");
             assert!(!s.contains("NaN") && !s.contains("inf"), "bad number: {s}");
+        }
+    }
+
+    #[test]
+    fn team_badges_are_stable_symmetric_and_not_faces() {
+        assert_eq!(team_svg("org-1", 56), team_svg("org-1", 56));
+        assert_ne!(team_svg("org-1", 56), team_svg("org-2", 56));
+        // A Team never wears a person's face, even on a colliding seed.
+        assert_ne!(team_svg("org-1", 56), svg("org-1", 56));
+
+        // Regression anchors against computing both halves instead of
+        // reflecting one: `sym-3390` rounds to an asymmetric pair of digits,
+        // `snap-4302` stays asymmetric even with both halves snapped to whole
+        // units.
+        for seed in [
+            "org-1",
+            "",
+            "org-with-a-very-long-identifier",
+            "sym-3390",
+            "snap-4302",
+            "组织",
+        ] {
+            let s = team_svg(seed, 56);
+            assert!(s.starts_with("<svg"), "not an svg: {s}");
+            assert!(!s.contains("NaN") && !s.contains("inf"), "bad number: {s}");
+            assert!(!s.contains("<circle"), "team badge grew eyes: {s}");
+
+            // Mirror check: every vertex has a partner at the same y, its x
+            // reflected through the 64 axis to the digit (the top and bottom
+            // vertices lie on the axis and pair with themselves).
+            let d = s
+                .split(" d=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_else(|| panic!("no path data: {s}"));
+            let pts: Vec<(f32, f32)> = d
+                .split(['M', 'L', 'Z'])
+                .filter_map(|seg| {
+                    let (x, y) = seg.split_once(' ')?;
+                    Some((x.parse().ok()?, y.parse().ok()?))
+                })
+                .collect();
+            assert_eq!(pts.len(), 8, "expected 8 vertices: {s}");
+            for (x, y) in &pts {
+                assert!(
+                    pts.iter().any(|(mx, my)| *mx == 128.0 - x && my == y),
+                    "vertex ({x}, {y}) has no mirror: {s}"
+                );
+            }
         }
     }
 }

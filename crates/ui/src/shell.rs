@@ -5817,13 +5817,12 @@ impl Shell {
                             .aria_selected(is_current)
                             .when(is_keyboard_active, |row| row.aria_active_descendant())
                             .when(team_busy && !is_current, |row| row.opacity(0.45))
-                            .child(icon(icons::GLOBAL).size(px(16.0)).flex_none().text_color(
-                                if is_current {
-                                    theme.text
-                                } else {
-                                    theme.text_muted
-                                },
-                            ))
+                            // Generated crest, seeded by the organization id so
+                            // renaming a Team does not change its badge.
+                            .child(
+                                crate::avatar::team_avatar(&org.organization_id, 16.0)
+                                    .self_center(),
+                            )
                             .child(
                                 div()
                                     .flex_1()

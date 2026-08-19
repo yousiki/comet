@@ -389,24 +389,28 @@ impl TeamPage {
             Loadable::Ready(orgs) => {
                 for (ix, org) in orgs.into_iter().enumerate() {
                     let is_current = Some(&org.organization_id) == current.as_ref();
-                    let mut row = widgets::card_row(theme, ix == 0).child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(widgets::row_title(theme, org.name.clone()))
-                            .child(widgets::meta_line(
-                                theme,
-                                vec![
-                                    div()
-                                        .child(SharedString::from(if org.role == "admin" {
-                                            "Admin"
-                                        } else {
-                                            "Member"
-                                        }))
-                                        .into_any_element(),
-                                ],
-                            )),
-                    );
+                    let mut row = widgets::card_row(theme, ix == 0)
+                        // Generated crest, seeded by the organization id so
+                        // renaming a Team does not change its badge.
+                        .child(crate::avatar::team_avatar(&org.organization_id, 32.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(widgets::row_title(theme, org.name.clone()))
+                                .child(widgets::meta_line(
+                                    theme,
+                                    vec![
+                                        div()
+                                            .child(SharedString::from(if org.role == "admin" {
+                                                "Admin"
+                                            } else {
+                                                "Member"
+                                            }))
+                                            .into_any_element(),
+                                    ],
+                                )),
+                        );
                     if is_current {
                         row = row.child(widgets::badge_active(theme, "Current"));
                     } else {
