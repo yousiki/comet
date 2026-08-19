@@ -199,7 +199,7 @@ async fn target_device_id_routes_over_the_relay() {
 
     // Engine B hosts its device room on the fake relay.
     let core_b = assemble(&dirs.path().join("b"), "device-b");
-    let _host = core_b.start_host_relay(&relay_url);
+    let _host = core_b.start_host_relay(&relay_url, Arc::new(StaticToken("test-user".into())));
 
     // Engine A dials peers through the same relay.
     let core_a = assemble(&dirs.path().join("a"), "device-a");
@@ -367,7 +367,7 @@ async fn terminal_stream_proxies_over_the_relay() {
         .workspace
         .create_chat("chat-term", Some("space-term"), None, None, None)
         .expect("chat row on B");
-    let _host = core_b.start_host_relay(&relay_url);
+    let _host = core_b.start_host_relay(&relay_url, Arc::new(StaticToken("test-user".into())));
 
     let core_a = assemble(&dirs.path().join("a"), "device-a");
     let mut link_config =

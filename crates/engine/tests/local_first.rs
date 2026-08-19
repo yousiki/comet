@@ -155,7 +155,8 @@ async fn serve_daemon_edge(
         let body = if target.starts_with("/auth/refresh") {
             let claims = serde_json::json!({
                 "exp": 4_102_444_800_u64,
-                "org_id": "org_1"
+                "org_id": "org_1",
+                "sub": "user_1"
             });
             let claims =
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());

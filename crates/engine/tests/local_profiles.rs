@@ -6,9 +6,10 @@ use std::sync::{Arc, Barrier, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use zeron_engine::{
-    AuthState, Engine, EngineConfig, EngineCore, EngineProfile, HarnessId, WorkspaceScope,
-    default_registry,
+    AuthState, Engine, EngineConfig, EngineCore, EngineInfo, EngineProfile, EngineProfileIdentity,
+    HarnessId, WorkspaceScope, default_registry,
 };
+use zeron_rpc::{memory_client, methods};
 
 fn config(
     data_dir: &Path,
@@ -35,6 +36,30 @@ fn assemble(profile: EngineProfile) -> EngineCore {
 async fn shutdown(core: EngineCore) {
     core.shutdown().await;
     drop(core);
+}
+
+#[tokio::test]
+async fn engine_info_announces_the_fixed_profile_instead_of_live_auth() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let core = assemble(EngineProfile::synced(dir.path(), "org-old", "user-1"));
+    // `rpc_service` lazily attaches its unrelated development Auth when this
+    // direct test core has none. EngineInfo must still describe the immutable
+    // profile that opened the stores.
+    let client = memory_client(core.rpc_service());
+    let info: EngineInfo = client
+        .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+        .await
+        .expect("engine info");
+
+    assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+    assert_eq!(
+        info.profile,
+        Some(EngineProfileIdentity {
+            user_id: "user-1".into(),
+            organization_id: "org-old".into(),
+        })
+    );
+    shutdown(core).await;
 }
 
 fn concurrent_engine_info(

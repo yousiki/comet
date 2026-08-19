@@ -16,18 +16,20 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding, Keystroke,
-    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Subscription,
-    Task, Window, WindowControlArea, actions, div, prelude::*, px,
+    AnyElement, App, Context, Empty, Entity, FocusHandle, Focusable as _, IntoElement, KeyBinding,
+    Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, Role,
+    SharedString, Subscription, Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
 use zeron_engine::InstanceLock;
-use zeron_proto::{AuthState, WorkspaceScope};
+use zeron_proto::{AuthState, EngineInfo, WorkspaceScope};
 use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
-use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
+use crate::composer::{
+    Composer, ComposerEvent, ComposerInput, ComposerInputEvent, ComposerUnsentRisk,
+};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -40,7 +42,7 @@ use crate::settings::devices::DevicesPage;
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
-use crate::settings::team::TeamPage;
+use crate::settings::team::{TeamMutation, TeamMutationKind, TeamPage, TeamPageEvent};
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
@@ -60,7 +62,14 @@ use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(
     shell,
-    [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]
+    [
+        ToggleSidebar,
+        ToggleChanges,
+        AddSpacePalette,
+        NewSession,
+        FocusNextControl,
+        FocusPreviousControl
+    ]
 );
 
 // ---------------------------------------------------------------------------
@@ -139,6 +148,13 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         }
     }
     cx.clear_key_bindings();
+    // Lower-precedence Composer fallbacks. `composer::init` is deliberately
+    // registered afterward so MentionTab accepts an open file mention first;
+    // when it propagates, these move through GPUI's tab-stop graph.
+    cx.bind_keys([
+        KeyBinding::new("tab", FocusNextControl, Some("Composer")),
+        KeyBinding::new("shift-tab", FocusPreviousControl, Some("Composer")),
+    ]);
     crate::composer::init(cx);
     // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
     // these back the native menu key equivalents and must survive keymap
@@ -168,6 +184,14 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
+        // GPUI has an explicit tab-stop graph rather than implicit browser-like
+        // traversal. Keep these scoped away from Terminal/PaletteSearch so a
+        // literal tab still reaches those controls. Composer's MentionTab
+        // binding gets first refusal and propagates when no mention is active.
+        KeyBinding::new("tab", FocusNextControl, Some("TeamMenu")),
+        KeyBinding::new("shift-tab", FocusPreviousControl, Some("TeamMenu")),
+        KeyBinding::new("tab", FocusNextControl, Some("TeamDialog")),
+        KeyBinding::new("shift-tab", FocusPreviousControl, Some("TeamDialog")),
     ]);
 }
 
@@ -592,6 +616,494 @@ enum AccountMenuAction {
     SignOut,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamChangePhase {
+    /// SELECT_ORG has not completed; canceling is still safe.
+    Selecting,
+    /// Auth points at the target and the old fixed-profile runtime is being
+    /// stopped or its replacement is booting.
+    Restarting,
+    /// SELECT_ORG failed, so the current runtime/profile remains coherent.
+    SelectFailed,
+    /// Auth changed, but the old runtime could not be fully replaced. The app
+    /// stays occluded until Retry completes the handoff.
+    ReplaceFailed,
+}
+
+#[derive(Debug, Clone)]
+struct TeamChange {
+    organization_id: Option<String>,
+    /// Set for an externally observed account replacement. Team selection
+    /// normally keeps the same user, but another viewport may sign in as a
+    /// different user whose membership happens to target the same org.
+    expected_user_id: Option<String>,
+    label: SharedString,
+    phase: TeamChangePhase,
+    error: Option<SharedString>,
+    /// User mutation that initiated this handoff. External AuthStatus-driven
+    /// replacements have no mutation. Keeping the full variant preserves its
+    /// kind and makes a pre-RPC failure safely retryable without guessing.
+    mutation: Option<TeamMutation>,
+    /// Kept across the clean-runtime reconciliation when the unary reply was
+    /// lost. Reopening a coherent profile must not silently turn this into a
+    /// reported success.
+    original_error: Option<SharedString>,
+    /// False only when the selection RPC transport disappeared before its
+    /// unary reply. The replacement runtime is then a reconciliation probe:
+    /// it may safely reopen either the old or requested Team.
+    selection_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TeamHandoffRisk {
+    live_runs: usize,
+    composer: ComposerUnsentRisk,
+    pending_sends: usize,
+}
+
+impl TeamHandoffRisk {
+    fn has_any(self) -> bool {
+        self.live_runs > 0 || self.composer.has_any() || self.pending_sends > 0
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingTeamChange {
+    mutation: TeamMutation,
+    risk: TeamHandoffRisk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamDialogKeyboardMode {
+    Pending,
+    SelectFailed,
+    ReplaceFailed,
+    Progress,
+}
+
+impl TeamDialogKeyboardMode {
+    fn action_count(self) -> usize {
+        match self {
+            Self::Pending | Self::SelectFailed => 2,
+            Self::ReplaceFailed | Self::Progress => 1,
+        }
+    }
+
+    fn default_active(self) -> usize {
+        match self {
+            // A destructive handoff defaults to Cancel. Failure recovery
+            // defaults to the only forward action, Retry.
+            Self::Pending => 0,
+            Self::SelectFailed => 1,
+            Self::ReplaceFailed | Self::Progress => 0,
+        }
+    }
+
+    fn primary_action(self) -> usize {
+        match self {
+            Self::Pending | Self::SelectFailed => 1,
+            Self::ReplaceFailed | Self::Progress => 0,
+        }
+    }
+
+    fn can_cancel(self) -> bool {
+        !matches!(self, Self::ReplaceFailed | Self::Progress)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamDialogCommand {
+    None,
+    Cancel,
+    Primary,
+}
+
+fn reduce_team_dialog_key(
+    mode: TeamDialogKeyboardMode,
+    key: &str,
+    shift: bool,
+    active: usize,
+) -> (usize, TeamDialogCommand) {
+    // Progress dialogs are deliberately inert but still own keyboard focus.
+    // Consuming their keys keeps Tab/Enter/Escape from reaching controls
+    // behind the modal while a Team runtime handoff is in flight.
+    if mode == TeamDialogKeyboardMode::Progress {
+        return (0, TeamDialogCommand::None);
+    }
+    let count = mode.action_count();
+    let active = active.min(count.saturating_sub(1));
+    match key {
+        "tab" => {
+            let delta = if shift { -1 } else { 1 };
+            (
+                popover::menu_step(Some(active), count, delta).unwrap_or(0),
+                TeamDialogCommand::None,
+            )
+        }
+        "enter" | "space" => (
+            active,
+            if active == mode.primary_action() {
+                TeamDialogCommand::Primary
+            } else {
+                TeamDialogCommand::Cancel
+            },
+        ),
+        "escape" if mode.can_cancel() => (active, TeamDialogCommand::Cancel),
+        _ => (active, TeamDialogCommand::None),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeShutdownStatus {
+    Running,
+    Finished(Result<(), String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeShutdownWait {
+    Finished(Result<(), String>),
+    TimedOut,
+    WorkerEnded,
+}
+
+/// One owned teardown shared by every Retry waiter. This deliberately uses a
+/// raw Tokio JoinHandle: dropping a GPUI `Tokio::spawn` task aborts its future,
+/// which would leave a half-drained embedded runtime. A raw handle detaches on
+/// drop, and Shell retains it while the handoff is observable.
+struct TeamRuntimeShutdown {
+    status: tokio::sync::watch::Receiver<RuntimeShutdownStatus>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+/// Destructive handoffs use the raw engine state, not the display staleness
+/// heuristic. A quiet tool call or an AwaitingInput run may remain legitimate
+/// well past 45 seconds and must still require explicit confirmation.
+fn live_team_run_count(sessions: &[zeron_proto::Session]) -> usize {
+    sessions
+        .iter()
+        .filter(|session| {
+            matches!(
+                session.status,
+                zeron_proto::SessionStatus::Working | zeron_proto::SessionStatus::AwaitingInput
+            )
+        })
+        .map(|session| session.chat_id.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeProfileIdentity {
+    user_id: String,
+    organization_id: String,
+}
+
+/// Keep the active workspace at the top while preserving the existing
+/// case-insensitive order for every other membership.
+fn teams_current_first(mut orgs: Vec<OrgRow>, current: Option<&str>) -> Vec<OrgRow> {
+    let Some(current) = current else { return orgs };
+    if let Some(index) = orgs.iter().position(|org| org.organization_id == current)
+        && index != 0
+    {
+        let active = orgs.remove(index);
+        orgs.insert(0, active);
+    }
+    orgs
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TeamRuntimeExpectation<'a> {
+    /// A transport-ambiguous mutation is reopening the durable state only; any
+    /// AuthStatus proves the old fixed-profile runtime is gone.
+    Any,
+    ExactOrg(&'a str),
+    ExactProfile {
+        organization_id: &'a str,
+        user_id: &'a str,
+    },
+    /// The final Team was deleted. Accepting an arbitrary signed-in profile
+    /// here would hide a stale session.json resurrection.
+    SignedOut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AmbiguousTeamRuntimeOutcome {
+    RequestedProfile(RuntimeProfileIdentity),
+    OtherProfile(RuntimeProfileIdentity),
+    SignedOut,
+    NeedsOrganization,
+}
+
+/// Resolve the durable auth result after a Team-selection RPC lost its unary
+/// reply. Only a signed-in, non-target profile proves that an ordinary Team is
+/// safely open and can offer a selection retry. Fail-closed auth outcomes need
+/// their own lifecycle handling instead of being mislabeled as the old Team.
+fn classify_ambiguous_team_runtime(
+    auth: &AuthState,
+    requested_organization_id: &str,
+) -> AmbiguousTeamRuntimeOutcome {
+    match auth {
+        AuthState::SignedIn {
+            user,
+            org_id: Some(organization_id),
+        } => {
+            let profile = RuntimeProfileIdentity {
+                user_id: user.id.clone(),
+                organization_id: organization_id.clone(),
+            };
+            if organization_id == requested_organization_id {
+                AmbiguousTeamRuntimeOutcome::RequestedProfile(profile)
+            } else {
+                AmbiguousTeamRuntimeOutcome::OtherProfile(profile)
+            }
+        }
+        AuthState::SignedOut => AmbiguousTeamRuntimeOutcome::SignedOut,
+        AuthState::NeedsOrganization { .. } | AuthState::SignedIn { org_id: None, .. } => {
+            AmbiguousTeamRuntimeOutcome::NeedsOrganization
+        }
+    }
+}
+
+/// An RPC error never proves that Team selection left durable auth unchanged:
+/// Engine-level `Failed` covers both a definite rejection and fail-closed
+/// ambiguous refresh outcomes. Only an AuthStatus that has already published
+/// the exact target can upgrade the subsequent reopen to a confirmed switch.
+fn team_selection_error_is_confirmed(
+    current_organization_id: Option<&str>,
+    requested_organization_id: &str,
+) -> bool {
+    current_organization_id == Some(requested_organization_id)
+}
+
+/// Extract the durable target promised by a successful mutation reply. A
+/// malformed success is treated exactly like a lost reply: auth may already
+/// have moved, so the fixed-profile runtime still has to be reconciled.
+fn confirmed_team_mutation_target(
+    mutation: &TeamMutation,
+    value: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    match mutation {
+        TeamMutation::Select {
+            organization_id, ..
+        } => Ok(Some(organization_id.clone())),
+        TeamMutation::Create { .. } => value
+            .get("organizationId")
+            .and_then(|value| value.as_str())
+            .filter(|organization_id| !organization_id.is_empty())
+            .map(|organization_id| Some(organization_id.to_string()))
+            .ok_or_else(|| "Create Team returned no organizationId".to_string()),
+        TeamMutation::Delete { .. } => match value.get("action").and_then(|value| value.as_str()) {
+            Some("signedOut") => Ok(None),
+            Some("switched") => value
+                .get("organizationId")
+                .and_then(|value| value.as_str())
+                .filter(|organization_id| !organization_id.is_empty())
+                .map(|organization_id| Some(organization_id.to_string()))
+                .ok_or_else(|| "Delete Team switched without an organizationId".to_string()),
+            _ => Err("Delete Team returned an unknown outcome".to_string()),
+        },
+    }
+}
+
+fn team_mutation_verb(kind: TeamMutationKind) -> &'static str {
+    match kind {
+        TeamMutationKind::Select => "switch Team",
+        TeamMutationKind::Create => "create Team",
+        TeamMutationKind::Delete => "delete Team",
+    }
+}
+
+fn team_outcome_unknown_notice(change: &TeamChange) -> Option<SharedString> {
+    let mutation = change.mutation.as_ref()?;
+    let error = change.original_error.as_ref()?;
+    Some(
+        format!(
+            "The {} request ended without a confirmed response: {error}. Zeron reopened a safe workspace, but the operation's outcome was unknown. The Team list was refreshed where available; verify it before trying again.",
+            team_mutation_verb(mutation.kind())
+        )
+        .into(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignedOutTeamRuntimeAction {
+    AlreadyLocal,
+    ReplaceSyncedWithLocal,
+}
+
+/// A fail-closed Team selection normally makes the very first replacement
+/// bootstrap choose the local profile. Only a runtime that still reports the
+/// old Synced scope needs another coordinated synced-to-local transition.
+fn signed_out_team_runtime_action(
+    workspace_scope: Option<WorkspaceScope>,
+) -> SignedOutTeamRuntimeAction {
+    if workspace_scope == Some(WorkspaceScope::Synced) {
+        SignedOutTeamRuntimeAction::ReplaceSyncedWithLocal
+    } else {
+        SignedOutTeamRuntimeAction::AlreadyLocal
+    }
+}
+
+/// `None` means the replacement runtime has not published AuthStatus yet.
+/// Once it has, a confirmed switch must prove the exact durable auth outcome
+/// before the occluding handoff dialog disappears.
+fn validate_team_runtime_auth(
+    auth: Option<&AuthState>,
+    expected: TeamRuntimeExpectation<'_>,
+) -> Option<Result<(), String>> {
+    let auth = auth?;
+    Some(match expected {
+        TeamRuntimeExpectation::Any => Ok(()),
+        TeamRuntimeExpectation::ExactOrg(expected) => {
+            let actual = match auth {
+                AuthState::SignedIn { org_id, .. } => org_id.as_deref(),
+                AuthState::NeedsOrganization { .. } | AuthState::SignedOut => None,
+            };
+            if actual == Some(expected) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "The replacement runtime opened a different Team than expected ({expected})."
+                ))
+            }
+        }
+        TeamRuntimeExpectation::ExactProfile {
+            organization_id,
+            user_id,
+        } => {
+            let matches = match auth {
+                AuthState::SignedIn { user, org_id } => {
+                    user.id == user_id && org_id.as_deref() == Some(organization_id)
+                }
+                AuthState::NeedsOrganization { .. } | AuthState::SignedOut => false,
+            };
+            if matches {
+                Ok(())
+            } else {
+                Err(format!(
+                    "The replacement runtime opened a different account or Team than expected ({user_id} in {organization_id})."
+                ))
+            }
+        }
+        TeamRuntimeExpectation::SignedOut => {
+            if matches!(auth, AuthState::SignedOut) {
+                Ok(())
+            } else {
+                Err("The deleted Team's session was still active after reopening.".into())
+            }
+        }
+    })
+}
+
+fn runtime_profile_identity(auth: Option<&AuthState>) -> Option<RuntimeProfileIdentity> {
+    match auth? {
+        AuthState::SignedIn {
+            user,
+            org_id: Some(organization_id),
+        } => Some(RuntimeProfileIdentity {
+            user_id: user.id.clone(),
+            organization_id: organization_id.clone(),
+        }),
+        AuthState::SignedIn { org_id: None, .. }
+        | AuthState::NeedsOrganization { .. }
+        | AuthState::SignedOut => None,
+    }
+}
+
+/// The data-plane profile is announced by EngineInfo when the runtime opens
+/// its stores. Unlike AuthStatus, it never follows a Team selection in place.
+fn engine_runtime_profile_identity(
+    engine_info: Option<&EngineInfo>,
+) -> Option<RuntimeProfileIdentity> {
+    let engine_info = engine_info?;
+    if engine_info.workspace_scope != WorkspaceScope::Synced {
+        return None;
+    }
+    let profile = engine_info.profile.as_ref()?;
+    Some(RuntimeProfileIdentity {
+        user_id: profile.user_id.clone(),
+        organization_id: profile.organization_id.clone(),
+    })
+}
+
+/// A replacement is coherent only when its mutable authentication control
+/// plane describes the immutable profile that actually opened its data plane.
+/// Keep the handoff occluded if a bootstrap probe reconnects to the old daemon
+/// after SELECT_ORG has already published the target AuthStatus.
+fn validate_team_runtime_planes(engine_info: &EngineInfo, auth: &AuthState) -> Result<(), String> {
+    match auth {
+        AuthState::SignedIn {
+            user,
+            org_id: Some(organization_id),
+        } => {
+            if engine_info.workspace_scope != WorkspaceScope::Synced {
+                return Err(
+                    "The replacement authentication is signed in, but its runtime did not open a synced Team profile."
+                        .into(),
+                );
+            }
+            let Some(profile) = engine_runtime_profile_identity(Some(engine_info)) else {
+                return Err(
+                    "The replacement runtime did not announce its fixed Team profile; retry after the old runtime has stopped."
+                        .into(),
+                );
+            };
+            if profile.user_id != user.id || profile.organization_id != *organization_id {
+                return Err(format!(
+                    "The replacement runtime still owns a different data profile ({} in {}) than authentication ({} in {}).",
+                    profile.user_id, profile.organization_id, user.id, organization_id
+                ));
+            }
+            Ok(())
+        }
+        AuthState::SignedOut => {
+            if engine_info.workspace_scope == WorkspaceScope::Local {
+                Ok(())
+            } else {
+                Err(
+                    "Authentication is signed out, but the replacement runtime still owns a synced Team profile."
+                        .into(),
+                )
+            }
+        }
+        AuthState::NeedsOrganization { .. } | AuthState::SignedIn { org_id: None, .. } => {
+            if engine_info.workspace_scope == WorkspaceScope::Synced
+                && engine_info.profile.is_none()
+            {
+                Ok(())
+            } else {
+                Err(
+                    "Authentication needs a Team, but the replacement runtime still owns another data profile."
+                        .into(),
+                )
+            }
+        }
+    }
+}
+
+/// Detect an AuthStatus profile change that this viewport did not initiate. A
+/// missing baseline is first attachment, not a switch: the caller records it
+/// and waits for a later, different user/org pair. Explicit handoffs own their
+/// own reconciliation and must never recursively trigger this path.
+fn external_team_replacement_target(
+    baseline: Option<&RuntimeProfileIdentity>,
+    connection: &ConnectionStatus,
+    workspace_scope: Option<WorkspaceScope>,
+    auth: Option<&AuthState>,
+    explicit_handoff: bool,
+) -> Option<RuntimeProfileIdentity> {
+    if explicit_handoff
+        || !matches!(connection, ConnectionStatus::Ready)
+        || workspace_scope != Some(WorkspaceScope::Synced)
+    {
+        return None;
+    }
+    let current = runtime_profile_identity(auth)?;
+    baseline
+        .filter(|baseline| *baseline != &current)
+        .map(|_| current)
+}
+
 const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -633,12 +1145,21 @@ async fn stop_synced_runtime(
     data_dir: &std::path::Path,
 ) -> Result<(), String> {
     let stop_error = if matches!(engine.mode(), EngineMode::Remote { .. }) {
-        engine
-            .client()
-            .call(methods::STOP_ENGINE, serde_json::json!({}))
-            .await
-            .err()
-            .map(|error| error.to_string())
+        match tokio::time::timeout(
+            RUNTIME_CHANGE_TIMEOUT,
+            engine
+                .client()
+                .call(methods::STOP_ENGINE, serde_json::json!({})),
+        )
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some(format!(
+                "the daemon did not acknowledge shutdown within {} seconds",
+                RUNTIME_CHANGE_TIMEOUT.as_secs()
+            )),
+        }
     } else {
         None
     };
@@ -649,6 +1170,27 @@ async fn stop_synced_runtime(
             Some(stop_error) => Err(format!("{stop_error}; {error}")),
             None => Err(error),
         },
+    }
+}
+
+async fn wait_for_runtime_shutdown(
+    mut status: tokio::sync::watch::Receiver<RuntimeShutdownStatus>,
+    timeout: Duration,
+) -> RuntimeShutdownWait {
+    let wait = async {
+        loop {
+            let current = { status.borrow().clone() };
+            if let RuntimeShutdownStatus::Finished(result) = current {
+                return RuntimeShutdownWait::Finished(result);
+            }
+            if status.changed().await.is_err() {
+                return RuntimeShutdownWait::WorkerEnded;
+            }
+        }
+    };
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(outcome) => outcome,
+        Err(_) => RuntimeShutdownWait::TimedOut,
     }
 }
 
@@ -838,6 +1380,7 @@ pub struct Shell {
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
     team_page: Option<Entity<TeamPage>>,
+    team_page_sub: Option<Subscription>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
@@ -873,6 +1416,30 @@ pub struct Shell {
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
     user_menu: popover::Popup<()>,
+    /// The avatar trigger is a real tab stop; the open menu takes focus on a
+    /// separate non-tab-stop container and uses an aria-active-descendant row.
+    user_menu_trigger_focus: FocusHandle,
+    user_menu_focus: FocusHandle,
+    user_menu_active: Option<usize>,
+    user_menu_scroll: gpui::ScrollHandle,
+    /// Memberships shown directly in the avatar menu. Loaded eagerly once the
+    /// synced runtime is ready, and refreshable from the menu on failure.
+    user_menu_orgs: Loadable<Vec<OrgRow>>,
+    user_menu_orgs_task: Option<Task<()>>,
+    /// Coordinated Team switch lifecycle (selection → stop → bootstrap).
+    team_change: Option<TeamChange>,
+    /// Any avatar-menu or Settings Team mutation that would stop work or
+    /// discard unsent input. No auth RPC begins until the user continues.
+    pending_team_change: Option<PendingTeamChange>,
+    /// Keyboard focus stays on the modal card while Tab roves its visible
+    /// actions. This traps focus inside the profile-isolation safety overlay.
+    team_dialog_focus: FocusHandle,
+    team_dialog_mode: Option<TeamDialogKeyboardMode>,
+    team_dialog_active: usize,
+    /// Account + organization captured when this fixed-profile runtime first
+    /// became Ready. A shared AuthStatus change means another viewport changed
+    /// Team or account, so this viewport must join the runtime handoff too.
+    fixed_runtime_profile: Option<RuntimeProfileIdentity>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
@@ -891,6 +1458,9 @@ pub struct Shell {
     mutate_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
     runtime_change_task: Option<Task<()>>,
+    /// Background Team teardown outlives individual UI timeout waiters. Retry
+    /// joins this same receiver instead of starting a concurrent shutdown.
+    team_runtime_shutdown: Option<TeamRuntimeShutdown>,
     runtime_change_error: Option<SharedString>,
     /// The one-time local→synced import stream (switch wizard progress step).
     import_task: Option<Task<()>>,
@@ -976,11 +1546,19 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
-        let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
-            this.on_state_changed(&state, cx);
-            cx.notify();
-        });
+    /// Build the views whose caches and async work are scoped to one engine
+    /// profile. Keeping their event hookups here makes replacement identical
+    /// to first boot: a fresh Composer always targets the fresh Transcript,
+    /// and spawn chips always reach the owning Shell.
+    fn build_profile_views(
+        state: &Entity<AppState>,
+        cx: &mut Context<Self>,
+    ) -> (
+        Entity<Transcript>,
+        Entity<Composer>,
+        Subscription,
+        Subscription,
+    ) {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         // Every send glides the prompt to the viewport top and reserves the
@@ -1000,6 +1578,16 @@ impl Shell {
         });
         // Spawn chips open their subagent's transcript as a right-pane tab.
         let transcript_events = cx.subscribe(&transcript, Self::on_transcript_event);
+        (transcript, composer, composer_events, transcript_events)
+    }
+
+    pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
+        let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
+            this.on_state_changed(&state, cx);
+            cx.notify();
+        });
+        let (transcript, composer, composer_events, transcript_events) =
+            Self::build_profile_views(&state, cx);
         // Working-indicator heartbeat: notify once a second while a session is
         // live so elapsed time and the flavour word stay fresh.
         let ticker = cx.spawn(async move |this, cx| {
@@ -1023,6 +1611,17 @@ impl Shell {
         });
         let data_dir = boot.data_dir.clone();
         let settings = UiSettings::load(&data_dir);
+        let fixed_runtime_profile = {
+            let state = state.read(cx);
+            if matches!(state.connection, ConnectionStatus::Ready)
+                && state.workspace_scope == Some(WorkspaceScope::Synced)
+            {
+                let engine_info = state.engine().map(|engine| engine.engine_info());
+                engine_runtime_profile_identity(engine_info.as_ref())
+            } else {
+                None
+            }
+        };
         // Bind the customizable shortcuts from the persisted keymap.
         apply_keymap(cx, &settings.keymap);
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
@@ -1089,6 +1688,7 @@ impl Shell {
             nav,
             devices_page: None,
             team_page: None,
+            team_page_sub: None,
             archived_page: None,
             appearance_page: None,
             notifications_page: None,
@@ -1110,6 +1710,18 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
+            user_menu_trigger_focus: cx.focus_handle().tab_index(0).tab_stop(true),
+            user_menu_focus: cx.focus_handle(),
+            user_menu_active: None,
+            user_menu_scroll: gpui::ScrollHandle::new(),
+            user_menu_orgs: Loadable::Idle,
+            user_menu_orgs_task: None,
+            team_change: None,
+            pending_team_change: None,
+            team_dialog_focus: cx.focus_handle(),
+            team_dialog_mode: None,
+            team_dialog_active: 0,
+            fixed_runtime_profile,
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
@@ -1120,6 +1732,7 @@ impl Shell {
             mutate_task: None,
             auth_task: None,
             runtime_change_task: None,
+            team_runtime_shutdown: None,
             runtime_change_error: None,
             import_task: None,
             import_current: None,
@@ -1160,10 +1773,124 @@ impl Shell {
         }
     }
 
+    /// Reset every view, task and cache that belongs to the runtime profile
+    /// which has just stopped. Lifecycle coordinators (`team_change` and
+    /// `sync_flow`) deliberately survive: their occluding progress/error UI
+    /// owns the handoff until the replacement runtime proves it is ready.
+    fn reset_profile_ui(&mut self, cx: &mut Context<Self>) {
+        // Cancel old-profile sends/file prompts eagerly. The entity is then
+        // replaced so its Pickers child (catalogs, refs, popovers and RPC
+        // tasks) and the Transcript's row/blob/attachment caches are dropped.
+        self.composer
+            .update(cx, |composer, cx| composer.prepare_profile_replacement(cx));
+        Composer::clear_profile_targets(&self.data_dir);
+        crate::attachments::clear_profile_cache();
+        crate::markdown::selection::clear();
+        let (transcript, composer, composer_events, transcript_events) =
+            Self::build_profile_views(&self.state, cx);
+        self.transcript = transcript;
+        self.composer = composer;
+        self._composer_events = composer_events;
+        self._transcript_events = transcript_events;
+
+        self.file_drag_active = false;
+        self.bottom_stack.set(120.0);
+        self.archived_open = true;
+        self.archived_shown = 0;
+        self.archived_hover = None;
+
+        self.terminal = None;
+        self.right_terminal = None;
+        self.right_plus = popover::Popup::default();
+        self.diffs.clear();
+        self.diff_subs.clear();
+        self.diff_seq = 0;
+        self.subagent_tabs.clear();
+        self.subagent_seq = 0;
+        self.right_tabs.clear();
+        self.right_tab_drag = None;
+        self.right_tab_scroll = gpui::ScrollHandle::new();
+
+        self.route = Route::Chat;
+        self.nav = NavHistory::new(NavEntry::Chat(String::new()));
+        self.devices_page = None;
+        self.team_page = None;
+        self.team_page_sub = None;
+        self.archived_page = None;
+        self.accounts_page = None;
+        self.harnesses_page = None;
+        // Appearance, Notifications and Shortcuts are device-local global
+        // preferences. Their entities/subscriptions intentionally survive.
+
+        self.chat_menu = popover::Popup::default();
+        self.rename_dialog = None;
+        self.delete_confirm = None;
+        self.space_menu = popover::Popup::default();
+        self.rename_space_dialog = None;
+        self.delete_space_confirm = None;
+        self.add_space = None;
+        self.spaces_menu = popover::Popup::default();
+        self.chat_status_hover = None;
+        self.sidebar_scroll = gpui::ScrollHandle::new();
+        self.space_boot_applied = false;
+        self.sound_prev.clear();
+        self.user_menu = popover::Popup::default();
+        self.user_menu_active = None;
+        self.user_menu_scroll = gpui::ScrollHandle::new();
+        self.user_menu_orgs = Loadable::Idle;
+        self.user_menu_orgs_task = None;
+        self.pending_team_change = None;
+        self.team_dialog_mode = None;
+        self.team_dialog_active = 0;
+        self.fixed_runtime_profile = None;
+        self.sidebar_notice = None;
+        self.org = None;
+        self.mutate_task = None;
+        self.auth_task = None;
+        self.import_task = None;
+        self.import_current = None;
+
+        self.panels = SessionPanels::default();
+        self.active_chat.clear();
+        self.sidebar_prev_order.clear();
+        self.sidebar_resort.clear();
+        self.sidebar_new_keys.clear();
+        self.resort_epoch = 0;
+        self.was_window_active = false;
+        self.debug_dialog = None;
+        self.right_tween = None;
+        self.right_pane_expanded = false;
+        self.terminal_tween = None;
+        self.terminal_tween_task = None;
+        self.terminal_drag_anchor = None;
+
+        // These persisted fields are lists/ids from a specific profile. Wipe
+        // only them; layout, appearance, notification and shortcut choices
+        // remain device-local and unchanged across Team switches.
+        let mut settings_changed = false;
+        settings_changed |= self.settings.last_space_id.take().is_some();
+        settings_changed |= self.settings.open_tabs.take().is_some();
+        settings_changed |= self.settings.space_filter.take().is_some();
+        if !self.settings.tab_order.is_empty() {
+            self.settings.tab_order.clear();
+            settings_changed = true;
+        }
+        if !self.settings.space_order.is_empty() {
+            self.settings.space_order.clear();
+            settings_changed = true;
+        }
+        if settings_changed {
+            self.schedule_save(cx);
+        }
+        cx.notify();
+    }
+
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
-        let next_sync_flow = {
+        let next_sync_flow = if self.team_change.is_some() {
+            self.sync_flow
+        } else {
             let state = state.read(cx);
             sync_flow_after_auth(self.sync_flow, state.workspace_scope, state.auth.as_ref())
         };
@@ -1179,6 +1906,18 @@ impl Shell {
         // The in-place local→synced switch: once the replacement runtime is
         // attached and Ready, kick the import (or finish) from here.
         self.drive_sync_switch(cx);
+        self.drive_team_change(cx);
+        self.observe_external_team_selection(cx);
+        let should_load_menu_orgs = {
+            let state = state.read(cx);
+            state.workspace_scope == Some(WorkspaceScope::Synced)
+                && matches!(state.auth, Some(AuthState::SignedIn { .. }))
+                && matches!(self.user_menu_orgs, Loadable::Idle)
+                && self.team_change.is_none()
+        };
+        if should_load_menu_orgs {
+            self.load_user_menu_orgs(cx);
+        }
         let signed_out_synced = {
             let state = state.read(cx);
             state.workspace_scope == Some(WorkspaceScope::Synced)
@@ -1187,7 +1926,7 @@ impl Shell {
         // AuthStatus is shared by every viewport. Whichever viewport owns the
         // embedded runtime drains it; remote viewports request daemon shutdown
         // and all of them independently reattach to the new local runtime.
-        if signed_out_synced && self.runtime_change_task.is_none() {
+        if signed_out_synced && self.runtime_change_task.is_none() && self.team_change.is_none() {
             self.start_local_runtime_transition(false, cx);
         }
         // Capture knob: the add-space palette needs only the device registry.
@@ -1965,6 +2704,128 @@ impl Shell {
         }
     }
 
+    fn open_user_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).workspace_scope == Some(WorkspaceScope::Synced)
+            && matches!(self.user_menu_orgs, Loadable::Idle)
+        {
+            self.load_user_menu_orgs(cx);
+        }
+        self.user_menu_active = self
+            .user_menu_orgs
+            .ready()
+            .and_then(|rows| (!rows.is_empty()).then_some(0));
+        self.user_menu.open(());
+        window.focus(&self.user_menu_focus, cx);
+        cx.notify();
+    }
+
+    fn toggle_user_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.user_menu.is_open() {
+            self.close_user_menu(cx);
+            window.focus(&self.user_menu_trigger_focus, cx);
+        } else {
+            self.open_user_menu(window, cx);
+        }
+    }
+
+    fn user_menu_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.user_menu.is_open() {
+            return;
+        }
+        let raw = event.keystroke.key.as_str();
+        let key = popover::classify_key(
+            raw,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        match key {
+            popover::MenuKey::Escape => {
+                self.close_user_menu(cx);
+                window.focus(&self.user_menu_trigger_focus, cx);
+            }
+            popover::MenuKey::Up | popover::MenuKey::Down => {
+                let count = self
+                    .user_menu_orgs
+                    .ready()
+                    .map_or(0, |memberships| memberships.len());
+                let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
+                self.user_menu_active = popover::menu_step(self.user_menu_active, count, delta);
+                if let Some(active) = self.user_menu_active {
+                    // Identity + Teams heading precede the membership rows.
+                    self.user_menu_scroll.scroll_to_item(active + 2);
+                }
+                cx.notify();
+            }
+            popover::MenuKey::Enter | popover::MenuKey::ModEnter
+                if matches!(self.user_menu_orgs, Loadable::Error(_)) =>
+            {
+                self.user_menu_orgs = Loadable::Idle;
+                self.load_user_menu_orgs(cx);
+            }
+            popover::MenuKey::Enter | popover::MenuKey::ModEnter
+                if self.user_menu_active.is_some() =>
+            {
+                self.activate_user_menu_team(window, cx);
+            }
+            popover::MenuKey::Other if raw == "space" => {
+                if matches!(self.user_menu_orgs, Loadable::Error(_)) {
+                    self.user_menu_orgs = Loadable::Idle;
+                    self.load_user_menu_orgs(cx);
+                } else if self.user_menu_active.is_some() {
+                    self.activate_user_menu_team(window, cx);
+                }
+            }
+            // Consume Enter even while the Team list is loading or empty.
+            // Otherwise it bubbles into the avatar trigger and closes the
+            // menu, while Space correctly leaves it open.
+            popover::MenuKey::Enter | popover::MenuKey::ModEnter => {}
+            popover::MenuKey::Backspace | popover::MenuKey::Other => return,
+        }
+        cx.stop_propagation();
+    }
+
+    fn activate_user_menu_team(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.user_menu_active else {
+            return;
+        };
+        let Some(org) = self
+            .user_menu_orgs
+            .ready()
+            .and_then(|memberships| memberships.get(active))
+            .cloned()
+        else {
+            self.user_menu_active = None;
+            return;
+        };
+        if self.current_org_id(cx).as_deref() == Some(org.organization_id.as_str()) {
+            self.close_user_menu(cx);
+            window.focus(&self.user_menu_trigger_focus, cx);
+            return;
+        }
+        let team_busy = self.pending_team_change.is_some()
+            || self.runtime_change_task.is_some()
+            || self.team_change.as_ref().is_some_and(|change| {
+                matches!(
+                    change.phase,
+                    TeamChangePhase::Selecting | TeamChangePhase::Restarting
+                )
+            });
+        if !team_busy {
+            self.request_team_mutation(
+                TeamMutation::Select {
+                    organization_id: org.organization_id,
+                    label: org.name.into(),
+                },
+                cx,
+            );
+        }
+    }
+
     /// Close the session-row context menu through the exit animation.
     fn close_chat_menu(&mut self, cx: &mut Context<Self>) {
         if self.chat_menu.begin_close() {
@@ -2043,7 +2904,16 @@ impl Shell {
             SettingsSection::Team => {
                 if self.team_page.is_none() {
                     let state = self.state.clone();
-                    self.team_page = Some(cx.new(|cx| TeamPage::new(state, cx)));
+                    let page = cx.new(|cx| TeamPage::new(state, cx));
+                    self.team_page_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &TeamPageEvent, cx| match event {
+                            TeamPageEvent::RequestRuntimeChange(mutation) => {
+                                this.request_team_mutation(mutation.clone(), cx)
+                            }
+                        },
+                    ));
+                    self.team_page = Some(page);
                 }
                 match &self.team_page {
                     Some(page) => page.clone().into_any_element(),
@@ -2240,6 +3110,681 @@ impl Shell {
         cx.notify();
     }
 
+    // ---- Team switch lifecycle ----
+
+    fn observe_external_team_selection(&mut self, cx: &mut Context<Self>) {
+        let (connection, workspace_scope, auth, engine_profile) = {
+            let state = self.state.read(cx);
+            let engine_info = state.engine().map(|engine| engine.engine_info());
+            (
+                state.connection.clone(),
+                state.workspace_scope,
+                state.auth.clone(),
+                engine_runtime_profile_identity(engine_info.as_ref()),
+            )
+        };
+
+        if matches!(connection, ConnectionStatus::Ready)
+            && workspace_scope == Some(WorkspaceScope::Local)
+        {
+            self.fixed_runtime_profile = None;
+            return;
+        }
+
+        let explicit_handoff = self.team_change.is_some();
+        // Capture the immutable data-plane boundary first. If this viewport
+        // attached after SELECT_ORG published but before the old runtime died,
+        // comparing it to AuthStatus below immediately detects that split.
+        if self.fixed_runtime_profile.is_none()
+            && !explicit_handoff
+            && self.runtime_change_task.is_none()
+            && matches!(connection, ConnectionStatus::Ready)
+            && workspace_scope == Some(WorkspaceScope::Synced)
+            && let Some(profile) = engine_profile
+        {
+            self.fixed_runtime_profile = Some(profile);
+        }
+
+        if self.runtime_change_task.is_none()
+            && let Some(target) = external_team_replacement_target(
+                self.fixed_runtime_profile.as_ref(),
+                &connection,
+                workspace_scope,
+                auth.as_ref(),
+                explicit_handoff,
+            )
+        {
+            let organization_id = target.organization_id.clone();
+            let label = self
+                .user_menu_orgs
+                .ready()
+                .and_then(|orgs| {
+                    orgs.iter()
+                        .find(|org| org.organization_id == organization_id)
+                        .map(|org| SharedString::from(org.name.clone()))
+                })
+                .unwrap_or_else(|| "the selected Team".into());
+            self.start_team_runtime_replacement(label, Some(organization_id), true, cx);
+            if let Some(change) = self.team_change.as_mut() {
+                change.expected_user_id = Some(target.user_id);
+            }
+            return;
+        }
+    }
+
+    fn current_org_id(&self, cx: &Context<Self>) -> Option<String> {
+        match self.state.read(cx).auth.as_ref()? {
+            AuthState::SignedIn { org_id, .. } => org_id.clone(),
+            _ => None,
+        }
+    }
+
+    fn current_team_name(&self, cx: &Context<Self>) -> Option<SharedString> {
+        let current = self.current_org_id(cx)?;
+        self.user_menu_orgs
+            .ready()?
+            .iter()
+            .find(|org| org.organization_id == current)
+            .map(|org| org.name.clone().into())
+    }
+
+    fn load_user_menu_orgs(&mut self, cx: &mut Context<Self>) {
+        if self.user_menu_orgs.is_loading() || self.user_menu_orgs_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.user_menu_orgs = Loadable::Error("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let current = self.current_org_id(cx);
+        self.user_menu_orgs = Loadable::Loading;
+        self.user_menu_orgs_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_ORGS, serde_json::json!({}))
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.user_menu_orgs_task = None;
+                shell.user_menu_orgs = match result {
+                    Ok(value) => Loadable::Ready(teams_current_first(
+                        sort_memberships(parse_orgs(&value)),
+                        current.as_deref(),
+                    )),
+                    Err(error) => Loadable::Error(error.to_string()),
+                };
+                shell.user_menu_active = shell
+                    .user_menu_orgs
+                    .ready()
+                    .and_then(|rows| (!rows.is_empty()).then_some(0));
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn team_label(&self, organization_id: &str, fallback: SharedString) -> SharedString {
+        self.user_menu_orgs
+            .ready()
+            .and_then(|orgs| {
+                orgs.iter()
+                    .find(|org| org.organization_id == organization_id)
+                    .map(|org| SharedString::from(org.name.clone()))
+            })
+            .unwrap_or(fallback)
+    }
+
+    fn team_handoff_risk(&self, cx: &App) -> TeamHandoffRisk {
+        let (live_runs, pending_sends) = {
+            let state = self.state.read(cx);
+            (
+                live_team_run_count(&state.sessions),
+                state.pending_send_count(),
+            )
+        };
+        let composer = self.composer.read(cx).unsent_risk(cx);
+        TeamHandoffRisk {
+            live_runs,
+            composer,
+            pending_sends,
+        }
+    }
+
+    /// Shared destructive preflight for both avatar-menu and Settings Team
+    /// mutations. No profile-changing RPC is issued before this returns or the
+    /// user confirms the stored pending mutation.
+    fn request_team_mutation(&mut self, mutation: TeamMutation, cx: &mut Context<Self>) {
+        if let TeamMutation::Select {
+            organization_id, ..
+        } = &mutation
+            && self.current_org_id(cx).as_deref() == Some(organization_id.as_str())
+        {
+            self.close_user_menu(cx);
+            return;
+        }
+        if self.pending_team_change.is_some()
+            || self.runtime_change_task.is_some()
+            || self.team_change.as_ref().is_some_and(|change| {
+                matches!(
+                    change.phase,
+                    TeamChangePhase::Selecting | TeamChangePhase::Restarting
+                )
+            })
+        {
+            return;
+        }
+        let risk = self.team_handoff_risk(cx);
+        if risk.has_any() {
+            self.close_user_menu(cx);
+            self.pending_team_change = Some(PendingTeamChange { mutation, risk });
+            cx.notify();
+            return;
+        }
+        self.begin_team_mutation(mutation, cx);
+    }
+
+    fn begin_team_mutation(&mut self, mutation: TeamMutation, cx: &mut Context<Self>) {
+        if self.runtime_change_task.is_some() || self.team_change.is_some() {
+            return;
+        }
+        let label = mutation.label();
+        let requested_organization_id = mutation.requested_organization_id().map(str::to_owned);
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.team_change = Some(TeamChange {
+                organization_id: requested_organization_id,
+                expected_user_id: None,
+                label,
+                phase: TeamChangePhase::SelectFailed,
+                error: Some("Engine not connected".into()),
+                mutation: Some(mutation),
+                original_error: None,
+                selection_confirmed: false,
+            });
+            cx.notify();
+            return;
+        };
+        self.close_user_menu(cx);
+        self.runtime_change_error = None;
+        self.team_change = Some(TeamChange {
+            organization_id: requested_organization_id.clone(),
+            expected_user_id: None,
+            label: label.clone(),
+            phase: TeamChangePhase::Selecting,
+            error: None,
+            mutation: Some(mutation.clone()),
+            original_error: None,
+            selection_confirmed: false,
+        });
+        let original_org = self.current_org_id(cx);
+        let (method, params) = mutation.rpc();
+        let request = Tokio::spawn(cx, async move {
+            tokio::time::timeout(RUNTIME_CHANGE_TIMEOUT, engine.client().call(method, params)).await
+        });
+        self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
+            let result = request.await;
+            this.update(cx, |shell, cx| {
+                shell.runtime_change_task = None;
+                match result {
+                    Ok(Ok(Ok(value))) => match confirmed_team_mutation_target(&mutation, &value) {
+                        Ok(target) => {
+                            let resolved_label = target
+                                .as_deref()
+                                .map(|target| shell.team_label(target, label.clone()))
+                                .unwrap_or_else(|| "local workspace".into());
+                            shell.start_team_runtime_replacement(resolved_label, target, true, cx);
+                        }
+                        Err(error) => {
+                            shell.reconcile_unknown_team_mutation(mutation, original_org, error, cx)
+                        }
+                    },
+                    Ok(Ok(Err(error))) => shell.reconcile_unknown_team_mutation(
+                        mutation,
+                        original_org,
+                        error.to_string(),
+                        cx,
+                    ),
+                    Ok(Err(_)) => shell.reconcile_unknown_team_mutation(
+                        mutation,
+                        original_org,
+                        format!(
+                            "Team request timed out after {} seconds",
+                            RUNTIME_CHANGE_TIMEOUT.as_secs()
+                        ),
+                        cx,
+                    ),
+                    Err(error) => shell.reconcile_unknown_team_mutation(
+                        mutation,
+                        original_org,
+                        format!("Team request task failed: {error}"),
+                        cx,
+                    ),
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn reconcile_unknown_team_mutation(
+        &mut self,
+        mutation: TeamMutation,
+        original_org: Option<String>,
+        error: String,
+        cx: &mut Context<Self>,
+    ) {
+        let requested = mutation.requested_organization_id().map(str::to_owned);
+        let actual = self.current_org_id(cx);
+        let observed_change = actual != original_org;
+        let confirmed = observed_change
+            || requested.as_deref().is_some_and(|requested| {
+                team_selection_error_is_confirmed(actual.as_deref(), requested)
+            });
+        let target = if observed_change {
+            actual.clone()
+        } else {
+            requested
+        };
+        let label = target
+            .as_deref()
+            .map(|target| self.team_label(target, mutation.label()))
+            .unwrap_or_else(|| {
+                if observed_change {
+                    "local workspace".into()
+                } else {
+                    mutation.label()
+                }
+            });
+        if let Some(change) = self.team_change.as_mut() {
+            change.original_error = Some(error.into());
+            change.mutation = Some(mutation);
+        }
+        self.start_team_runtime_replacement(label, target, confirmed, cx);
+    }
+
+    fn cancel_pending_team_change(&mut self, cx: &mut Context<Self>) {
+        self.pending_team_change = None;
+        cx.notify();
+    }
+
+    fn confirm_pending_team_change(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_team_change.take() else {
+            return;
+        };
+        self.begin_team_mutation(pending.mutation, cx);
+    }
+
+    /// Auth has already selected the new Team. Stop the old fixed-profile
+    /// runtime, wait for its daemon/lock to disappear, then bootstrap in place.
+    fn start_team_runtime_replacement(
+        &mut self,
+        label: SharedString,
+        requested_organization_id: Option<String>,
+        selection_confirmed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.runtime_change_task.is_some() {
+            return;
+        }
+        self.pending_team_change = None;
+        let (expected_user_id, mutation, original_error) = self
+            .team_change
+            .as_ref()
+            .map(|change| {
+                (
+                    change.expected_user_id.clone(),
+                    change.mutation.clone(),
+                    change.original_error.clone(),
+                )
+            })
+            .unwrap_or((None, None, None));
+        let organization_id = requested_organization_id.or_else(|| {
+            self.team_change
+                .as_ref()
+                .and_then(|change| change.organization_id.clone())
+        });
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.team_change = Some(TeamChange {
+                organization_id,
+                expected_user_id,
+                label,
+                phase: TeamChangePhase::ReplaceFailed,
+                error: Some("Engine not connected".into()),
+                mutation,
+                original_error,
+                selection_confirmed,
+            });
+            cx.notify();
+            return;
+        };
+        self.close_user_menu(cx);
+        self.user_menu_orgs_task = None;
+        self.user_menu_orgs = Loadable::Idle;
+        self.runtime_change_error = None;
+        self.team_change = Some(TeamChange {
+            organization_id,
+            expected_user_id,
+            label: label.clone(),
+            phase: TeamChangePhase::Restarting,
+            error: None,
+            mutation,
+            original_error,
+            selection_confirmed,
+        });
+        let ipc_port = self.boot.ipc_port;
+        let data_dir = self.data_dir.clone();
+        let shutdown_status = if let Some(shutdown) = self.team_runtime_shutdown.as_ref() {
+            shutdown.status.clone()
+        } else {
+            let (status_tx, status) = tokio::sync::watch::channel(RuntimeShutdownStatus::Running);
+            let task = Tokio::handle(cx).spawn(async move {
+                let result = stop_synced_runtime(engine, ipc_port, &data_dir).await;
+                status_tx.send_replace(RuntimeShutdownStatus::Finished(result));
+            });
+            self.team_runtime_shutdown = Some(TeamRuntimeShutdown {
+                status: status.clone(),
+                _task: task,
+            });
+            status
+        };
+        let transition = Tokio::spawn(cx, async move {
+            wait_for_runtime_shutdown(shutdown_status, RUNTIME_CHANGE_TIMEOUT).await
+        });
+        let state = self.state.clone();
+        let boot = self.boot.clone();
+        self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = match transition.await {
+                Ok(outcome) => outcome,
+                Err(_) => RuntimeShutdownWait::WorkerEnded,
+            };
+            this.update(cx, |shell, cx| {
+                shell.runtime_change_task = None;
+                if !matches!(&outcome, RuntimeShutdownWait::TimedOut) {
+                    shell.team_runtime_shutdown = None;
+                }
+                match outcome {
+                    RuntimeShutdownWait::Finished(Ok(())) => {
+                        shell.runtime_change_error = None;
+                        state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
+                        shell.reset_profile_ui(cx);
+                        AppState::bootstrap(state.clone(), boot, cx);
+                    }
+                    RuntimeShutdownWait::Finished(Err(error)) => {
+                        if let Some(change) = shell.team_change.as_mut() {
+                            change.phase = TeamChangePhase::ReplaceFailed;
+                            change.error = Some(error.into());
+                        }
+                        cx.notify();
+                    }
+                    RuntimeShutdownWait::TimedOut => {
+                        if let Some(change) = shell.team_change.as_mut() {
+                            change.phase = TeamChangePhase::ReplaceFailed;
+                            change.error = Some(
+                                format!(
+                                    "The engine is still stopping after {} seconds. Teardown continues safely in the background; Retry will rejoin it without starting another shutdown.",
+                                    RUNTIME_CHANGE_TIMEOUT.as_secs()
+                                )
+                                .into(),
+                            );
+                        }
+                        cx.notify();
+                    }
+                    RuntimeShutdownWait::WorkerEnded => {
+                        if let Some(change) = shell.team_change.as_mut() {
+                            change.phase = TeamChangePhase::ReplaceFailed;
+                            change.error = Some(
+                                "The background engine teardown ended without reporting a result. Retry will start a fresh shutdown attempt."
+                                    .into(),
+                            );
+                        }
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn drive_team_change(&mut self, cx: &mut Context<Self>) {
+        if self.runtime_change_task.is_some()
+            || !matches!(
+                self.team_change.as_ref().map(|change| change.phase),
+                Some(TeamChangePhase::Restarting)
+            )
+        {
+            return;
+        }
+        let (connection, workspace_scope, auth, engine_info) = {
+            let state = self.state.read(cx);
+            (
+                state.connection.clone(),
+                state.workspace_scope,
+                state.auth.clone(),
+                state.engine().map(|engine| engine.engine_info()),
+            )
+        };
+        match connection {
+            ConnectionStatus::Ready => {
+                let (expectation, target, selection_confirmed) = self
+                    .team_change
+                    .as_ref()
+                    .map(|change| {
+                        (
+                            if !change.selection_confirmed {
+                                TeamRuntimeExpectation::Any
+                            } else if let Some(organization_id) = change.organization_id.as_deref()
+                            {
+                                match change.expected_user_id.as_deref() {
+                                    Some(user_id) => TeamRuntimeExpectation::ExactProfile {
+                                        organization_id,
+                                        user_id,
+                                    },
+                                    None => TeamRuntimeExpectation::ExactOrg(organization_id),
+                                }
+                            } else {
+                                TeamRuntimeExpectation::SignedOut
+                            },
+                            change.organization_id.clone(),
+                            change.selection_confirmed,
+                        )
+                    })
+                    .unwrap_or((TeamRuntimeExpectation::Any, None, true));
+                let Some(validation) = validate_team_runtime_auth(auth.as_ref(), expectation)
+                else {
+                    return; // wait for the replacement runtime's first AuthStatus frame
+                };
+                if let Err(error) = validation {
+                    if let Some(change) = self.team_change.as_mut() {
+                        change.phase = TeamChangePhase::ReplaceFailed;
+                        change.error = Some(error.into());
+                    }
+                    cx.notify();
+                    return;
+                }
+                let Some(engine_info) = engine_info.as_ref() else {
+                    if let Some(change) = self.team_change.as_mut() {
+                        change.phase = TeamChangePhase::ReplaceFailed;
+                        change.error = Some(
+                            "The replacement connection did not expose a fixed runtime identity."
+                                .into(),
+                        );
+                    }
+                    cx.notify();
+                    return;
+                };
+                let Some(auth) = auth.as_ref() else {
+                    return;
+                };
+                if let Err(error) = validate_team_runtime_planes(engine_info, auth) {
+                    if let Some(change) = self.team_change.as_mut() {
+                        change.phase = TeamChangePhase::ReplaceFailed;
+                        change.error = Some(error.into());
+                    }
+                    cx.notify();
+                    return;
+                }
+                let outcome_unknown_notice = self
+                    .team_change
+                    .as_ref()
+                    .and_then(team_outcome_unknown_notice);
+                let runtime_profile = engine_runtime_profile_identity(Some(engine_info));
+                if !selection_confirmed && let Some(target) = target {
+                    match classify_ambiguous_team_runtime(auth, &target) {
+                        AmbiguousTeamRuntimeOutcome::RequestedProfile(_) => {}
+                        AmbiguousTeamRuntimeOutcome::OtherProfile(_) => {
+                            // The ambiguous RPC did not durably select the
+                            // requested Team. A concrete signed-in profile is
+                            // open, so Cancel is safe and Retry can select again.
+                            self.fixed_runtime_profile = runtime_profile.clone();
+                            if let Some(change) = self.team_change.as_mut() {
+                                change.phase = TeamChangePhase::SelectFailed;
+                                let original = change
+                                    .original_error
+                                    .as_deref()
+                                    .unwrap_or("the Team response was lost");
+                                change.error = Some(format!(
+                                    "The operation outcome was unknown ({original}). Your previous Team reopened safely. Refresh Teams to verify the result, then retry only if needed."
+                                ).into());
+                            }
+                            if outcome_unknown_notice.is_some() {
+                                self.sidebar_notice = outcome_unknown_notice.clone();
+                            }
+                            self.user_menu_orgs = Loadable::Idle;
+                            self.load_user_menu_orgs(cx);
+                            cx.notify();
+                            return;
+                        }
+                        AmbiguousTeamRuntimeOutcome::SignedOut => {
+                            // A fail-closed SELECT refresh can clear the session.
+                            // The replacement bootstrap normally opens Local
+                            // directly. Only an unexpectedly-still-Synced runtime
+                            // needs another transition; waiting for a future
+                            // AuthStatus notification can leave that case stuck.
+                            self.fixed_runtime_profile = None;
+                            self.team_change = None;
+                            self.runtime_change_error = None;
+                            if outcome_unknown_notice.is_some() {
+                                self.sidebar_notice = outcome_unknown_notice.clone();
+                            }
+                            match signed_out_team_runtime_action(workspace_scope) {
+                                SignedOutTeamRuntimeAction::AlreadyLocal => {
+                                    self.sync_flow = SyncFlow::Idle;
+                                    self.user_menu_orgs = Loadable::Idle;
+                                    cx.notify();
+                                }
+                                SignedOutTeamRuntimeAction::ReplaceSyncedWithLocal => {
+                                    self.start_local_runtime_transition(false, cx);
+                                }
+                            }
+                            return;
+                        }
+                        AmbiguousTeamRuntimeOutcome::NeedsOrganization => {
+                            // The clean replacement runtime already owns this
+                            // auth state. Let the normal organization gate take
+                            // over instead of presenting it as an old-Team retry.
+                            self.fixed_runtime_profile = None;
+                            self.team_change = None;
+                            self.runtime_change_error = None;
+                            if outcome_unknown_notice.is_some() {
+                                self.sidebar_notice = outcome_unknown_notice.clone();
+                            }
+                            self.user_menu_orgs = Loadable::Idle;
+                            cx.notify();
+                            return;
+                        }
+                    }
+                }
+                self.fixed_runtime_profile = runtime_profile;
+                self.team_change = None;
+                self.runtime_change_error = None;
+                if outcome_unknown_notice.is_some() {
+                    self.sidebar_notice = outcome_unknown_notice;
+                }
+                self.user_menu_orgs = Loadable::Idle;
+                if self.state.read(cx).workspace_scope == Some(WorkspaceScope::Synced)
+                    && matches!(self.state.read(cx).auth, Some(AuthState::SignedIn { .. }))
+                {
+                    self.load_user_menu_orgs(cx);
+                }
+                cx.notify();
+            }
+            ConnectionStatus::Failed(error) => {
+                if let Some(change) = self.team_change.as_mut() {
+                    change.phase = TeamChangePhase::ReplaceFailed;
+                    change.error = Some(error.into());
+                }
+                cx.notify();
+            }
+            ConnectionStatus::Connecting => {}
+        }
+    }
+
+    fn retry_team_change(&mut self, cx: &mut Context<Self>) {
+        let Some(change) = self.team_change.clone() else {
+            return;
+        };
+        match change.phase {
+            TeamChangePhase::SelectFailed => {
+                self.team_change = None;
+                if let Some(mutation) = change.mutation {
+                    self.request_team_mutation(mutation, cx);
+                } else if let Some(organization_id) = change.organization_id {
+                    if self.current_org_id(cx).as_deref() == Some(organization_id.as_str()) {
+                        self.start_team_runtime_replacement(
+                            change.label,
+                            Some(organization_id),
+                            true,
+                            cx,
+                        );
+                    } else {
+                        self.request_team_mutation(
+                            TeamMutation::Select {
+                                organization_id,
+                                label: change.label,
+                            },
+                            cx,
+                        );
+                    }
+                } else {
+                    self.sidebar_notice = Some(
+                        "This Team operation cannot be retried safely. Refresh Teams and verify its outcome."
+                            .into(),
+                    );
+                    cx.notify();
+                }
+            }
+            TeamChangePhase::ReplaceFailed => {
+                if self.state.read(cx).engine().is_some() {
+                    self.start_team_runtime_replacement(
+                        change.label,
+                        change.organization_id,
+                        change.selection_confirmed,
+                        cx,
+                    );
+                } else {
+                    if let Some(change) = self.team_change.as_mut() {
+                        change.phase = TeamChangePhase::Restarting;
+                        change.error = None;
+                    }
+                    AppState::bootstrap(self.state.clone(), self.boot.clone(), cx);
+                    cx.notify();
+                }
+            }
+            TeamChangePhase::Selecting | TeamChangePhase::Restarting => {}
+        }
+    }
+
+    fn cancel_failed_team_selection(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.team_change.as_ref().map(|change| change.phase),
+            Some(TeamChangePhase::SelectFailed)
+        ) {
+            self.team_change = None;
+            cx.notify();
+        }
+    }
+
     fn request_sign_out(&mut self, cx: &mut Context<Self>) {
         self.close_user_menu(cx);
         if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
@@ -2291,10 +3836,8 @@ impl Shell {
                     Ok(()) => {
                         shell.sync_flow = SyncFlow::Idle;
                         shell.runtime_change_error = None;
-                        shell.org = None;
-                        shell.route = Route::Chat;
-                        shell.space_boot_applied = false;
                         state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
+                        shell.reset_profile_ui(cx);
                         AppState::bootstrap(state.clone(), boot, cx);
                     }
                     Err(error) => {
@@ -2425,10 +3968,8 @@ impl Shell {
                         // Keep `Switching { import }`: the state observer sees
                         // the replacement runtime reach Ready and advances the
                         // wizard from there.
-                        shell.org = None;
-                        shell.route = Route::Chat;
-                        shell.space_boot_applied = false;
                         state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
+                        shell.reset_profile_ui(cx);
                         AppState::bootstrap(state.clone(), boot, cx);
                     }
                     Err(error) => {
@@ -3720,7 +5261,15 @@ impl Shell {
                     .as_ref()
                     .map(|u| SharedString::from(u.email.clone()))
                     .unwrap_or_else(|| line.clone());
-                (line, Some("Alpha".into()), email)
+                let team = user.as_ref().map(|_| {
+                    self.current_team_name(cx)
+                        .unwrap_or_else(|| match &self.user_menu_orgs {
+                            Loadable::Idle | Loadable::Loading => "Loading Team…".into(),
+                            Loadable::Error(_) => "Team unavailable".into(),
+                            Loadable::Ready(_) => "No Team selected".into(),
+                        })
+                });
+                (line, team, email)
             }
         };
         let user_menu =
@@ -3984,8 +5533,17 @@ impl Shell {
             .into();
         let mut trigger = div()
             .id("user-menu")
+            .key_context("TeamMenu")
+            .track_focus(&self.user_menu_trigger_focus)
+            .role(Role::Button)
+            .aria_label("Team and account menu")
+            .aria_expanded(open)
             .flex_none()
             .rounded(px(8.0))
+            // Reserve the focus ring so keyboard focus never changes layout.
+            .border_1()
+            .border_color(theme.border_strong.opacity(0.0))
+            .focus_visible(|style| style.border_color(theme.border_strong))
             .px(px(Theme::SPACE_SM))
             .py(px(Theme::SPACE_SM))
             .flex()
@@ -4009,16 +5567,23 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.user_menu.note_trigger_press()),
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                // A press that found the menu open closes it (the card's
-                // mouse-down-out already began the close) — never reopen.
+            );
+        trigger = trigger
+            .on_click(cx.listener(|this, _, window, cx| {
+                // `note_trigger_press` preserves the anchored-menu outside
+                // click behavior. Only the genuinely closed case opens.
                 if this.user_menu.take_press_was_open() {
                     this.close_user_menu(cx);
-                } else {
-                    this.user_menu.open(());
+                    window.focus(&this.user_menu_trigger_focus, cx);
+                } else if !this.user_menu.is_open() {
+                    this.open_user_menu(window, cx);
                 }
-                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.toggle_user_menu(window, cx);
+                    cx.stop_propagation();
+                }
             }))
             .child(
                 // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
@@ -4063,13 +5628,51 @@ impl Shell {
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
-            // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
-            // (exactly as wide as the trigger row — sidebar minus its p-2
-            // gutters), `flex-col gap-0.5`, then: one small muted email line
-            // (`px-2 pb-1 pt-1.5 text-[11px] text-muted-foreground/70`),
-            // the action selected by the runtime scope, then "Settings".
-            let menu = popover::popover_card(theme)
+            let synced = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Synced);
+            let current_org = self.current_org_id(cx);
+            let team_busy = self.pending_team_change.is_some()
+                || self.runtime_change_task.is_some()
+                || self.team_change.as_ref().is_some_and(|change| {
+                    matches!(
+                        change.phase,
+                        TeamChangePhase::Selecting | TeamChangePhase::Restarting
+                    )
+                });
+            let orgs = self.user_menu_orgs.clone();
+            // Exactly as wide as the trigger row. Team memberships live here,
+            // above the management/account actions, so the common switch path
+            // is one click after opening the avatar menu.
+            let mut menu = popover::popover_card(theme)
+                .id("user-menu-scroll")
+                .key_context("TeamMenu")
+                .track_focus(&self.user_menu_focus)
+                .role(Role::Menu)
+                .aria_label("Teams and account actions")
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
+                .max_h(px(420.0))
+                .overflow_y_scroll()
+                .track_scroll(&self.user_menu_scroll)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    this.user_menu_key(event, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &FocusNextControl, window, cx| {
+                    if this.user_menu.is_open() {
+                        this.close_user_menu(cx);
+                        window.focus(&this.user_menu_trigger_focus, cx);
+                        window.focus_next(cx);
+                    } else {
+                        cx.propagate();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &FocusPreviousControl, window, cx| {
+                    if this.user_menu.is_open() {
+                        this.close_user_menu(cx);
+                        window.focus(&this.user_menu_trigger_focus, cx);
+                        window.focus_prev(cx);
+                    } else {
+                        cx.propagate();
+                    }
+                }))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.close_user_menu(cx);
                 }))
@@ -4085,74 +5688,248 @@ impl Shell {
                         .text_color(theme.text_muted.opacity(0.7))
                         .truncate()
                         .child(menu_identity),
-                )
-                .when_some(action, |menu, action| {
-                    let row = match action {
-                        AccountMenuAction::EnableSync => {
-                            popover::menu_row(theme, false, "user-menu-enable-sync")
-                                .id("user-menu-enable-sync")
-                                .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
+                );
+
+            if synced {
+                menu = menu.child(popover::menu_heading(theme, "Teams"));
+                match orgs {
+                    Loadable::Idle | Loadable::Loading => {
+                        menu = menu.child(div().px(px(8.0)).child(popover::skeleton_rows(
+                            "user-menu-teams-skeleton",
+                            theme,
+                            2,
+                            cx.entity_id(),
+                            cx,
+                        )));
+                    }
+                    Loadable::Error(message) => {
+                        menu = menu.child(
+                            popover::error_row(theme, &format!("Could not load Teams: {message}"))
                                 .child(
-                                    icon(icons::GLOBAL)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Enable sync"))
-                                .into_any_element()
+                                    div()
+                                        .id("user-menu-teams-retry")
+                                        .rounded(px(7.0))
+                                        .px(px(8.0))
+                                        .py(px(4.0))
+                                        .text_color(theme.text)
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(theme.glass_hover()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.user_menu_orgs = Loadable::Idle;
+                                            this.load_user_menu_orgs(cx);
+                                        }))
+                                        .child("Retry"),
+                                ),
+                        );
+                    }
+                    Loadable::Ready(rows) if rows.is_empty() => {
+                        menu = menu.child(
+                            div()
+                                .px(px(8.0))
+                                .py(px(7.0))
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted)
+                                .child("No Teams available"),
+                        );
+                    }
+                    Loadable::Ready(rows) => {
+                        for (ix, org) in rows.into_iter().enumerate() {
+                            let is_current =
+                                current_org.as_deref() == Some(org.organization_id.as_str());
+                            let is_keyboard_active = self.user_menu_active == Some(ix);
+                            let organization_id = org.organization_id.clone();
+                            let label: SharedString = org.name.clone().into();
+                            let role: SharedString = if org.role == "admin" {
+                                "Admin".into()
+                            } else {
+                                "Member".into()
+                            };
+                            let row_id: SharedString = format!("user-menu-team-{ix}").into();
+                            let fade_key: SharedString = format!("user-menu-team-fade-{ix}").into();
+                            let accessible_label: SharedString = format!(
+                                "{}, {}{}",
+                                org.name,
+                                role,
+                                if is_current { ", current Team" } else { "" }
+                            )
+                            .into();
+                            let mut row = popover::menu_row_nav(
+                                theme,
+                                is_current,
+                                is_keyboard_active,
+                                fade_key,
+                            )
+                            .id(row_id)
+                            .role(Role::MenuItem)
+                            .aria_label(accessible_label)
+                            .aria_selected(is_current)
+                            .when(is_keyboard_active, |row| row.aria_active_descendant())
+                            .when(team_busy && !is_current, |row| row.opacity(0.45))
+                            .child(icon(icons::GLOBAL).size(px(16.0)).flex_none().text_color(
+                                if is_current {
+                                    theme.text
+                                } else {
+                                    theme.text_muted
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().truncate().child(label.clone()))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(theme.text_muted.opacity(0.7))
+                                            .child(role),
+                                    ),
+                            );
+                            if is_current {
+                                row = row
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.close_user_menu(cx)),
+                                    )
+                                    .child(
+                                        icon(icons::CHECK)
+                                            .size(px(15.0))
+                                            .flex_none()
+                                            .text_color(theme.success_muted),
+                                    );
+                            } else if !team_busy {
+                                row = row.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.request_team_mutation(
+                                        TeamMutation::Select {
+                                            organization_id: organization_id.clone(),
+                                            label: label.clone(),
+                                        },
+                                        cx,
+                                    )
+                                }));
+                            }
+                            menu = menu.child(row);
                         }
-                        AccountMenuAction::SyncInProgress => {
-                            popover::menu_row(theme, false, "user-menu-sync-progress")
-                                .id("user-menu-sync-progress")
-                                .opacity(0.6)
-                                .child(
-                                    icon(icons::GLOBAL)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Sync setup in progress"))
-                                .into_any_element()
-                        }
-                        AccountMenuAction::RestartPending => {
-                            popover::menu_row(theme, false, "user-menu-sync-restart")
-                                .id("user-menu-sync-restart")
-                                .on_click(cx.listener(|this, _, _, cx| this.reopen_sync_notice(cx)))
-                                .child(
-                                    icon(icons::RESTART)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Finish sync setup"))
-                                .into_any_element()
-                        }
-                        AccountMenuAction::SignOut => {
-                            popover::menu_row(theme, false, "user-menu-signout")
-                                .id("user-menu-signout")
-                                .on_click(cx.listener(|this, _, _, cx| this.request_sign_out(cx)))
-                                .child(
-                                    icon(icons::LOGOUT_2)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Sign out"))
-                                .into_any_element()
-                        }
-                    };
-                    menu.child(row).child(popover::menu_separator())
-                })
-                .child(
-                    popover::menu_row(theme, false, "user-menu-settings")
-                        .id("user-menu-settings")
+                    }
+                }
+                menu = menu.child(popover::menu_separator()).child(
+                    popover::menu_row(theme, false, "user-menu-manage-team")
+                        .id("user-menu-manage-team")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_settings(SettingsSection::Devices, cx)
+                            this.open_settings(SettingsSection::Team, cx)
                         }))
                         .child(
-                            icon(icons::SETTINGS_MINIMALISTIC)
+                            icon(icons::GLOBAL)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
-                        .child(SharedString::from("Settings")),
-                )
-                .into_any_element();
+                        .child(SharedString::from("Manage current Team")),
+                );
+            }
+
+            if !synced && let Some(action) = action {
+                let row = match action {
+                    AccountMenuAction::EnableSync => {
+                        popover::menu_row(theme, false, "user-menu-enable-sync")
+                            .id("user-menu-enable-sync")
+                            .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
+                            .child(
+                                icon(icons::GLOBAL)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Enable sync"))
+                            .into_any_element()
+                    }
+                    AccountMenuAction::SyncInProgress => {
+                        popover::menu_row(theme, false, "user-menu-sync-progress")
+                            .id("user-menu-sync-progress")
+                            .opacity(0.6)
+                            .child(
+                                icon(icons::GLOBAL)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Sync setup in progress"))
+                            .into_any_element()
+                    }
+                    AccountMenuAction::RestartPending => {
+                        popover::menu_row(theme, false, "user-menu-sync-restart")
+                            .id("user-menu-sync-restart")
+                            .on_click(cx.listener(|this, _, _, cx| this.reopen_sync_notice(cx)))
+                            .child(
+                                icon(icons::RESTART)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Finish sync setup"))
+                            .into_any_element()
+                    }
+                    AccountMenuAction::SignOut => Empty.into_any_element(),
+                };
+                menu = menu.child(row).child(popover::menu_separator());
+            }
+
+            menu = menu.child(
+                popover::menu_row(theme, false, "user-menu-settings")
+                    .id("user-menu-settings")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_settings(SettingsSection::Devices, cx)
+                    }))
+                    .child(
+                        icon(icons::SETTINGS_MINIMALISTIC)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(SharedString::from("Settings")),
+            );
+
+            if synced && let Some(action) = action {
+                let row: Option<AnyElement> = match action {
+                    AccountMenuAction::SignOut => Some(
+                        popover::menu_row(theme, false, "user-menu-signout")
+                            .id("user-menu-signout")
+                            .on_click(cx.listener(|this, _, _, cx| this.request_sign_out(cx)))
+                            .child(
+                                icon(icons::LOGOUT_2)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Sign out"))
+                            .into_any_element(),
+                    ),
+                    AccountMenuAction::SyncInProgress => Some(
+                        popover::menu_row(theme, false, "user-menu-sync-progress")
+                            .id("user-menu-sync-progress")
+                            .opacity(0.6)
+                            .child(
+                                icon(icons::GLOBAL)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Sync setup in progress"))
+                            .into_any_element(),
+                    ),
+                    AccountMenuAction::RestartPending => Some(
+                        popover::menu_row(theme, false, "user-menu-sync-restart")
+                            .id("user-menu-sync-restart")
+                            .on_click(cx.listener(|this, _, _, cx| this.reopen_sync_notice(cx)))
+                            .child(
+                                icon(icons::RESTART)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Finish sync setup"))
+                            .into_any_element(),
+                    ),
+                    AccountMenuAction::EnableSync => None,
+                };
+                if let Some(row) = row {
+                    menu = menu.child(popover::menu_separator()).child(row);
+                }
+            }
+
+            let menu = menu.into_any_element();
             trigger = trigger.child(popover::anchored_menu_above(
                 "user-menu-popover",
                 menu,
@@ -4160,6 +5937,328 @@ impl Shell {
             ));
         }
         trigger.into_any_element()
+    }
+
+    fn render_team_change_overlay(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let change = self.team_change.clone()?;
+        let theme = Theme::of(cx).clone();
+        let (title, body) = match change.phase {
+            TeamChangePhase::Selecting => (
+                format!("Switching to {}…", change.label),
+                "Updating your Team selection before opening its workspace.".to_string(),
+            ),
+            TeamChangePhase::Restarting => (
+                format!("Opening {}…", change.label),
+                "Closing the previous workspace cleanly, then reconnecting in place. Keep Zeron open."
+                    .to_string(),
+            ),
+            TeamChangePhase::SelectFailed => (
+                "Couldn't switch Teams".to_string(),
+                "The current workspace is unchanged. You can retry or return to it.".to_string(),
+            ),
+            TeamChangePhase::ReplaceFailed => (
+                "Couldn't finish opening the Team".to_string(),
+                "Your Team selection changed, but the old workspace did not fully release its runtime. Retry the handoff before continuing."
+                    .to_string(),
+            ),
+        };
+        let mut card = popover::dialog_card(&theme)
+            .id("team-runtime-change-card")
+            .key_context("TeamDialog")
+            .track_focus(&self.team_dialog_focus)
+            .role(Role::Dialog)
+            .aria_label(title.clone())
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.team_dialog_key(event, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusNextControl, _, cx| {
+                this.move_team_dialog_action(false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusPreviousControl, _, cx| {
+                this.move_team_dialog_action(true, cx)
+            }))
+            .child(popover::dialog_title(&theme, &title))
+            .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, body)));
+        if let Some(error) = change.error {
+            card = card.child(
+                div()
+                    .mt(px(10.0))
+                    .text_size(px(12.0))
+                    .line_height(px(17.0))
+                    .text_color(theme.danger)
+                    .child(error),
+            );
+        }
+        match change.phase {
+            TeamChangePhase::SelectFailed => {
+                card = card.child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "team-switch-failed-cancel")
+                                .id("team-switch-failed-cancel")
+                                .role(Role::Button)
+                                .aria_label("Cancel Team switch")
+                                .border_1()
+                                .border_color(if self.team_dialog_active == 0 {
+                                    theme.border_strong
+                                } else {
+                                    theme.border_strong.opacity(0.0)
+                                })
+                                .when(self.team_dialog_active == 0, |button| {
+                                    button.aria_active_descendant()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_failed_team_selection(cx)
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Retry")
+                                .id("team-switch-failed-retry")
+                                .role(Role::Button)
+                                .aria_label("Retry Team switch")
+                                .border_1()
+                                .border_color(if self.team_dialog_active == 1 {
+                                    theme.border_strong
+                                } else {
+                                    theme.border_strong.opacity(0.0)
+                                })
+                                .when(self.team_dialog_active == 1, |button| {
+                                    button.aria_active_descendant()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.retry_team_change(cx))),
+                        ),
+                );
+            }
+            TeamChangePhase::ReplaceFailed => {
+                card = card.child(
+                    div().mt(px(16.0)).flex().flex_row().justify_end().child(
+                        popover::btn_primary(&theme, "Retry")
+                            .id("team-replace-failed-retry")
+                            .role(Role::Button)
+                            .aria_label("Retry Team handoff")
+                            .border_1()
+                            .border_color(theme.border_strong)
+                            .aria_active_descendant()
+                            .on_click(cx.listener(|this, _, _, cx| this.retry_team_change(cx))),
+                    ),
+                );
+            }
+            TeamChangePhase::Selecting | TeamChangePhase::Restarting => {}
+        }
+        Some(popover::modal(
+            "team-runtime-change-dialog",
+            viewport,
+            card.into_any_element(),
+        ))
+    }
+
+    fn current_team_dialog_mode(&self) -> Option<TeamDialogKeyboardMode> {
+        if self.pending_team_change.is_some() {
+            return Some(TeamDialogKeyboardMode::Pending);
+        }
+        match self.team_change.as_ref().map(|change| change.phase) {
+            Some(TeamChangePhase::SelectFailed) => Some(TeamDialogKeyboardMode::SelectFailed),
+            Some(TeamChangePhase::ReplaceFailed) => Some(TeamDialogKeyboardMode::ReplaceFailed),
+            Some(TeamChangePhase::Selecting | TeamChangePhase::Restarting) => {
+                Some(TeamDialogKeyboardMode::Progress)
+            }
+            None => None,
+        }
+    }
+
+    fn sync_team_dialog_keyboard_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mode = self.current_team_dialog_mode();
+        if self.team_dialog_mode != mode {
+            self.team_dialog_mode = mode;
+            self.team_dialog_active = mode.map_or(0, TeamDialogKeyboardMode::default_active);
+        }
+        if mode.is_some() && !self.team_dialog_focus.is_focused(window) {
+            window.focus(&self.team_dialog_focus, cx);
+        }
+    }
+
+    fn apply_team_dialog_command(
+        &mut self,
+        mode: TeamDialogKeyboardMode,
+        command: TeamDialogCommand,
+        cx: &mut Context<Self>,
+    ) {
+        match (mode, command) {
+            (_, TeamDialogCommand::None) => {}
+            (TeamDialogKeyboardMode::Pending, TeamDialogCommand::Cancel) => {
+                self.cancel_pending_team_change(cx)
+            }
+            (TeamDialogKeyboardMode::Pending, TeamDialogCommand::Primary) => {
+                self.confirm_pending_team_change(cx)
+            }
+            (TeamDialogKeyboardMode::SelectFailed, TeamDialogCommand::Cancel) => {
+                self.cancel_failed_team_selection(cx)
+            }
+            (
+                TeamDialogKeyboardMode::SelectFailed | TeamDialogKeyboardMode::ReplaceFailed,
+                TeamDialogCommand::Primary,
+            ) => self.retry_team_change(cx),
+            (TeamDialogKeyboardMode::ReplaceFailed, TeamDialogCommand::Cancel) => {}
+            (TeamDialogKeyboardMode::Progress, _) => {}
+        }
+    }
+
+    fn move_team_dialog_action(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        let Some(mode) = self.current_team_dialog_mode() else {
+            cx.propagate();
+            return;
+        };
+        let (active, _) = reduce_team_dialog_key(mode, "tab", backwards, self.team_dialog_active);
+        self.team_dialog_active = active;
+        cx.notify();
+    }
+
+    fn team_dialog_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mode) = self.current_team_dialog_mode() else {
+            return;
+        };
+        let key = event.keystroke.key.as_str();
+        if !matches!(key, "enter" | "space" | "escape") {
+            return;
+        }
+        let (active, command) = reduce_team_dialog_key(mode, key, false, self.team_dialog_active);
+        self.team_dialog_active = active;
+        self.apply_team_dialog_command(mode, command, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn render_pending_team_change_overlay(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let pending = self.pending_team_change.clone()?;
+        let theme = Theme::of(cx).clone();
+        let mut consequences = Vec::new();
+        if pending.risk.live_runs > 0 {
+            consequences.push(if pending.risk.live_runs == 1 {
+                "stop 1 active run (including a run waiting for input)".to_string()
+            } else {
+                format!(
+                    "stop {} active runs (including runs waiting for input)",
+                    pending.risk.live_runs
+                )
+            });
+        }
+        let composer = pending.risk.composer;
+        match (composer.current_input, composer.draft_count) {
+            (true, 0) => consequences.push("clear the current unsent draft".to_string()),
+            (true, 1) => consequences
+                .push("clear the current unsent draft and 1 draft in another chat".to_string()),
+            (true, count) => consequences.push(format!(
+                "clear the current unsent draft and {count} drafts in other chats"
+            )),
+            (false, 0) => {}
+            (false, 1) => consequences.push("clear 1 unsent draft".to_string()),
+            (false, count) => consequences.push(format!("clear {count} unsent drafts")),
+        }
+        if composer.attachment_count > 0 {
+            consequences.push(if composer.attachment_count == 1 {
+                "discard 1 staged attachment".to_string()
+            } else {
+                format!("discard {} staged attachments", composer.attachment_count)
+            });
+        }
+        if composer.sending || composer.send_task || pending.risk.pending_sends > 0 {
+            let count = pending.risk.pending_sends;
+            consequences.push(if count > 1 {
+                format!("interrupt {count} sends that have not been acknowledged")
+            } else {
+                "interrupt a send that has not finished or been acknowledged".to_string()
+            });
+        }
+        let action = team_mutation_verb(pending.mutation.kind());
+        let target = pending.mutation.label();
+        let body = format!(
+            "Continuing to {action} ({target}) will {}. Unsent text and staged attachments cannot be recovered after the runtime handoff.",
+            consequences.join(", ")
+        );
+        let card = popover::dialog_card(&theme)
+            .id("team-handoff-risk-card")
+            .key_context("TeamDialog")
+            .track_focus(&self.team_dialog_focus)
+            .role(Role::Dialog)
+            .aria_label("Review work before changing Teams")
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.team_dialog_key(event, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusNextControl, _, cx| {
+                this.move_team_dialog_action(false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusPreviousControl, _, cx| {
+                this.move_team_dialog_action(true, cx)
+            }))
+            .child(popover::dialog_title(
+                &theme,
+                "Review work before changing Teams",
+            ))
+            .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, body)))
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "team-live-runs-cancel")
+                            .id("team-live-runs-cancel")
+                            .role(Role::Button)
+                            .aria_label("Cancel Team change")
+                            .border_1()
+                            .border_color(if self.team_dialog_active == 0 {
+                                theme.border_strong
+                            } else {
+                                theme.border_strong.opacity(0.0)
+                            })
+                            .when(self.team_dialog_active == 0, |button| {
+                                button.aria_active_descendant()
+                            })
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.cancel_pending_team_change(cx)),
+                            ),
+                    )
+                    .child(
+                        popover::btn_danger(&theme, "Continue")
+                            .id("team-live-runs-continue")
+                            .role(Role::Button)
+                            .aria_label("Continue Team change")
+                            .border_1()
+                            .border_color(if self.team_dialog_active == 1 {
+                                theme.border_strong
+                            } else {
+                                theme.border_strong.opacity(0.0)
+                            })
+                            .when(self.team_dialog_active == 1, |button| {
+                                button.aria_active_descendant()
+                            })
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.confirm_pending_team_change(cx)),
+                            ),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("team-handoff-risk-dialog", viewport, card))
     }
 
     fn render_sync_overlay(
@@ -6649,12 +8748,16 @@ impl Render for Shell {
             let state = self.state.read(cx);
             (state.workspace_scope, state.auth.clone())
         };
-        self.sync_flow = sync_flow_after_auth(self.sync_flow, workspace_scope, auth.as_ref());
-        let restart_required = self.sync_flow == SyncFlow::SignedOutRestartRequired;
+        if self.team_change.is_none() {
+            self.sync_flow = sync_flow_after_auth(self.sync_flow, workspace_scope, auth.as_ref());
+        }
+        let restart_required =
+            self.team_change.is_none() && self.sync_flow == SyncFlow::SignedOutRestartRequired;
         let gate = self
             .debug_gate
             .clone()
             .unwrap_or_else(|| self.state.read(cx).gate());
+        self.sync_team_dialog_keyboard_state(window, cx);
 
         // Fullscreen hides the macOS traffic lights — reflow the control
         // cluster with a 200ms ease-out tween (§1.1). A fullscreen transition
@@ -6728,6 +8831,8 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|_, _: &FocusNextControl, window, cx| window.focus_next(cx)))
+            .on_action(cx.listener(|_, _: &FocusPreviousControl, window, cx| window.focus_prev(cx)))
             // New session works from anywhere — `open_new_session` routes back
             // to chat itself, so Settings is not a dead spot.
             .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
@@ -6909,6 +9014,18 @@ impl Render for Shell {
         } else {
             root
         };
+        // Team handoff is shell-level, not Ready-page content. Keep its stable
+        // progress/error surface visible while prepare_runtime_replacement()
+        // intentionally moves the generic gate through Loading or Failed.
+        let root = if let Some(confirm) =
+            self.render_pending_team_change_overlay(window.viewport_size(), cx)
+        {
+            root.child(confirm)
+        } else if let Some(team) = self.render_team_change_overlay(window.viewport_size(), cx) {
+            root.child(team)
+        } else {
+            root
+        };
 
         // A manually-driven tween is mid-flight: keep frames coming (the same
         // scheduling `with_animation` would have requested). Hover color fades
@@ -6964,6 +9081,731 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
+
+    fn org(id: &str, name: &str) -> OrgRow {
+        OrgRow {
+            organization_id: id.into(),
+            name: name.into(),
+            role: "member".into(),
+        }
+    }
+
+    fn signed_in_to(org_id: &str) -> AuthState {
+        signed_in_as("user-1", org_id)
+    }
+
+    fn signed_in_as(user_id: &str, org_id: &str) -> AuthState {
+        AuthState::SignedIn {
+            user: zeron_proto::UserProfile {
+                id: user_id.into(),
+                email: "user@example.com".into(),
+                name: None,
+            },
+            org_id: Some(org_id.into()),
+        }
+    }
+
+    fn synced_engine_info(user_id: &str, org_id: &str) -> EngineInfo {
+        EngineInfo {
+            device_id: "device-1".into(),
+            workspace_scope: WorkspaceScope::Synced,
+            profile: Some(zeron_proto::EngineProfileIdentity {
+                user_id: user_id.into(),
+                organization_id: org_id.into(),
+            }),
+        }
+    }
+
+    fn test_boot(data_dir: &std::path::Path) -> EngineBootConfig {
+        EngineBootConfig {
+            data_dir: data_dir.to_path_buf(),
+            ipc_port: 27901,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: zeron_proto::HarnessId::Mock,
+        }
+    }
+
+    #[test]
+    fn avatar_menu_keeps_current_team_first_and_only_once() {
+        let sorted = sort_memberships(vec![
+            org("org-b", "Beta"),
+            org("org-a", "Alpha"),
+            org("org-c", "Gamma"),
+            org("org-b", "Zulu stale duplicate"),
+        ]);
+        let rows = teams_current_first(sorted, Some("org-c"));
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|row| row.organization_id.as_str())
+            .collect();
+        assert_eq!(ids, ["org-c", "org-a", "org-b"]);
+        assert_eq!(ids.iter().filter(|id| **id == "org-c").count(), 1);
+    }
+
+    #[test]
+    fn team_dialog_keyboard_navigation_wraps_and_respects_safe_escape() {
+        let pending = TeamDialogKeyboardMode::Pending;
+        assert_eq!(pending.default_active(), 0, "Cancel is the safe default");
+        assert_eq!(
+            reduce_team_dialog_key(pending, "tab", false, 0),
+            (1, TeamDialogCommand::None)
+        );
+        assert_eq!(
+            reduce_team_dialog_key(pending, "tab", false, 1),
+            (0, TeamDialogCommand::None)
+        );
+        assert_eq!(
+            reduce_team_dialog_key(pending, "tab", true, 0),
+            (1, TeamDialogCommand::None)
+        );
+        assert_eq!(
+            reduce_team_dialog_key(pending, "enter", false, 0),
+            (0, TeamDialogCommand::Cancel)
+        );
+        assert_eq!(
+            reduce_team_dialog_key(pending, "space", false, 1),
+            (1, TeamDialogCommand::Primary)
+        );
+        assert_eq!(
+            reduce_team_dialog_key(pending, "escape", false, 1),
+            (1, TeamDialogCommand::Cancel)
+        );
+
+        let replace_failed = TeamDialogKeyboardMode::ReplaceFailed;
+        assert_eq!(replace_failed.default_active(), 0);
+        assert_eq!(
+            reduce_team_dialog_key(replace_failed, "escape", false, 0),
+            (0, TeamDialogCommand::None),
+            "the profile-isolation overlay must remain Retry-only"
+        );
+        assert_eq!(
+            reduce_team_dialog_key(replace_failed, "enter", false, 0),
+            (0, TeamDialogCommand::Primary)
+        );
+
+        let progress = TeamDialogKeyboardMode::Progress;
+        for key in ["tab", "enter", "space", "escape"] {
+            assert_eq!(
+                reduce_team_dialog_key(progress, key, false, 0),
+                (0, TeamDialogCommand::None),
+                "progress dialogs must trap {key} without dispatching an action"
+            );
+        }
+    }
+
+    #[test]
+    fn team_switch_confirmation_counts_raw_live_chats_once() {
+        let now = Utc::now();
+        let session =
+            |chat_id: &str,
+             status: zeron_proto::SessionStatus,
+             updated_at: chrono::DateTime<Utc>| zeron_proto::Session {
+                chat_id: chat_id.into(),
+                device_id: "device-1".into(),
+                status,
+                started_at: Some(updated_at),
+                updated_at,
+            };
+        let sessions = vec![
+            session("working", zeron_proto::SessionStatus::Working, now),
+            session("awaiting", zeron_proto::SessionStatus::AwaitingInput, now),
+            // Defensive dedupe: a malformed/replayed frame must not inflate
+            // the destructive-action count shown to the user.
+            session("working", zeron_proto::SessionStatus::Working, now),
+            session("idle", zeron_proto::SessionStatus::Idle, now),
+            session(
+                "stale",
+                zeron_proto::SessionStatus::Working,
+                now - chrono::TimeDelta::seconds(46),
+            ),
+        ];
+
+        assert_eq!(
+            live_team_run_count(&sessions),
+            3,
+            "a quiet Working row remains destructive even past the display TTL"
+        );
+    }
+
+    #[gpui::test]
+    fn settings_team_mutation_sends_no_rpc_before_shared_preflight_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.auth = Some(signed_in_to("org-a"));
+            state.workspace_scope = Some(WorkspaceScope::Synced);
+            state.sessions.push(zeron_proto::Session {
+                chat_id: "quiet-run".into(),
+                device_id: "device-1".into(),
+                status: zeron_proto::SessionStatus::Working,
+                started_at: Some(now - chrono::TimeDelta::minutes(5)),
+                updated_at: now - chrono::TimeDelta::minutes(5),
+            });
+            state.begin_pending_send("queued", "message-1", now);
+            state
+        });
+        let shell = cx.new(|cx| Shell::new(state, test_boot(dir.path()), cx));
+
+        shell.update(cx, |shell, cx| {
+            shell
+                .composer
+                .update(cx, |composer, cx| composer.set_input_for_test("unsent", cx));
+            shell.request_team_mutation(
+                TeamMutation::Select {
+                    organization_id: "org-b".into(),
+                    label: "Beta".into(),
+                },
+                cx,
+            );
+
+            let pending = shell
+                .pending_team_change
+                .as_ref()
+                .expect("risk must stop before the executor");
+            assert_eq!(pending.risk.live_runs, 1);
+            assert!(pending.risk.composer.current_input);
+            assert_eq!(pending.risk.pending_sends, 1);
+            assert!(shell.team_change.is_none(), "RPC lifecycle has not begun");
+            assert!(shell.runtime_change_task.is_none(), "no RPC task exists");
+
+            shell.confirm_pending_team_change(cx);
+            assert!(shell.pending_team_change.is_none());
+            assert!(matches!(
+                shell.team_change,
+                Some(TeamChange {
+                    phase: TeamChangePhase::SelectFailed,
+                    ..
+                })
+            ));
+        });
+    }
+
+    #[gpui::test]
+    fn no_risk_team_mutation_keeps_the_fast_path(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.auth = Some(signed_in_to("org-a"));
+            state.workspace_scope = Some(WorkspaceScope::Synced);
+            state
+        });
+        let shell = cx.new(|cx| Shell::new(state, test_boot(dir.path()), cx));
+
+        shell.update(cx, |shell, cx| {
+            shell.request_team_mutation(
+                TeamMutation::Create {
+                    name: "New Team".into(),
+                },
+                cx,
+            );
+
+            assert!(shell.pending_team_change.is_none());
+            assert!(matches!(
+                shell.team_change,
+                Some(TeamChange {
+                    phase: TeamChangePhase::SelectFailed,
+                    mutation: Some(TeamMutation::Create { .. }),
+                    ..
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn ambiguous_team_mutations_keep_kind_and_original_error_for_feedback() {
+        for mutation in [
+            TeamMutation::Select {
+                organization_id: "org-b".into(),
+                label: "Beta".into(),
+            },
+            TeamMutation::Create {
+                name: "New Team".into(),
+            },
+            TeamMutation::Delete {
+                organization_id: "org-a".into(),
+                label: "Alpha".into(),
+            },
+        ] {
+            let kind = mutation.kind();
+            let change = TeamChange {
+                organization_id: mutation.requested_organization_id().map(str::to_owned),
+                expected_user_id: None,
+                label: mutation.label(),
+                phase: TeamChangePhase::Restarting,
+                error: None,
+                mutation: Some(mutation),
+                original_error: Some("transport closed after commit was possible".into()),
+                selection_confirmed: false,
+            };
+            let notice = team_outcome_unknown_notice(&change)
+                .expect("an ambiguous user mutation must remain visible")
+                .to_string();
+            assert!(notice.contains(team_mutation_verb(kind)));
+            assert!(notice.contains("transport closed after commit was possible"));
+            assert!(notice.contains("outcome was unknown"));
+            assert!(notice.contains("Team list was refreshed"));
+        }
+    }
+
+    #[test]
+    fn confirmed_create_and_delete_require_proof_of_the_new_runtime_target() {
+        let create = TeamMutation::Create {
+            name: "New Team".into(),
+        };
+        assert_eq!(
+            confirmed_team_mutation_target(
+                &create,
+                &serde_json::json!({ "organizationId": "org-new" })
+            ),
+            Ok(Some("org-new".into()))
+        );
+        assert!(confirmed_team_mutation_target(&create, &serde_json::json!({})).is_err());
+
+        let delete = TeamMutation::Delete {
+            organization_id: "org-old".into(),
+            label: "Old Team".into(),
+        };
+        assert_eq!(
+            confirmed_team_mutation_target(
+                &delete,
+                &serde_json::json!({ "action": "switched", "organizationId": "org-next" })
+            ),
+            Ok(Some("org-next".into()))
+        );
+        assert_eq!(
+            confirmed_team_mutation_target(&delete, &serde_json::json!({ "action": "signedOut" })),
+            Ok(None)
+        );
+        assert!(
+            confirmed_team_mutation_target(&delete, &serde_json::json!({ "action": "switched" }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn team_runtime_handoff_waits_for_auth_and_rejects_wrong_profile() {
+        assert_eq!(
+            validate_team_runtime_auth(None, TeamRuntimeExpectation::ExactOrg("org-b")),
+            None
+        );
+        assert_eq!(
+            validate_team_runtime_auth(
+                Some(&signed_in_to("org-b")),
+                TeamRuntimeExpectation::ExactOrg("org-b")
+            ),
+            Some(Ok(()))
+        );
+        let mismatch = validate_team_runtime_auth(
+            Some(&signed_in_to("org-a")),
+            TeamRuntimeExpectation::ExactOrg("org-b"),
+        )
+        .expect("auth frame is present")
+        .expect_err("the old Team must not be accepted");
+        assert!(mismatch.contains("org-b"), "{mismatch}");
+        assert!(
+            validate_team_runtime_auth(
+                Some(&signed_in_as("user-2", "org-b")),
+                TeamRuntimeExpectation::ExactProfile {
+                    organization_id: "org-b",
+                    user_id: "user-1",
+                },
+            )
+            .expect("auth frame is present")
+            .is_err(),
+            "the same Team under a different account is a different runtime profile"
+        );
+        assert!(
+            validate_team_runtime_auth(
+                Some(&AuthState::SignedOut),
+                TeamRuntimeExpectation::SignedOut
+            ) == Some(Ok(())),
+            "deleting the final Team may legitimately reopen local mode"
+        );
+        assert!(
+            validate_team_runtime_auth(
+                Some(&signed_in_to("org-deleted")),
+                TeamRuntimeExpectation::SignedOut
+            )
+            .expect("auth frame is present")
+            .is_err(),
+            "a stale deleted-Team session must not pass the signed-out expectation"
+        );
+    }
+
+    #[test]
+    fn ambiguous_team_handoff_separates_fail_closed_auth_from_an_open_team() {
+        assert!(team_selection_error_is_confirmed(Some("org-b"), "org-b"));
+        assert!(
+            !team_selection_error_is_confirmed(Some("org-a"), "org-b"),
+            "an RPC error that beats AuthStatus must remain an ambiguous handoff"
+        );
+        assert_eq!(
+            classify_ambiguous_team_runtime(&signed_in_as("user-1", "org-b"), "org-b"),
+            AmbiguousTeamRuntimeOutcome::RequestedProfile(RuntimeProfileIdentity {
+                user_id: "user-1".into(),
+                organization_id: "org-b".into(),
+            })
+        );
+        assert_eq!(
+            classify_ambiguous_team_runtime(&signed_in_as("user-1", "org-a"), "org-b"),
+            AmbiguousTeamRuntimeOutcome::OtherProfile(RuntimeProfileIdentity {
+                user_id: "user-1".into(),
+                organization_id: "org-a".into(),
+            })
+        );
+        assert_eq!(
+            classify_ambiguous_team_runtime(&AuthState::SignedOut, "org-b"),
+            AmbiguousTeamRuntimeOutcome::SignedOut,
+            "a delayed fail-closed AuthStatus must enter the explicit synced-to-local lifecycle"
+        );
+        let user = zeron_proto::UserProfile {
+            id: "user-1".into(),
+            email: "user@example.com".into(),
+            name: None,
+        };
+        assert_eq!(
+            classify_ambiguous_team_runtime(
+                &AuthState::NeedsOrganization { user: user.clone() },
+                "org-b"
+            ),
+            AmbiguousTeamRuntimeOutcome::NeedsOrganization,
+            "an organization gate is not proof that the previous Team reopened"
+        );
+        assert_eq!(
+            classify_ambiguous_team_runtime(&AuthState::SignedIn { user, org_id: None }, "org-b"),
+            AmbiguousTeamRuntimeOutcome::NeedsOrganization
+        );
+    }
+
+    #[test]
+    fn signed_out_team_handoff_reuses_local_and_only_replaces_synced_runtime() {
+        assert_eq!(
+            signed_out_team_runtime_action(Some(WorkspaceScope::Local)),
+            SignedOutTeamRuntimeAction::AlreadyLocal,
+            "the first fail-closed replacement should not reopen Local twice"
+        );
+        assert_eq!(
+            signed_out_team_runtime_action(Some(WorkspaceScope::Synced)),
+            SignedOutTeamRuntimeAction::ReplaceSyncedWithLocal,
+            "a still-synced runtime needs the explicit local handoff"
+        );
+    }
+
+    #[test]
+    fn another_viewports_team_selection_requires_a_runtime_handoff() {
+        let ready = ConnectionStatus::Ready;
+        let connecting = ConnectionStatus::Connecting;
+        let team_a = signed_in_to("org-a");
+        let team_b = signed_in_to("org-b");
+        let account_b_same_team = signed_in_as("user-2", "org-a");
+        let baseline = runtime_profile_identity(Some(&team_a)).unwrap();
+
+        assert_eq!(
+            external_team_replacement_target(
+                None,
+                &ready,
+                Some(WorkspaceScope::Synced),
+                Some(&team_a),
+                false,
+            ),
+            None,
+            "a missing immutable baseline cannot prove that a switch occurred"
+        );
+        assert_eq!(
+            external_team_replacement_target(
+                Some(&baseline),
+                &ready,
+                Some(WorkspaceScope::Synced),
+                Some(&team_b),
+                false,
+            ),
+            Some(RuntimeProfileIdentity {
+                user_id: "user-1".into(),
+                organization_id: "org-b".into(),
+            }),
+            "a shared AuthStatus change must make this viewport reattach"
+        );
+        assert_eq!(
+            external_team_replacement_target(
+                Some(&baseline),
+                &ready,
+                Some(WorkspaceScope::Synced),
+                Some(&team_a),
+                false,
+            ),
+            None,
+            "repeated frames for the same fixed profile are inert"
+        );
+        assert_eq!(
+            external_team_replacement_target(
+                Some(&baseline),
+                &ready,
+                Some(WorkspaceScope::Synced),
+                Some(&account_b_same_team),
+                false,
+            ),
+            Some(RuntimeProfileIdentity {
+                user_id: "user-2".into(),
+                organization_id: "org-a".into(),
+            }),
+            "same-org sign-in as another user is still a profile replacement"
+        );
+        assert_eq!(
+            external_team_replacement_target(
+                Some(&baseline),
+                &ready,
+                Some(WorkspaceScope::Synced),
+                Some(&team_b),
+                true,
+            ),
+            None,
+            "the explicit Team lifecycle owns its own auth change"
+        );
+        assert_eq!(
+            external_team_replacement_target(
+                Some(&baseline),
+                &connecting,
+                Some(WorkspaceScope::Synced),
+                Some(&team_b),
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            external_team_replacement_target(
+                Some(&baseline),
+                &ready,
+                Some(WorkspaceScope::Local),
+                Some(&team_b),
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn new_viewport_between_select_publish_and_old_runtime_stop_detects_the_split() {
+        let old_runtime = synced_engine_info("user-1", "org-a");
+        let baseline = engine_runtime_profile_identity(Some(&old_runtime))
+            .expect("current EngineInfo has a fixed profile");
+
+        assert_eq!(
+            external_team_replacement_target(
+                Some(&baseline),
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
+                Some(&signed_in_to("org-b")),
+                false,
+            ),
+            Some(RuntimeProfileIdentity {
+                user_id: "user-1".into(),
+                organization_id: "org-b".into(),
+            }),
+            "the viewport must compare new AuthStatus to old immutable EngineInfo"
+        );
+    }
+
+    #[test]
+    fn replacement_reconnecting_to_the_old_daemon_stays_occluded() {
+        let old_runtime = synced_engine_info("user-1", "org-a");
+        let target_auth = signed_in_to("org-b");
+        assert_eq!(
+            validate_team_runtime_auth(
+                Some(&target_auth),
+                TeamRuntimeExpectation::ExactOrg("org-b")
+            ),
+            Some(Ok(())),
+            "the control plane alone already reports the requested Team"
+        );
+
+        let error = validate_team_runtime_planes(&old_runtime, &target_auth)
+            .expect_err("old data plane must not pass target auth validation");
+        assert!(error.contains("different data profile"), "{error}");
+        assert!(
+            validate_team_runtime_planes(&synced_engine_info("user-1", "org-b"), &target_auth,)
+                .is_ok(),
+            "handoff may finish only after EngineInfo and AuthStatus converge"
+        );
+    }
+
+    #[gpui::test]
+    fn profile_ui_reset_rebuilds_views_and_keeps_only_global_preferences(cx: &mut TestAppContext) {
+        let _cache_guard = crate::attachments::cache_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.data_dir = Some(dir.path().to_path_buf());
+            state.selected_chat = Some("old-chat".into());
+            state
+        });
+        let boot = EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: 27901,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: zeron_proto::HarnessId::Mock,
+        };
+        let shell_state = state.clone();
+        let shell = cx.new(|cx| Shell::new(shell_state, boot, cx));
+
+        // All production handoff paths clear AppState first, so the newly
+        // constructed Picker cannot read an old selected chat/project.
+        state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
+
+        shell.update(cx, |shell, cx| {
+            let old_composer = shell.composer.entity_id();
+            let old_transcript = shell.transcript.entity_id();
+
+            shell.route = Route::Settings(SettingsSection::Devices);
+            shell.nav.push(NavEntry::Settings(SettingsSection::Devices));
+            shell.active_chat = "old-chat".into();
+            shell.panels.toggle_terminal("old-chat");
+            shell
+                .right_tabs
+                .insert("old-chat".into(), vec![RightSurface::Terminal(1)]);
+            shell.delete_confirm = Some("old-chat".into());
+            shell.delete_space_confirm = Some("old-space".into());
+            shell.user_menu.open(());
+            shell.user_menu_orgs = Loadable::Ready(vec![org("old-org", "Old Team")]);
+            shell.mutate_task = Some(Task::ready(()));
+            shell.auth_task = Some(Task::ready(()));
+            shell.import_task = Some(Task::ready(()));
+            shell.terminal_tween_task = Some(Task::ready(()));
+            shell.terminal = Some(cx.new(|cx| TerminalPanel::new(state.clone(), cx)));
+            shell.right_terminal =
+                Some(cx.new(|cx| TerminalPanel::new_embedded(state.clone(), cx)));
+
+            shell.devices_page = Some(cx.new(|cx| DevicesPage::new(state.clone(), cx)));
+            shell.team_page = Some(cx.new(|cx| TeamPage::new(state.clone(), cx)));
+            shell.archived_page = Some(cx.new(|cx| ArchivedPage::new(state.clone(), cx)));
+            shell.accounts_page = Some(cx.new(|cx| AccountsPage::new(state.clone(), cx)));
+            shell.harnesses_page = Some(cx.new(|cx| HarnessesPage::new(state.clone(), cx)));
+
+            let appearance = cx.new(AppearancePage::new);
+            let notifications = cx.new(|cx| NotificationsPage::new(false, true, true, cx));
+            let shortcut_keymap = shell.settings.keymap.clone();
+            let shortcuts = cx.new(|cx| ShortcutsPage::new(state.clone(), shortcut_keymap, cx));
+            shell.appearance_page = Some(appearance.clone());
+            shell.notifications_page = Some(notifications.clone());
+            shell.shortcuts_page = Some(shortcuts.clone());
+
+            shell.settings.sidebar_width = 333.0;
+            shell.settings.sound_enabled = false;
+            shell.settings.notifications_enabled = true;
+            shell.settings.appearance = crate::appearance::AppearanceMode::Dark;
+            shell.settings.keymap.toggle_sidebar = "mod-k".into();
+            shell.settings.last_space_id = Some("old-space".into());
+            shell.settings.open_tabs = Some(vec!["old-chat".into()]);
+            shell.settings.space_filter = Some("old-space".into());
+            shell
+                .settings
+                .tab_order
+                .insert("old-space".into(), vec!["old-chat".into()]);
+            shell.settings.space_order.push("old-space".into());
+
+            shell.team_change = Some(TeamChange {
+                organization_id: Some("new-org".into()),
+                expected_user_id: None,
+                label: "New Team".into(),
+                phase: TeamChangePhase::Restarting,
+                error: None,
+                mutation: Some(TeamMutation::Select {
+                    organization_id: "new-org".into(),
+                    label: "New Team".into(),
+                }),
+                original_error: None,
+                selection_confirmed: true,
+            });
+            shell.fixed_runtime_profile = Some(RuntimeProfileIdentity {
+                user_id: "user-1".into(),
+                organization_id: "old-org".into(),
+            });
+            shell.sync_flow = SyncFlow::Switching { import: false };
+            let cache_namespace = state.read(cx).profile_cache_namespace();
+            assert!(crate::attachments::begin_load(
+                &cache_namespace,
+                "old-profile-device",
+                "/old-profile/image.png"
+            ));
+
+            shell.reset_profile_ui(cx);
+
+            assert_ne!(shell.composer.entity_id(), old_composer);
+            assert_ne!(shell.transcript.entity_id(), old_transcript);
+            assert_eq!(shell.route, Route::Chat);
+            assert_eq!(*shell.nav.current(), NavEntry::Chat(String::new()));
+            assert!(shell.active_chat.is_empty());
+            assert_eq!(shell.panels.get("old-chat"), ChatPanels::default());
+            assert!(shell.right_tabs.is_empty());
+            assert!(shell.terminal.is_none());
+            assert!(shell.right_terminal.is_none());
+            assert!(shell.devices_page.is_none());
+            assert!(shell.team_page.is_none());
+            assert!(shell.archived_page.is_none());
+            assert!(shell.accounts_page.is_none());
+            assert!(shell.harnesses_page.is_none());
+            assert!(shell.delete_confirm.is_none());
+            assert!(shell.delete_space_confirm.is_none());
+            assert!(!shell.user_menu.is_open());
+            assert!(matches!(shell.user_menu_orgs, Loadable::Idle));
+            assert!(shell.mutate_task.is_none());
+            assert!(shell.auth_task.is_none());
+            assert!(shell.import_task.is_none());
+            assert!(shell.terminal_tween_task.is_none());
+            assert!(
+                crate::attachments::begin_load(
+                    &cache_namespace,
+                    "old-profile-device",
+                    "/old-profile/image.png"
+                ),
+                "the replacement profile must re-authorize and reload attachment bytes"
+            );
+
+            assert_eq!(shell.settings.last_space_id, None);
+            assert_eq!(shell.settings.open_tabs, None);
+            assert_eq!(shell.settings.space_filter, None);
+            assert!(shell.settings.tab_order.is_empty());
+            assert!(shell.settings.space_order.is_empty());
+            assert_eq!(shell.settings.sidebar_width, 333.0);
+            assert!(!shell.settings.sound_enabled);
+            assert!(shell.settings.notifications_enabled);
+            assert_eq!(
+                shell.settings.appearance,
+                crate::appearance::AppearanceMode::Dark
+            );
+            assert_eq!(shell.settings.keymap.toggle_sidebar, "mod-k");
+            assert_eq!(
+                shell.appearance_page.as_ref().map(Entity::entity_id),
+                Some(appearance.entity_id())
+            );
+            assert_eq!(
+                shell.notifications_page.as_ref().map(Entity::entity_id),
+                Some(notifications.entity_id())
+            );
+            assert_eq!(
+                shell.shortcuts_page.as_ref().map(Entity::entity_id),
+                Some(shortcuts.entity_id())
+            );
+            assert_eq!(shell.sync_flow, SyncFlow::Switching { import: false });
+            assert_eq!(shell.fixed_runtime_profile, None);
+            assert!(matches!(
+                shell.team_change,
+                Some(TeamChange {
+                    phase: TeamChangePhase::Restarting,
+                    ..
+                })
+            ));
+        });
+    }
 
     #[tokio::test]
     async fn remote_shutdown_waits_for_ipc_release() {
@@ -7058,6 +9900,40 @@ mod tests {
 
         assert!(error.contains("did not finish stopping"));
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn shutdown_watchdog_timeout_retry_reuses_the_background_worker() {
+        let (status_tx, status) = tokio::sync::watch::channel(RuntimeShutdownStatus::Running);
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let worker_release = release.clone();
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_starts = starts.clone();
+        let worker = tokio::spawn(async move {
+            worker_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            worker_release.notified().await;
+            status_tx.send_replace(RuntimeShutdownStatus::Finished(Ok(())));
+        });
+
+        // Raw Tokio ownership is cancellation-safe for this lifecycle: dropping
+        // the handle detaches instead of aborting the teardown future.
+        drop(worker);
+        assert_eq!(
+            wait_for_runtime_shutdown(status.clone(), Duration::from_millis(20)).await,
+            RuntimeShutdownWait::TimedOut
+        );
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release.notify_one();
+        assert_eq!(
+            wait_for_runtime_shutdown(status, Duration::from_secs(1)).await,
+            RuntimeShutdownWait::Finished(Ok(()))
+        );
+        assert_eq!(
+            starts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Retry must rejoin the first shutdown rather than start a second one"
+        );
     }
 
     #[test]

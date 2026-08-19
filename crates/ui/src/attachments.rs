@@ -23,7 +23,7 @@ use gpui::{
     StyledImage as _, div, img, prelude::*, px,
 };
 
-use crate::state::EngineHandle;
+use crate::state::{EngineHandle, ProfileCacheNamespace};
 use crate::theme::ink;
 use zeron_rpc::methods;
 
@@ -475,7 +475,7 @@ const IMAGE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
 struct ImageCache {
-    map: HashMap<(String, String), CacheEntry>,
+    map: HashMap<CacheKey, CacheEntry>,
     /// Monotonic access clock for LRU ordering.
     tick: u64,
     loaded_bytes: usize,
@@ -485,7 +485,7 @@ struct ImageCache {
 }
 
 impl ImageCache {
-    fn insert_loaded(&mut self, key: (String, String), image: CachedAttachmentImage) {
+    fn insert_loaded(&mut self, key: CacheKey, image: CachedAttachmentImage) {
         let bytes = image.image.bytes.len();
         self.tick += 1;
         if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.insert(
@@ -510,7 +510,7 @@ impl ImageCache {
                     CacheEntry::Loaded { last_used, .. } => Some((*last_used, k.clone())),
                     _ => None,
                 })
-                .min();
+                .min_by_key(|(last_used, _)| *last_used);
             let Some((_, evict_key)) = oldest else { break };
             if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.remove(&evict_key) {
                 self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
@@ -525,34 +525,65 @@ fn cache() -> &'static Mutex<ImageCache> {
     CACHE.get_or_init(|| Mutex::new(ImageCache::default()))
 }
 
+#[cfg(test)]
+pub(crate) fn cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
 /// Keys shielded from LRU eviction — the open transcript's attachments. The
 /// gpui list caches rendered rows across frames, so a VISIBLE thumbnail's
 /// `last_used` tick can go stale and budget pressure evicted images still on
 /// screen (user report: "images unload before they are scrolled out of
 /// view"). The transcript replaces this set on every row sync; other chats'
 /// images stay evictable, so the budget still bounds the cache overall.
-fn protected() -> &'static Mutex<std::collections::HashSet<(String, String)>> {
-    static PROTECTED: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> =
-        OnceLock::new();
+pub(crate) type CacheKey = (ProfileCacheNamespace, String, String);
+
+fn protected() -> &'static Mutex<std::collections::HashSet<CacheKey>> {
+    static PROTECTED: OnceLock<Mutex<std::collections::HashSet<CacheKey>>> = OnceLock::new();
     PROTECTED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Replace the eviction shield with the given keys (see [`protected`]).
-pub fn protect_attachments(keys: std::collections::HashSet<(String, String)>) {
+pub(crate) fn protect_attachments(keys: std::collections::HashSet<CacheKey>) {
     *protected().lock().unwrap() = keys;
 }
 
-fn key(device_id: &str, path: &str) -> (String, String) {
-    (device_id.to_string(), path.to_string())
+/// Reclaim cached transcript images at a runtime-profile boundary. Privacy does
+/// not depend on this clear: every entry is independently namespaced, so a late
+/// old-profile load cannot become visible in the replacement profile.
+pub fn clear_profile_cache() {
+    protected().lock().unwrap().clear();
+    let mut cache = cache().lock().unwrap();
+    let entries = std::mem::take(&mut cache.map);
+    cache
+        .pending_free
+        .extend(entries.into_values().filter_map(|entry| {
+            if let CacheEntry::Loaded { image, .. } = entry {
+                Some(image.image)
+            } else {
+                None
+            }
+        }));
+    cache.loaded_bytes = 0;
+    cache.tick = 0;
 }
 
-pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
+fn key(namespace: &ProfileCacheNamespace, device_id: &str, path: &str) -> CacheKey {
+    (namespace.clone(), device_id.to_string(), path.to_string())
+}
+
+pub(crate) fn attachment_snapshot(
+    namespace: &ProfileCacheNamespace,
+    device_id: &str,
+    path: &str,
+) -> AttachmentSnapshot {
     let mut cache = cache().lock().unwrap();
     let tick = {
         cache.tick += 1;
         cache.tick
     };
-    match cache.map.get_mut(&key(device_id, path)) {
+    match cache.map.get_mut(&key(namespace, device_id, path)) {
         Some(CacheEntry::Loaded {
             image, last_used, ..
         }) => {
@@ -581,9 +612,9 @@ pub fn flush_evicted(mut window: Option<&mut gpui::Window>, cx: &mut gpui::App) 
 /// Claim the load for a source: `true` ⇒ the caller should start fetching now
 /// (the entry is marked Loading so concurrent renders don't double-fetch).
 /// Errored sources hand out a retry only after their backoff has elapsed.
-pub fn begin_load(device_id: &str, path: &str) -> bool {
+pub(crate) fn begin_load(namespace: &ProfileCacheNamespace, device_id: &str, path: &str) -> bool {
     let mut cache = cache().lock().unwrap();
-    let entry = cache.map.entry(key(device_id, path));
+    let entry = cache.map.entry(key(namespace, device_id, path));
     match entry {
         std::collections::hash_map::Entry::Vacant(v) => {
             v.insert(CacheEntry::Loading { attempts: 0 });
@@ -602,22 +633,29 @@ pub fn begin_load(device_id: &str, path: &str) -> bool {
     }
 }
 
-pub fn store_loaded(device_id: &str, path: &str, name: SharedString, image: Arc<Image>) {
-    cache()
-        .lock()
-        .unwrap()
-        .insert_loaded(key(device_id, path), CachedAttachmentImage { name, image });
+pub(crate) fn store_loaded(
+    namespace: &ProfileCacheNamespace,
+    device_id: &str,
+    path: &str,
+    name: SharedString,
+    image: Arc<Image>,
+) {
+    cache().lock().unwrap().insert_loaded(
+        key(namespace, device_id, path),
+        CachedAttachmentImage { name, image },
+    );
 }
 
-pub fn store_error(device_id: &str, path: &str) {
+pub(crate) fn store_error(namespace: &ProfileCacheNamespace, device_id: &str, path: &str) {
     let mut cache = cache().lock().unwrap();
-    let attempts = match cache.map.get(&key(device_id, path)) {
+    let cache_key = key(namespace, device_id, path);
+    let attempts = match cache.map.get(&cache_key) {
         Some(CacheEntry::Loading { attempts }) => attempts + 1,
         Some(CacheEntry::Error { attempts, .. }) => *attempts,
         _ => 1,
     };
     cache.map.insert(
-        key(device_id, path),
+        cache_key,
         CacheEntry::Error {
             attempts,
             at: Instant::now(),
@@ -627,8 +665,14 @@ pub fn store_error(device_id: &str, path: &str) {
 
 /// Seed the cache after a successful upload (composer send path) so the just-
 /// sent bubble's thumbnails render from local bytes instead of a round-trip.
-pub fn seed_attachment(device_id: &str, path: &str, name: &str, image: Arc<Image>) {
-    store_loaded(device_id, path, name.to_string().into(), image);
+pub(crate) fn seed_attachment(
+    namespace: &ProfileCacheNamespace,
+    device_id: &str,
+    path: &str,
+    name: &str,
+    image: Arc<Image>,
+) {
+    store_loaded(namespace, device_id, path, name.to_string().into(), image);
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +749,75 @@ pub fn lightbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cached_test_image(byte: u8) -> Arc<Image> {
+        Arc::new(Image::from_bytes(ImageFormat::Png, vec![byte]))
+    }
+
+    #[test]
+    fn late_old_profile_store_cannot_populate_the_replacement_profile() {
+        let _guard = cache_test_guard();
+        clear_profile_cache();
+        let old = ProfileCacheNamespace::Synced {
+            user_id: "user-1".into(),
+            organization_id: "org-old".into(),
+        };
+        let replacement = ProfileCacheNamespace::Synced {
+            user_id: "user-1".into(),
+            organization_id: "org-new".into(),
+        };
+        let device = "device-shared";
+        let path = "/uploads/same.png";
+
+        assert!(begin_load(&old, device, path));
+        clear_profile_cache();
+        // Simulate an old viewport completing after another viewport cleared
+        // the global cache and opened the replacement Team.
+        store_loaded(&old, device, path, "old.png".into(), cached_test_image(1));
+
+        assert!(
+            begin_load(&replacement, device, path),
+            "the old namespace must not claim the replacement namespace's load"
+        );
+        assert!(matches!(
+            attachment_snapshot(&replacement, device, path),
+            AttachmentSnapshot::Loading
+        ));
+        let AttachmentSnapshot::Loaded(old_image) = attachment_snapshot(&old, device, path) else {
+            panic!("the late result should remain available only to its old namespace");
+        };
+        assert_eq!(old_image.name.as_ref(), "old.png");
+        clear_profile_cache();
+    }
+
+    #[test]
+    fn viewports_with_the_same_profile_namespace_share_cached_bytes() {
+        let _guard = cache_test_guard();
+        clear_profile_cache();
+        let first_viewport = ProfileCacheNamespace::Synced {
+            user_id: "user-1".into(),
+            organization_id: "org-shared".into(),
+        };
+        let second_viewport = ProfileCacheNamespace::Synced {
+            user_id: "user-1".into(),
+            organization_id: "org-shared".into(),
+        };
+        store_loaded(
+            &first_viewport,
+            "device-1",
+            "/uploads/shared.png",
+            "shared.png".into(),
+            cached_test_image(2),
+        );
+
+        let AttachmentSnapshot::Loaded(shared) =
+            attachment_snapshot(&second_viewport, "device-1", "/uploads/shared.png")
+        else {
+            panic!("the same stable profile identity should share cached bytes");
+        };
+        assert_eq!(shared.name.as_ref(), "shared.png");
+        clear_profile_cache();
+    }
 
     #[test]
     fn with_attachments_round_trips_through_parse() {

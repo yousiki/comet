@@ -371,7 +371,7 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     );
 
     // Sign-out clears state and removes the persisted session.
-    auth.sign_out();
+    auth.sign_out().expect("persist sign-out");
     assert_eq!(auth.state(), AuthState::SignedOut);
     assert!(!session_file.exists());
 }
@@ -460,6 +460,11 @@ async fn offline_refresh_loop_backs_off_without_revoking_session() {
     );
     assert!(auth.state().is_signed_in());
     assert!(session_file.exists(), "offline must not revoke the session");
+    let restarted = Auth::new(workos_config(&edge.url(), dir.path()));
+    assert!(
+        restarted.state().is_signed_in(),
+        "temporary refresh transport failure must remain signed in after restart"
+    );
     refresh_loop.abort();
 }
 
@@ -513,7 +518,7 @@ async fn sign_out_invalidates_pending_and_in_flight_oauth_callbacks() {
         .replace("%3A", ":")
         .replace("%2F", "/");
     let first_state = query_param(&first_url, "state").expect("state");
-    auth.sign_out();
+    auth.sign_out().expect("persist sign-out");
     let canceled_pending = reqwest::get(format!("{callback}?code=old&state={first_state}"))
         .await
         .expect("pending callback response");
@@ -533,7 +538,7 @@ async fn sign_out_invalidates_pending_and_in_flight_oauth_callbacks() {
     .await
     .expect("exchange did not start");
 
-    auth.sign_out();
+    auth.sign_out().expect("persist sign-out");
     edge.state.release_exchange.notify_one();
     let canceled_exchange = callback_request
         .await

@@ -16,18 +16,23 @@
  * access token yet); the org routes verify the bearer themselves — the user
  * id is ALWAYS the token's `sub`, never request input: users manage their own
  * memberships and no one else's. Error mapping matches the old server: bad
- * body 400, missing bearer 401, WorkOS-off 501, rejected exchange/refresh 401.
+ * body 400, missing bearer 401, WorkOS-off 501, explicit auth rejection 401,
+ * retryable rejection 503, and outcome-unknown mutations 502 with JSON flags.
  */
 import { bearerFromRequest, verifyToken } from "./auth";
 import type { Env } from "./env";
 import {
   WorkOsAuthFailed,
+  WorkOsOutcomeUnknown,
+  WorkOsRoleAssignmentFailed,
+  WorkOsTransientFailure,
   addMemberByEmail,
   createOrg,
   deleteOrg,
   exchange,
   listMembers,
   listOrgs,
+  listRawMembers,
   membershipOf,
   refresh,
   removeMember,
@@ -42,8 +47,44 @@ const json = (value: unknown, status = 200): Response =>
 
 const notConfigured = (): Response => json({ error: "workos not configured" }, 501);
 
-const authFailed = (e: unknown): Response =>
-  json({ error: e instanceof WorkOsAuthFailed ? e.message : "authentication failed" }, 401);
+const authFailed = (e: unknown): Response => {
+  if (e instanceof WorkOsOutcomeUnknown) {
+    return json({ error: e.message, transient: true, outcomeUnknown: true }, 502);
+  }
+  if (e instanceof WorkOsTransientFailure) {
+    return json(
+      {
+        error: e.message,
+        transient: true,
+        outcomeUnknown: false,
+        ...(e.upstreamStatus ? { upstreamStatus: e.upstreamStatus } : {})
+      },
+      503
+    );
+  }
+  if (e instanceof WorkOsRoleAssignmentFailed) {
+    return json(
+      {
+        error: e.message,
+        outcomeUnknown: false,
+        ...(e.organizationId ? { organizationId: e.organizationId } : {}),
+        ...(e.rollbackFailure ? { rollbackFailure: e.rollbackFailure } : {})
+      },
+      502
+    );
+  }
+  if (e instanceof WorkOsAuthFailed) return json({ error: e.message }, 401);
+  return json({ error: "workos request failed", transient: true, outcomeUnknown: false }, 502);
+};
+
+const refreshFailureClass = (
+  error: unknown
+): "auth" | "transient" | "outcomeUnknown" | "unexpected" => {
+  if (error instanceof WorkOsOutcomeUnknown) return "outcomeUnknown";
+  if (error instanceof WorkOsTransientFailure) return "transient";
+  if (error instanceof WorkOsAuthFailed) return "auth";
+  return "unexpected";
+};
 
 const bodyJson = async <T>(request: Request): Promise<T | undefined> => {
   try {
@@ -84,15 +125,16 @@ export const handleAuthRoute = async (
     try {
       return json(await refresh(env, apiKey, body.refreshToken, body.organizationId));
     } catch (e) {
-      // Identify repeat offenders: a client with a rotated-out session
-      // retries every 30s forever and is otherwise anonymous in the tail
-      // (the Worker outcome is "ok" — only the 401 body says it failed).
-      // The token fingerprint is safe: single-use, and this one is dead.
+      // A transient or outcome-unknown failure does not prove that the
+      // refresh token is dead. Keep diagnostics useful without writing any
+      // live credential bytes to Worker logs.
       console.warn(
         "auth/refresh failed",
         request.headers.get("cf-connecting-ip") ?? "unknown-ip",
-        `token:${body.refreshToken.slice(0, 6)}…len${body.refreshToken.length}`,
-        e instanceof WorkOsAuthFailed ? e.message : String(e)
+        {
+          refreshTokenLength: body.refreshToken.length,
+          failureClass: refreshFailureClass(e)
+        }
       );
       return authFailed(e);
     }
@@ -161,7 +203,10 @@ export const handleAuthRoute = async (
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         return json({ error: "invalid email" }, 400);
       }
-      const role = body?.role === "admin" ? "admin" : "member";
+      const role = body?.role ?? "member";
+      if (role !== "admin" && role !== "member") {
+        return json({ error: "role must be admin or member" }, 400);
+      }
       try {
         return json(await addMemberByEmail(apiKey, orgId, email, role));
       } catch (e) {
@@ -174,26 +219,32 @@ export const handleAuthRoute = async (
     if (parts[3] === "members" && parts.length === 5) {
       if (!isAdmin) return json({ error: "only workspace admins can manage members" }, 403);
       const membershipId = parts[4];
-      // Last-admin protection: demoting or removing the only admin would
-      // orphan the workspace (nobody could manage or delete it again).
-      const guardLastAdmin = async (): Promise<Response | undefined> => {
-        const members = await listMembers(apiKey, orgId);
+      // Resolve through the URL org's filtered roster before every mutation.
+      // WorkOS role/remove endpoints accept only membershipId, so skipping
+      // this check would let an admin mutate a membership from another org.
+      const targetInOrg = async () => {
+        // Role and ownership checks need raw memberships only. User enrichment
+        // is reserved for the roster GET, avoiding N extra WorkOS requests on
+        // every mutation and keeping the guard practical for large Teams.
+        const members = await listRawMembers(apiKey, orgId);
         const target = members.find((m) => m.membershipId === membershipId);
-        if (!target) return json({ error: "no such member" }, 404);
-        const admins = members.filter((m) => m.role === "admin");
-        if (target.role === "admin" && admins.length <= 1) {
-          return json({ error: "cannot remove or demote the last admin" }, 409);
-        }
-        return undefined;
+        return { members, target };
       };
       if (request.method === "POST") {
         const body = await bodyJson<{ role?: string }>(request);
         const role = body?.role === "admin" ? "admin" : body?.role === "member" ? "member" : null;
         if (!role) return json({ error: "role must be admin or member" }, 400);
         try {
-          if (role === "member") {
-            const guard = await guardLastAdmin();
-            if (guard) return guard;
+          const { members, target } = await targetInOrg();
+          if (!target) return json({ error: "no such member" }, 404);
+          // Last-admin protection: demoting the only admin would orphan the
+          // workspace (nobody could manage or delete it again).
+          if (
+            role === "member" &&
+            target.role === "admin" &&
+            members.filter((m) => m.role === "admin").length <= 1
+          ) {
+            return json({ error: "cannot remove or demote the last admin" }, 409);
           }
           await setMemberRole(apiKey, membershipId, role);
           return json({ ok: true });
@@ -203,8 +254,14 @@ export const handleAuthRoute = async (
       }
       if (request.method === "DELETE") {
         try {
-          const guard = await guardLastAdmin();
-          if (guard) return guard;
+          const { members, target } = await targetInOrg();
+          if (!target) return json({ error: "no such member" }, 404);
+          if (
+            target.role === "admin" &&
+            members.filter((m) => m.role === "admin").length <= 1
+          ) {
+            return json({ error: "cannot remove or demote the last admin" }, 409);
+          }
           await removeMember(apiKey, membershipId);
           return json({ ok: true });
         } catch (e) {

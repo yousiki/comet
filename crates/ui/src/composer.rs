@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ use zeron_rpc::{RpcError, methods};
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::Pickers;
+use crate::settings::composer::ComposerDefaults;
 use crate::state::{AppState, Indicator};
 use crate::theme::Theme;
 
@@ -1336,7 +1337,9 @@ impl ComposerInput {
     ) -> Self {
         Self {
             key_context,
-            focus_handle: cx.focus_handle(),
+            // GPUI tab traversal is opt-in. Inputs participate so Tab can
+            // leave the composer for the avatar/Team control and return.
+            focus_handle: cx.focus_handle().tab_stop(true),
             content: String::new(),
             placeholder: placeholder.into(),
             selected_range: 0..0,
@@ -3372,6 +3375,28 @@ pub struct Composer {
 
 impl EventEmitter<ComposerEvent> for Composer {}
 
+/// Profile-bound input that a runtime handoff would discard or interrupt.
+/// Kept as a value object so Shell can build one destructive preflight for
+/// avatar-menu and Settings Team changes without reaching into Composer state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ComposerUnsentRisk {
+    pub current_input: bool,
+    pub draft_count: usize,
+    pub attachment_count: usize,
+    pub sending: bool,
+    pub send_task: bool,
+}
+
+impl ComposerUnsentRisk {
+    pub fn has_any(self) -> bool {
+        self.current_input
+            || self.draft_count > 0
+            || self.attachment_count > 0
+            || self.sending
+            || self.send_task
+    }
+}
+
 impl Composer {
     /// The picker entity, for the shell's canvas target selectors.
     pub fn pickers(&self) -> &Entity<Pickers> {
@@ -3505,6 +3530,63 @@ impl Composer {
         composer
     }
 
+    /// Cancel every profile-bound operation and discard all unsent input
+    /// before the shell releases this entity during a runtime replacement.
+    ///
+    /// Rebuilding the composer is still required: its [`Pickers`] child owns
+    /// engine-backed catalogs, ref caches, popovers and RPC tasks of its own.
+    /// This eager teardown closes the smaller window in which an old rendered
+    /// frame can retain the entity and let a send or file picker complete
+    /// against the replacement profile.
+    pub(crate) fn prepare_profile_replacement(&mut self, cx: &mut Context<Self>) {
+        self.picker_task = None;
+        self.reset_mention(None, cx);
+        self.reset_slash(None, cx);
+        self.advance_task = None;
+        self.send_task = None;
+        self.settle_task = None;
+
+        self.drafts.clear();
+        self.attachments.clear();
+        self.preview = None;
+        self.preview_focus_pending = false;
+        self.slash_cache.clear();
+        self.current_key.clear();
+        self.sending = false;
+        self.failure = None;
+        self.wizard = None;
+        self.answered_requests.clear();
+        self.expanded_mode = false;
+        self.flip_epoch = 0;
+        self.compact_capacity = 0.0;
+        self.expanded_anchor = 0.0;
+        self.last_seen_width = 0.0;
+        self.width_changed_at = None;
+        self.flip_morph = None;
+        self.last_rendered_height = 0.0;
+        self.route_snap_until = None;
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder("Do anything…", cx);
+            input.set_text("", cx);
+        });
+        cx.notify();
+    }
+
+    /// The composer defaults file also contains profile identities. Keep the
+    /// user's device-local model/reasoning/favorite preferences, but never
+    /// seed a replacement Team with the previous Team's device or project id.
+    pub(crate) fn clear_profile_targets(data_dir: &Path) {
+        let mut defaults = ComposerDefaults::load(data_dir);
+        let had_device = defaults.device.take().is_some();
+        let had_project = defaults.project.take().is_some();
+        let had_no_project = std::mem::take(&mut defaults.no_project);
+        if (had_device || had_project || had_no_project)
+            && let Err(error) = defaults.save(data_dir)
+        {
+            tracing::warn!(%error, "could not clear composer profile targets");
+        }
+    }
+
     /// Capture-knob passthrough (`ZERON_OPEN_DIALOG=model`): open the
     /// combined harness/model menu.
     pub fn debug_open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3514,6 +3596,25 @@ impl Composer {
 
     pub fn is_sending(&self) -> bool {
         self.sending
+    }
+
+    pub(crate) fn unsent_risk(&self, cx: &App) -> ComposerUnsentRisk {
+        ComposerUnsentRisk {
+            current_input: !self.input.read(cx).text().is_empty(),
+            draft_count: self
+                .drafts
+                .values()
+                .filter(|draft| !draft.is_empty())
+                .count(),
+            attachment_count: self.attachments.values().map(Vec::len).sum(),
+            sending: self.sending,
+            send_task: self.send_task.is_some(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_input_for_test(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
     }
 
     // ---- attachment staging (use-attachments.ts) ----
@@ -4452,6 +4553,10 @@ impl Composer {
             cx.notify();
             return;
         };
+        // Capture the fixed runtime profile once. Team AuthStatus can change
+        // while this async send is still finishing; late seeds must remain in
+        // the old namespace instead of following mutable auth into a new Team.
+        let attachment_namespace = self.state.read(cx).profile_cache_namespace();
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
         let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
@@ -4543,11 +4648,23 @@ impl Composer {
             .collect();
         let echo_text = attachments::with_attachments(&text, &echo_paths);
         for (path, att) in echo_paths.iter().zip(&staged) {
-            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+            attachments::seed_attachment(
+                &attachment_namespace,
+                &device_id,
+                path,
+                &att.name,
+                att.image.clone(),
+            );
             if let Some(local) = local_device_id.as_deref()
                 && local != device_id
             {
-                attachments::seed_attachment(local, path, &att.name, att.image.clone());
+                attachments::seed_attachment(
+                    &attachment_namespace,
+                    local,
+                    path,
+                    &att.name,
+                    att.image.clone(),
+                );
             }
         }
 
@@ -4734,9 +4851,21 @@ impl Composer {
                     // Attachment in the original send path).
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
+                        attachments::seed_attachment(
+                            &attachment_namespace,
+                            &seed_device,
+                            path,
+                            &att.name,
+                            att.image.clone(),
+                        );
                         if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                            attachments::seed_attachment(
+                                &attachment_namespace,
+                                &device_id,
+                                path,
+                                &att.name,
+                                att.image.clone(),
+                            );
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);
@@ -5727,6 +5856,100 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn profile_replacement_discards_unsent_composer_state(cx: &mut TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+
+        composer.update(cx, |composer, cx| {
+            composer
+                .drafts
+                .insert("old-chat".into(), "secret draft".into());
+            // An empty vector still proves the old profile key itself is gone.
+            composer.attachments.insert("old-chat".into(), Vec::new());
+            composer.slash_cache.insert(HarnessId::Mock, Vec::new());
+            composer.current_key = "old-chat".into();
+            composer.sending = true;
+            composer.failure = Some("old failure".into());
+            composer.wizard = Some(Wizard::new("old-request".into(), Vec::new()));
+            composer.answered_requests.insert("old-request".into());
+            composer.preview_focus_pending = true;
+            composer.picker_task = Some(Task::ready(()));
+            composer.mention_task = Some(Task::ready(()));
+            composer.slash_task = Some(Task::ready(()));
+            composer.advance_task = Some(Task::ready(()));
+            composer.send_task = Some(Task::ready(()));
+            composer.settle_task = Some(Task::ready(()));
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("secret draft", cx));
+
+            assert_eq!(
+                composer.unsent_risk(cx),
+                ComposerUnsentRisk {
+                    current_input: true,
+                    draft_count: 1,
+                    attachment_count: 0,
+                    sending: true,
+                    send_task: true,
+                }
+            );
+
+            composer.prepare_profile_replacement(cx);
+
+            assert!(composer.drafts.is_empty());
+            assert!(composer.attachments.is_empty());
+            assert!(composer.slash_cache.is_empty());
+            assert!(composer.current_key.is_empty());
+            assert!(!composer.sending);
+            assert!(composer.failure.is_none());
+            assert!(composer.wizard.is_none());
+            assert!(composer.answered_requests.is_empty());
+            assert!(!composer.preview_focus_pending);
+            assert!(composer.picker_task.is_none());
+            assert!(composer.mention_task.is_none());
+            assert!(composer.slash_task.is_none());
+            assert!(composer.advance_task.is_none());
+            assert!(composer.send_task.is_none());
+            assert!(composer.settle_task.is_none());
+            assert!(composer.input.read(cx).text().is_empty());
+            assert!(!composer.unsent_risk(cx).has_any());
+        });
+    }
+
+    #[test]
+    fn profile_target_reset_preserves_global_composer_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut defaults = ComposerDefaults {
+            harness: Some(HarnessId::Codex),
+            reasoning: Some(zeron_proto::ReasoningLevel::High),
+            device: Some("old-device".into()),
+            project: Some("old-project".into()),
+            no_project: true,
+            ..Default::default()
+        };
+        defaults.remember_model(HarnessId::Codex, "model-1".into(), "Model One".into());
+        defaults.toggle_favorite(HarnessId::Codex, "model-1");
+        defaults.save(dir.path()).unwrap();
+
+        Composer::clear_profile_targets(dir.path());
+
+        let reset = ComposerDefaults::load(dir.path());
+        assert_eq!(reset.device, None);
+        assert_eq!(reset.project, None);
+        assert!(!reset.no_project);
+        assert_eq!(reset.harness, Some(HarnessId::Codex));
+        assert_eq!(reset.reasoning, Some(zeron_proto::ReasoningLevel::High));
+        assert_eq!(
+            reset
+                .model_for(HarnessId::Codex)
+                .map(|model| model.id.as_str()),
+            Some("model-1")
+        );
+        assert!(reset.is_favorite(HarnessId::Codex, "model-1"));
+    }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
         MentionTooltipTarget {

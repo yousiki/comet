@@ -31,7 +31,8 @@ use crate::comments::DiffComment;
 use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
-    AuthState, Chat, ChatIndicator, Device, EngineInfo, HarnessId, Session, Space, WorkspaceScope,
+    AuthState, Chat, ChatIndicator, Device, EngineInfo, EngineProfileIdentity, HarnessId, Session,
+    Space, WorkspaceScope,
 };
 use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -123,7 +124,7 @@ enum DeferredEngineState {
 /// Existing subscriptions attach to the assembled service without reconnecting.
 struct DeferredEngineRpc {
     auth: AuthRpc,
-    engine_info: EngineInfo,
+    engine_info: Arc<std::sync::RwLock<EngineInfo>>,
     state: tokio::sync::watch::Receiver<DeferredEngineState>,
     service: Arc<tokio::sync::OnceCell<Arc<dyn RpcService>>>,
 }
@@ -132,7 +133,12 @@ struct DeferredEngineRpc {
 impl RpcService for DeferredEngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         if method == methods::ENGINE_INFO {
-            return RpcReply::value(&self.engine_info);
+            let engine_info = self
+                .engine_info
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            return RpcReply::value(&engine_info);
         }
         if method == methods::ENGINE_READY {
             let mut state = self.state.clone();
@@ -211,7 +217,7 @@ impl EngineBackend for RemoteEngine {
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<dyn EngineBackend>,
-    engine_info: EngineInfo,
+    engine_info: Arc<std::sync::RwLock<EngineInfo>>,
     deferred_state: Option<tokio::sync::watch::Receiver<DeferredEngineState>>,
 }
 
@@ -268,7 +274,11 @@ impl EngineHandle {
         let workspace_scope = Engine::initial_workspace_scope(&auth);
         let initial_profile = Engine::resolve_profile(&engine_config, &auth, workspace_scope)?;
         let profile_is_resolved = initial_profile.is_some();
-        let engine_info = Engine::engine_info(&engine_config, workspace_scope)?;
+        let engine_info = Arc::new(std::sync::RwLock::new(Engine::engine_info_for_profile(
+            &engine_config,
+            workspace_scope,
+            initial_profile.as_ref(),
+        )?));
         let refresh_task = auth.spawn_refresh_loop();
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
         let assembled_service = Arc::new(tokio::sync::OnceCell::new());
@@ -302,6 +312,7 @@ impl EngineHandle {
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
         let service_for_boot = assembled_service.clone();
+        let engine_info_for_boot = engine_info.clone();
         let ipc_bound = ipc_task.is_some();
         // The instance lock rides into the boot task and is consumed by
         // assembly — held through sign-in onboarding too, because this process
@@ -349,6 +360,10 @@ impl EngineHandle {
                     }
                 }
             };
+            let profile_identity = EngineProfileIdentity {
+                user_id: profile.user_id().to_string(),
+                organization_id: profile.org_id().to_string(),
+            };
 
             match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
                 Ok(engine_runtime) => {
@@ -369,6 +384,10 @@ impl EngineHandle {
                         ));
                         return;
                     }
+                    engine_info_for_boot
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .profile = Some(profile_identity);
                     state_tx.send_replace(DeferredEngineState::Ready);
                 }
                 Err(err) => {
@@ -417,15 +436,28 @@ impl EngineHandle {
             Ok(client) => match query_engine_info(&client).await {
                 Ok(engine_info) => {
                     let client = Arc::new(client);
+                    let engine_info = Arc::new(std::sync::RwLock::new(engine_info));
                     let (state_tx, state_rx) =
                         tokio::sync::watch::channel(DeferredEngineState::Waiting);
                     let lifecycle_client = client.clone();
+                    let lifecycle_engine_info = engine_info.clone();
                     let lifecycle_task = tokio::spawn(async move {
                         let state = match lifecycle_client
                             .call(methods::ENGINE_READY, serde_json::json!({}))
                             .await
                         {
-                            Ok(_) => DeferredEngineState::Ready,
+                            Ok(_) => match query_engine_info(&lifecycle_client).await {
+                                Ok(resolved) => {
+                                    *lifecycle_engine_info
+                                        .write()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        resolved;
+                                    DeferredEngineState::Ready
+                                }
+                                Err(err) => DeferredEngineState::Failed(format!(
+                                    "engine became ready without a fixed identity: {err}"
+                                )),
+                            },
                             // EngineReady was added after EngineInfo. An older daemon
                             // that does not expose the barrier is already assembled.
                             Err(RpcError::Failed(message))
@@ -475,12 +507,25 @@ impl EngineHandle {
         self.inner.mode()
     }
 
-    pub fn engine_info(&self) -> &EngineInfo {
-        &self.engine_info
+    pub fn engine_info(&self) -> EngineInfo {
+        self.engine_info
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn same_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     fn deferred_state(&self) -> Option<tokio::sync::watch::Receiver<DeferredEngineState>> {
         self.deferred_state.clone()
+    }
+
+    fn lifecycle_ready(&self) -> bool {
+        self.deferred_state
+            .as_ref()
+            .is_none_or(|state| matches!(&*state.borrow(), DeferredEngineState::Ready))
     }
 
     pub async fn shutdown(&self) {
@@ -510,6 +555,7 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
             Ok(EngineInfo {
                 device_id: legacy.device_id,
                 workspace_scope: WorkspaceScope::Synced,
+                profile: None,
             })
         }
         Err(err) => Err(err),
@@ -570,7 +616,11 @@ pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
             .cmp(&b.name.to_lowercase())
             .then_with(|| a.name.cmp(&b.name))
     });
-    orgs.dedup_by(|a, b| a.organization_id == b.organization_id);
+    // The same WorkOS membership can occasionally arrive twice with names
+    // from different cache generations. `dedup_by` only removes adjacent
+    // entries, which name sorting does not guarantee, so retain by identity.
+    let mut seen = std::collections::HashSet::new();
+    orgs.retain(|org| seen.insert(org.organization_id.clone()));
     orgs
 }
 
@@ -593,6 +643,111 @@ struct PendingSend {
 /// to a remote host; when the host is offline the dot falls back to the
 /// truth after this.
 pub const PENDING_SEND_TTL_MS: i64 = 30_000;
+
+/// Stable identity for process-global attachment bytes. Authentication can
+/// change before a fixed-profile runtime stops, so consumers must use this
+/// captured runtime identity instead of deriving a cache key from the latest
+/// mutable AuthStatus frame on every render.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ProfileCacheNamespace {
+    Synced {
+        user_id: String,
+        organization_id: String,
+    },
+    Local {
+        data_dir: PathBuf,
+        device_id: String,
+    },
+    Development {
+        user_id: String,
+        organization_id: String,
+    },
+    /// No profile-bearing data may render while pending. A unique nonce keeps
+    /// late work from an unattached/replaced runtime isolated defensively.
+    Pending(String),
+}
+
+impl ProfileCacheNamespace {
+    fn for_engine(engine_info: &EngineInfo, data_dir: Option<&PathBuf>) -> Self {
+        match (engine_info.workspace_scope, engine_info.profile.as_ref()) {
+            (WorkspaceScope::Synced, Some(profile)) => Self::Synced {
+                user_id: profile.user_id.clone(),
+                organization_id: profile.organization_id.clone(),
+            },
+            (WorkspaceScope::Development, Some(profile)) => Self::Development {
+                user_id: profile.user_id.clone(),
+                organization_id: profile.organization_id.clone(),
+            },
+            (WorkspaceScope::Local, _) => Self::Local {
+                data_dir: data_dir.cloned().unwrap_or_default(),
+                device_id: engine_info.device_id.clone(),
+            },
+            // A legacy daemon or first-run synced engine may not announce a
+            // resolved profile. Never substitute mutable AuthStatus: a Team
+            // selection can publish there while this runtime still owns the
+            // previous profile's stores. A viewport-unique namespace is the
+            // safe fallback (at the cost of cache sharing only).
+            (WorkspaceScope::Synced | WorkspaceScope::Development, None) => {
+                Self::Pending(uuid::Uuid::new_v4().to_string())
+            }
+        }
+    }
+}
+
+const MISSING_FIXED_SYNCED_PROFILE_ERROR: &str = "This engine does not announce its fixed Team profile. Stop or upgrade the old engine, then retry; the app will not open Team data against a mutable authentication identity.";
+
+fn missing_fixed_synced_profile_error(
+    engine_info: Option<&EngineInfo>,
+    lifecycle_ready: bool,
+    auth: Option<&AuthState>,
+) -> Option<&'static str> {
+    let engine_info = engine_info?;
+    let signed_in_with_team = matches!(
+        auth,
+        Some(AuthState::SignedIn {
+            org_id: Some(_),
+            ..
+        })
+    );
+    (lifecycle_ready
+        && signed_in_with_team
+        && engine_info.workspace_scope == WorkspaceScope::Synced
+        && engine_info.profile.is_none())
+    .then_some(MISSING_FIXED_SYNCED_PROFILE_ERROR)
+}
+
+fn fixed_synced_profile_gate(
+    engine_info: Option<&EngineInfo>,
+    lifecycle_ready: bool,
+    auth: Option<&AuthState>,
+) -> Option<GatePhase> {
+    let engine_info = engine_info?;
+    let Some(AuthState::SignedIn {
+        user,
+        org_id: Some(organization_id),
+    }) = auth
+    else {
+        return None;
+    };
+    if engine_info.workspace_scope != WorkspaceScope::Synced {
+        return None;
+    }
+    match engine_info.profile.as_ref() {
+        Some(profile)
+            if profile.user_id == user.id && profile.organization_id == *organization_id =>
+        {
+            None
+        }
+        // A valid old profile plus new AuthStatus is the normal Team-handoff
+        // window. The shell owns the replacement UI, while this lower-level
+        // gate guarantees no old Team rows paint before that observer runs.
+        Some(_) => Some(GatePhase::Loading),
+        None if lifecycle_ready => Some(GatePhase::Failed(
+            MISSING_FIXED_SYNCED_PROFILE_ERROR.to_string(),
+        )),
+        None => Some(GatePhase::Loading),
+    }
+}
 
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
@@ -649,6 +804,7 @@ pub struct AppState {
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
+    profile_cache_namespace: ProfileCacheNamespace,
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
@@ -690,6 +846,9 @@ impl AppState {
             local_device_id: None,
             update: None,
             data_dir: None,
+            profile_cache_namespace: ProfileCacheNamespace::Pending(
+                uuid::Uuid::new_v4().to_string(),
+            ),
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
@@ -826,6 +985,20 @@ impl AppState {
 
     pub fn apply_auth(&mut self, auth: AuthState) {
         self.auth = Some(auth);
+        if let Some(error) = self.fixed_profile_compatibility_error() {
+            self.connection = ConnectionStatus::Failed(error);
+        }
+    }
+
+    fn fixed_profile_compatibility_error(&self) -> Option<String> {
+        let engine = self.engine.as_ref()?;
+        let engine_info = engine.engine_info();
+        missing_fixed_synced_profile_error(
+            Some(&engine_info),
+            engine.lifecycle_ready(),
+            self.auth.as_ref(),
+        )
+        .map(str::to_string)
     }
 
     /// Tolerant AuthStatus frame reducer (see [`parse_auth_state`]).
@@ -842,6 +1015,10 @@ impl AppState {
             AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
             AuthState::SignedOut => None,
         }
+    }
+
+    pub(crate) fn profile_cache_namespace(&self) -> ProfileCacheNamespace {
+        self.profile_cache_namespace.clone()
     }
 
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
@@ -959,6 +1136,13 @@ impl AppState {
         self.pending_sends.get(chat_id).is_some_and(|p| {
             now.signed_duration_since(p.started).num_milliseconds() <= PENDING_SEND_TTL_MS
         })
+    }
+
+    /// Raw unacknowledged sends, including entries past the display TTL. A
+    /// destructive runtime handoff must remain conservative: the TTL only
+    /// suppresses stale chrome and is not proof that a queued send settled.
+    pub fn pending_send_count(&self) -> usize {
+        self.pending_sends.len()
     }
 
     /// When the in-flight send (if any, inside the TTL) was fired — the
@@ -1157,6 +1341,18 @@ impl AppState {
     }
 
     pub fn gate(&self) -> GatePhase {
+        if matches!(self.connection, ConnectionStatus::Ready)
+            && let Some(engine) = self.engine.as_ref()
+        {
+            let engine_info = engine.engine_info();
+            if let Some(gate) = fixed_synced_profile_gate(
+                Some(&engine_info),
+                engine.lifecycle_ready(),
+                self.auth.as_ref(),
+            ) {
+                return gate;
+            }
+        }
         gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
 
@@ -1188,8 +1384,13 @@ impl AppState {
         self.transcript.clear();
         self.echoes.clear();
         self.pending_sends.clear();
+        self.diff_comments.clear();
+        self.sub_watch_tasks.clear();
+        self.sub_transcripts.clear();
         self.local_device_id = None;
         self.update = None;
+        self.profile_cache_namespace =
+            ProfileCacheNamespace::Pending(uuid::Uuid::new_v4().to_string());
         cx.notify();
     }
 
@@ -1204,6 +1405,8 @@ impl AppState {
             s.workspace_scope = None;
             s.auth = None;
             s.data_dir = Some(data_dir);
+            s.profile_cache_namespace =
+                ProfileCacheNamespace::Pending(uuid::Uuid::new_v4().to_string());
             cx.notify();
         });
         let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
@@ -1235,6 +1438,8 @@ impl AppState {
         let engine_info = handle.engine_info();
         self.workspace_scope = Some(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());
+        self.profile_cache_namespace =
+            ProfileCacheNamespace::for_engine(&engine_info, self.data_dir.as_ref());
         self.engine = Some(handle.clone());
         let mut watch_tasks = Vec::with_capacity(8);
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
@@ -1401,18 +1606,46 @@ fn spawn_deferred_engine_watch(
 ) -> Option<Task<()>> {
     let mut deferred = handle.deferred_state()?;
     Some(cx.spawn(async move |this, cx| {
-        let Err(failure) = wait_for_deferred_engine(&mut deferred).await else {
-            return;
-        };
-        tracing::error!(error = %failure, "engine assembly failed after attachment");
-        // Embedded handles release their IPC listener before exposing Retry;
-        // remote handles stop their completed readiness probe.
-        handle.shutdown().await;
-        this.update(cx, |state, cx| {
-            state.connection = ConnectionStatus::Failed(failure);
-            cx.notify();
-        })
-        .ok();
+        match wait_for_deferred_engine(&mut deferred).await {
+            Ok(()) => {
+                let engine_info = handle.engine_info();
+                this.update(cx, |state, cx| {
+                    let is_current = state
+                        .engine
+                        .as_ref()
+                        .is_some_and(|current| current.same_runtime(&handle));
+                    if !is_current {
+                        return;
+                    }
+                    state.workspace_scope = Some(engine_info.workspace_scope);
+                    state.local_device_id = Some(engine_info.device_id.clone());
+                    state.profile_cache_namespace =
+                        ProfileCacheNamespace::for_engine(&engine_info, state.data_dir.as_ref());
+                    if let Some(error) = state.fixed_profile_compatibility_error() {
+                        state.connection = ConnectionStatus::Failed(error);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+            Err(failure) => {
+                tracing::error!(error = %failure, "engine assembly failed after attachment");
+                // Embedded handles release their IPC listener before exposing Retry;
+                // remote handles stop their completed readiness probe.
+                handle.shutdown().await;
+                this.update(cx, |state, cx| {
+                    let is_current = state
+                        .engine
+                        .as_ref()
+                        .is_some_and(|current| current.same_runtime(&handle));
+                    if is_current {
+                        state.connection = ConnectionStatus::Failed(failure);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        }
     }))
 }
 
@@ -1689,7 +1922,10 @@ fn spawn_subagent_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use chrono::TimeDelta;
+    use gpui::{AppContext as _, TestAppContext};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zeron_engine::{EngineCore, default_registry};
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `zeron_proto::view`.
@@ -1699,6 +1935,62 @@ mod tests {
     async fn free_port() -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap().port()
+    }
+
+    fn test_access_token(organization_id: Option<&str>) -> String {
+        let mut claims = serde_json::json!({
+            "sub": "user_1",
+            "iat": 1_700_000_000_i64,
+            "exp": 4_100_000_000_i64,
+        });
+        if let Some(organization_id) = organization_id {
+            claims["org_id"] = serde_json::json!(organization_id);
+        }
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).expect("JWT claims"));
+        format!("header.{payload}.signature")
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let total = loop {
+            let mut chunk = [0_u8; 2048];
+            let count = stream.read(&mut chunk).await.expect("read mock request");
+            assert!(count > 0, "mock request closed before its body");
+            bytes.extend_from_slice(&chunk[..count]);
+            let Some(head_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..head_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            break head_end + 4 + content_length;
+        };
+        while bytes.len() < total {
+            let mut chunk = [0_u8; 2048];
+            let count = stream.read(&mut chunk).await.expect("read mock body");
+            assert!(count > 0, "mock request closed before its body");
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        String::from_utf8_lossy(&bytes[..total]).into_owned()
+    }
+
+    async fn write_http_json(stream: &mut tokio::net::TcpStream, body: serde_json::Value) {
+        let body = serde_json::to_vec(&body).expect("mock JSON");
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.expect("write head");
+        stream.write_all(&body).await.expect("write body");
+        stream.shutdown().await.expect("close response");
     }
 
     struct LegacyIdentityRpc;
@@ -1720,7 +2012,7 @@ mod tests {
     }
 
     struct DeferredIdentityRpc {
-        engine_info: EngineInfo,
+        engine_info: Arc<std::sync::RwLock<EngineInfo>>,
         state: tokio::sync::watch::Receiver<DeferredEngineState>,
     }
 
@@ -1732,7 +2024,14 @@ mod tests {
             _params: serde_json::Value,
         ) -> Result<RpcReply, RpcError> {
             match method {
-                methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+                methods::ENGINE_INFO => {
+                    let engine_info = self
+                        .engine_info
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    RpcReply::value(&engine_info)
+                }
                 methods::ENGINE_READY => {
                     let mut state = self.state.clone();
                     wait_for_deferred_engine(&mut state)
@@ -1886,10 +2185,11 @@ mod tests {
         let server = tokio::spawn(zeron_rpc::serve_ws_listener(
             listener,
             Arc::new(DeferredIdentityRpc {
-                engine_info: EngineInfo {
+                engine_info: Arc::new(std::sync::RwLock::new(EngineInfo {
                     device_id: "owner-device".into(),
                     workspace_scope: WorkspaceScope::Local,
-                },
+                    profile: None,
+                })),
                 state: state_rx,
             }),
         ));
@@ -1920,6 +2220,67 @@ mod tests {
             .await
             .expect("remote readiness probe completes"),
             Err("store failed".into())
+        );
+
+        handle.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_viewport_requeries_fixed_profile_after_deferred_ready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind deferred daemon");
+        let port = listener.local_addr().expect("daemon addr").port();
+        let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let engine_info = Arc::new(std::sync::RwLock::new(EngineInfo {
+            device_id: "owner-device".into(),
+            workspace_scope: WorkspaceScope::Synced,
+            profile: None,
+        }));
+        let server = tokio::spawn(zeron_rpc::serve_ws_listener(
+            listener,
+            Arc::new(DeferredIdentityRpc {
+                engine_info: engine_info.clone(),
+                state: state_rx,
+            }),
+        ));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .expect("remote viewport attaches during onboarding");
+        assert_eq!(handle.engine_info().profile, None);
+
+        let expected = Some(EngineProfileIdentity {
+            user_id: "user-1".into(),
+            organization_id: "org-target".into(),
+        });
+        engine_info
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .profile = expected.clone();
+        state_tx.send_replace(DeferredEngineState::Ready);
+        let mut deferred = handle.deferred_state().expect("remote lifecycle");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_deferred_engine(&mut deferred),
+        )
+        .await
+        .expect("remote readiness completed")
+        .expect("remote runtime ready");
+        assert_eq!(
+            handle.engine_info().profile,
+            expected,
+            "the remote handle must requery EngineInfo after the owner promotes it"
         );
 
         handle.shutdown().await;
@@ -2080,7 +2441,7 @@ mod tests {
             .call_as(methods::ENGINE_INFO, serde_json::json!({}))
             .await
             .unwrap();
-        assert_eq!(info, *handle.engine_info());
+        assert_eq!(info, handle.engine_info());
 
         let mut auth = handle
             .client()
@@ -2153,6 +2514,104 @@ mod tests {
         );
         assert!(!dir.path().join("orgs").exists());
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deferred_team_selection_promotes_engine_info_before_ready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock edge");
+        let edge_url = format!("http://{}", listener.local_addr().expect("edge addr"));
+        let (orgs_seen_tx, orgs_seen_rx) = tokio::sync::oneshot::channel();
+        let edge = tokio::spawn(async move {
+            let mut orgs_seen_tx = Some(orgs_seen_tx);
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("accept edge request");
+                let request = read_http_request(&mut stream).await;
+                let first_line = request.lines().next().unwrap_or_default();
+                let body = if first_line.starts_with("POST /auth/refresh ") {
+                    let target = request.contains("\"organizationId\":\"org_target\"");
+                    serde_json::json!({
+                        "accessToken": test_access_token(target.then_some("org_target")),
+                        "refreshToken": if target { "refresh_target" } else { "refresh_unscoped" },
+                    })
+                } else if first_line.starts_with("GET /auth/orgs ") {
+                    if let Some(seen) = orgs_seen_tx.take() {
+                        let _ = seen.send(());
+                    }
+                    serde_json::json!({
+                        "orgs": [{
+                            "id": "membership_target",
+                            "organizationId": "org_target",
+                            "name": "Target Team",
+                            "role": "admin",
+                        }]
+                    })
+                } else {
+                    panic!("unexpected mock edge request: {first_line}");
+                };
+                write_http_json(&mut stream, body).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("session.json"),
+            r#"{"refreshToken":"saved","user":{"id":"user_1","email":"u@example.com"}}"#,
+        )
+        .expect("seed org-less session");
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: free_port().await,
+            edge_url,
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .expect("deferred bootstrap");
+        assert_eq!(handle.engine_info().profile, None);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), orgs_seen_rx)
+            .await
+            .expect("default-org probe reached memberships")
+            .expect("membership signal");
+        handle
+            .client()
+            .call(
+                methods::SELECT_ORG,
+                serde_json::json!({"organizationId": "org_target"}),
+            )
+            .await
+            .expect("select existing Team");
+        let mut deferred = handle.deferred_state().expect("deferred lifecycle");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_deferred_engine(&mut deferred),
+        )
+        .await
+        .expect("runtime assembly completed")
+        .expect("runtime became ready");
+
+        let expected = Some(EngineProfileIdentity {
+            user_id: "user_1".into(),
+            organization_id: "org_target".into(),
+        });
+        assert_eq!(
+            handle.engine_info().profile,
+            expected,
+            "the owning viewport must see the assembled fixed profile before Ready"
+        );
+        let announced: EngineInfo = handle
+            .client()
+            .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+            .await
+            .expect("resolved EngineInfo RPC");
+        assert_eq!(announced.profile, expected);
+
+        handle.shutdown().await;
+        edge.await.expect("mock edge completed");
     }
 
     #[tokio::test]
@@ -2314,6 +2773,7 @@ mod tests {
         assert_eq!(s.display_status_for(&s_chat, now), ChatIndicator::Completed);
         assert_eq!(s.indicator_for("c", now), Indicator::None);
         s.begin_pending_send("c", "m1", now);
+        assert_eq!(s.pending_send_count(), 1);
         assert_eq!(s.display_status_for(&s_chat, now), ChatIndicator::Working);
         assert_eq!(s.indicator_for("c", now), Indicator::Working);
         // Time-bounded: an offline host must not leave an eternal spinner.
@@ -2323,6 +2783,11 @@ mod tests {
             ChatIndicator::Completed
         );
         assert_eq!(s.indicator_for("c", later), Indicator::None);
+        assert_eq!(
+            s.pending_send_count(),
+            1,
+            "display TTL is not settlement proof for destructive preflight"
+        );
     }
 
     #[test]
@@ -2736,6 +3201,207 @@ mod tests {
         });
         assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
         assert_eq!(state.watch_tasks.len(), 1);
+    }
+
+    #[test]
+    fn synced_attachment_namespace_uses_fixed_engine_profile_after_auth_moves_on() {
+        let auth = |user_id: &str, organization_id: &str| AuthState::SignedIn {
+            user: UserProfile {
+                id: user_id.into(),
+                email: format!("{user_id}@example.com"),
+                name: None,
+            },
+            org_id: Some(organization_id.into()),
+        };
+        let old_runtime = EngineInfo {
+            device_id: "device-1".into(),
+            workspace_scope: WorkspaceScope::Synced,
+            profile: Some(zeron_proto::EngineProfileIdentity {
+                user_id: "user-1".into(),
+                organization_id: "org-old".into(),
+            }),
+        };
+        let mut first_viewport = AppState::new();
+        first_viewport.workspace_scope = Some(WorkspaceScope::Synced);
+        first_viewport.profile_cache_namespace =
+            ProfileCacheNamespace::for_engine(&old_runtime, None);
+        let fixed = first_viewport.profile_cache_namespace();
+        assert_eq!(
+            fixed,
+            ProfileCacheNamespace::Synced {
+                user_id: "user-1".into(),
+                organization_id: "org-old".into(),
+            }
+        );
+
+        // SELECT_ORG publishes AuthStatus before the old fixed-profile runtime
+        // has necessarily stopped. Its cache namespace must not follow.
+        first_viewport.apply_auth(auth("user-1", "org-new"));
+        assert_eq!(first_viewport.profile_cache_namespace(), fixed);
+
+        // A viewport attaching inside that window sees the new AuthStatus but
+        // must still key bytes to the old immutable EngineInfo profile.
+        let mut second_viewport = AppState::new();
+        second_viewport.workspace_scope = Some(WorkspaceScope::Synced);
+        second_viewport.profile_cache_namespace =
+            ProfileCacheNamespace::for_engine(&old_runtime, None);
+        second_viewport.apply_auth(auth("user-1", "org-new"));
+        assert_eq!(
+            second_viewport.profile_cache_namespace(),
+            fixed,
+            "viewports attached to the same profile need the same stable namespace"
+        );
+    }
+
+    #[test]
+    fn missing_engine_profile_never_falls_back_to_mutable_auth_identity() {
+        let legacy_or_onboarding_runtime = EngineInfo {
+            device_id: "legacy-device".into(),
+            workspace_scope: WorkspaceScope::Synced,
+            profile: None,
+        };
+        let mut viewport = AppState::new();
+        viewport.profile_cache_namespace =
+            ProfileCacheNamespace::for_engine(&legacy_or_onboarding_runtime, None);
+        let isolated = viewport.profile_cache_namespace();
+        assert!(matches!(isolated, ProfileCacheNamespace::Pending(_)));
+
+        viewport.apply_auth(AuthState::SignedIn {
+            user: UserProfile {
+                id: "user-1".into(),
+                email: "user-1@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-new".into()),
+        });
+        assert_eq!(viewport.profile_cache_namespace(), isolated);
+    }
+
+    #[test]
+    fn ready_legacy_synced_engine_with_no_fixed_profile_fails_closed() {
+        let unsupported = EngineInfo {
+            device_id: "legacy-device".into(),
+            workspace_scope: WorkspaceScope::Synced,
+            profile: None,
+        };
+        let signed_in = AuthState::SignedIn {
+            user: UserProfile {
+                id: "user-1".into(),
+                email: "user-1@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-1".into()),
+        };
+        assert!(
+            missing_fixed_synced_profile_error(Some(&unsupported), true, Some(&signed_in))
+                .is_some(),
+            "a ready legacy daemon must not render Team stores under mutable auth"
+        );
+        assert_eq!(
+            missing_fixed_synced_profile_error(Some(&unsupported), false, Some(&signed_in)),
+            None,
+            "deferred onboarding is allowed to acquire its first fixed profile before Ready"
+        );
+        assert_eq!(
+            fixed_synced_profile_gate(Some(&unsupported), false, Some(&signed_in)),
+            Some(GatePhase::Loading),
+            "signed-in Team data stays occluded while deferred identity is unresolved"
+        );
+        assert!(matches!(
+            fixed_synced_profile_gate(Some(&unsupported), true, Some(&signed_in)),
+            Some(GatePhase::Failed(_))
+        ));
+        assert_eq!(
+            missing_fixed_synced_profile_error(
+                Some(&unsupported),
+                true,
+                Some(&AuthState::NeedsOrganization {
+                    user: UserProfile {
+                        id: "user-1".into(),
+                        email: "user-1@example.com".into(),
+                        name: None,
+                    },
+                }),
+            ),
+            None,
+            "the organization gate has no Team data plane yet"
+        );
+        let supported = EngineInfo {
+            profile: Some(EngineProfileIdentity {
+                user_id: "user-1".into(),
+                organization_id: "org-1".into(),
+            }),
+            ..unsupported
+        };
+        assert_eq!(
+            missing_fixed_synced_profile_error(Some(&supported), true, Some(&signed_in)),
+            None
+        );
+        assert_eq!(
+            fixed_synced_profile_gate(Some(&supported), true, Some(&signed_in)),
+            None
+        );
+        let switched_auth = AuthState::SignedIn {
+            user: UserProfile {
+                id: "user-1".into(),
+                email: "user-1@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-2".into()),
+        };
+        assert_eq!(
+            fixed_synced_profile_gate(Some(&supported), true, Some(&switched_auth)),
+            Some(GatePhase::Loading),
+            "a SELECT-published control plane cannot reveal the old data plane"
+        );
+    }
+
+    #[gpui::test]
+    fn runtime_replacement_clears_comments_and_subagent_feeds(cx: &mut TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let data_dir = PathBuf::from("/tmp/zeron-profile-reset-test");
+        state.update(cx, |state, cx| {
+            state.connection = ConnectionStatus::Ready;
+            state.workspace_scope = Some(WorkspaceScope::Synced);
+            state.auth = Some(AuthState::SignedIn {
+                user: UserProfile {
+                    id: "u".into(),
+                    email: "u@example.com".into(),
+                    name: None,
+                },
+                org_id: Some("old-org".into()),
+            });
+            state.data_dir = Some(data_dir.clone());
+            state.add_diff_comment(
+                "old-chat",
+                DiffComment::new(
+                    "src/lib.rs",
+                    crate::comments::CommentSide::New,
+                    7,
+                    "old Team note",
+                ),
+            );
+            state
+                .sub_transcripts
+                .insert("old-subagent".into(), Vec::new());
+            state
+                .sub_watch_tasks
+                .insert("old-subagent".into(), Task::ready(()));
+            state.watch_tasks.push(Task::ready(()));
+            state.transcript_task = Some(Task::ready(()));
+
+            state.prepare_runtime_replacement(cx);
+
+            assert!(state.diff_comments.is_empty());
+            assert!(state.sub_transcripts.is_empty());
+            assert!(state.sub_watch_tasks.is_empty());
+            assert!(state.watch_tasks.is_empty());
+            assert!(state.transcript_task.is_none());
+            assert_eq!(state.connection, ConnectionStatus::Connecting);
+            assert_eq!(state.workspace_scope, None);
+            assert_eq!(state.auth, None);
+            assert_eq!(state.data_dir.as_ref(), Some(&data_dir));
+        });
     }
 
     #[test]

@@ -12,8 +12,8 @@
 //!   remote devices' workspace session rows
 //! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
 //!   setChatArchived, deleteChat, renameDevice, markChatSeen)
-//! - `EngineInfo` → `{deviceId, workspaceScope}` — this runtime's fixed identity
-//!   and data boundary (never forwarded)
+//! - `EngineInfo` → `{deviceId, workspaceScope, profile?}` — this runtime's fixed
+//!   identity and data boundary (never forwarded)
 //! - `LocalDevice` → `{deviceId}` — legacy engine identity (never forwarded)
 //! - AuthRpc (feature-inventory §2): `AuthStatus` (stream), `SignIn`/`SignInHeadless` →
 //!   `{url}`, `CompleteSignIn {code}`, `SignOut`, `ListOrgs`, `CreateOrg {name}`,
@@ -57,7 +57,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
-use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
+use zeron_proto::{
+    ChatConfig, EngineInfo, EngineProfileIdentity, HarnessId, ToolCall, WorkspaceScope,
+};
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
@@ -403,6 +405,7 @@ impl EngineRpc {
         let engine_info = EngineInfo {
             device_id: doc_host.device_id().to_string(),
             workspace_scope,
+            profile: None,
         };
         Self {
             sessions,
@@ -420,6 +423,14 @@ impl EngineRpc {
             local_import: None,
             engine_info,
         }
+    }
+
+    /// Announce the immutable profile that opened this RPC service's stores.
+    /// Kept as a builder so direct/test callers of `new` remain source-compatible
+    /// and safely expose no profile unless they actually have one.
+    pub fn with_profile_identity(mut self, profile_identity: EngineProfileIdentity) -> Self {
+        self.engine_info.profile = Some(profile_identity);
+        self
     }
 
     /// Attach the auth service (AuthStatus + AuthRpc mutations).
@@ -942,7 +953,9 @@ impl RpcService for AuthRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::SIGN_OUT => {
-                self.auth.sign_out();
+                self.auth
+                    .sign_out()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::LIST_ORGS => {
@@ -959,11 +972,12 @@ impl RpcService for AuthRpc {
                     name: String,
                 }
                 let p: P = parse_params(params)?;
-                self.auth
+                let organization_id = self
+                    .auth
                     .create_org(&p.name)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
+                RpcReply::value(&serde_json::json!({ "organizationId": organization_id }))
             }
             methods::SELECT_ORG => {
                 #[derive(Deserialize)]
@@ -1049,11 +1063,12 @@ impl RpcService for AuthRpc {
                     organization_id: String,
                 }
                 let p: P = parse_params(params)?;
-                self.auth
+                let outcome = self
+                    .auth
                     .delete_org(&p.organization_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
+                RpcReply::value(&outcome)
             }
             _ => Err(RpcError::UnknownMethod(method.to_string())),
         }
@@ -1861,5 +1876,25 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn create_org_rpc_returns_the_organization_id_field() {
+        let data_dir = tempfile::tempdir().expect("temp auth dir");
+        let auth = Auth::new(crate::auth::AuthConfig::new(
+            "http://127.0.0.1:9",
+            data_dir.path(),
+        ));
+        let reply = AuthRpc::new(auth)
+            .handle(
+                methods::CREATE_ORG,
+                serde_json::json!({"name": "Workspace"}),
+            )
+            .await
+            .expect("create org RPC");
+        let RpcReply::Value(value) = reply else {
+            panic!("create org must be a unary reply");
+        };
+        assert_eq!(value, serde_json::json!({"organizationId": ""}));
     }
 }

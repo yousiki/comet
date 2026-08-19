@@ -129,7 +129,9 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
     if !auth.workos_enabled() {
         // Dev mode has no live session, but clear any stale session.json from a
         // previous WorkOS-mode run so the next real run starts signed out.
-        auth.sign_out();
+        auth.sign_out().map_err(|error| {
+            anyhow::anyhow!("could not durably clear the saved auth session: {error}")
+        })?;
         println!("Auth is in dev mode — cleared any stale saved session.");
         println!("The next engine start will remain in development mode.");
         return Ok(());
@@ -137,7 +139,9 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
     match auth.state() {
         AuthState::SignedOut => {
             // Also remove malformed or stale files that could not be loaded.
-            auth.sign_out();
+            auth.sign_out().map_err(|error| {
+                anyhow::anyhow!("could not durably clear the stale auth session: {error}")
+            })?;
             println!("No valid saved session; cleared any stale session file.");
         }
         state => {
@@ -145,7 +149,8 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
                 .user()
                 .map(|u| u.email.clone())
                 .unwrap_or_else(|| "<unknown>".into());
-            auth.sign_out();
+            auth.sign_out()
+                .map_err(|error| anyhow::anyhow!("could not durably sign out {email}: {error}"))?;
             println!(
                 "Signed out {email} — removed {}.",
                 config.data_dir.join("session.json").display()
@@ -307,6 +312,23 @@ mod tests {
         assert_eq!(
             Engine::initial_workspace_scope(&after),
             WorkspaceScope::Local
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_reports_a_durable_invalidation_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        std::fs::create_dir(dir.path().join("session.state")).unwrap();
+
+        let error = logout(config).await.unwrap_err().to_string();
+        assert!(
+            error.contains("could not durably clear the stale auth session"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("could not durably invalidate auth session"),
+            "unexpected error: {error}"
         );
     }
 }

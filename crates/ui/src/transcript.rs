@@ -2592,13 +2592,14 @@ impl Transcript {
         if self.doc_override.is_some() {
             return;
         }
+        let namespace = self.state.read(cx).profile_cache_namespace();
         let devices = self.attachment_device_ids(cx);
         let mut keys = std::collections::HashSet::new();
         for row in &self.rows {
             if let RowKind::User { attachments, .. } = &row.kind {
                 for att in attachments.iter() {
                     for dev in &devices {
-                        keys.insert((dev.clone(), att.path.clone()));
+                        keys.insert((namespace.clone(), dev.clone(), att.path.clone()));
                     }
                 }
             }
@@ -2639,18 +2640,19 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> crate::attachments::AttachmentSnapshot {
         use crate::attachments::{AttachmentSnapshot, attachment_snapshot, begin_load};
+        let namespace = self.state.read(cx).profile_cache_namespace();
         for dev in device_ids {
-            if let AttachmentSnapshot::Loaded(image) = attachment_snapshot(dev, path) {
+            if let AttachmentSnapshot::Loaded(image) = attachment_snapshot(&namespace, dev, path) {
                 return AttachmentSnapshot::Loaded(image);
             }
         }
         let mut any_loading = false;
         let mut min_retry: Option<Duration> = None;
         for dev in device_ids {
-            if begin_load(dev, path) {
-                self.spawn_attachment_load(dev.clone(), path.to_string(), cx);
+            if begin_load(&namespace, dev, path) {
+                self.spawn_attachment_load(namespace.clone(), dev.clone(), path.to_string(), cx);
             }
-            match attachment_snapshot(dev, path) {
+            match attachment_snapshot(&namespace, dev, path) {
                 AttachmentSnapshot::Loaded(image) => return AttachmentSnapshot::Loaded(image),
                 AttachmentSnapshot::Loading => any_loading = true,
                 AttachmentSnapshot::Error { retry_in } => {
@@ -2675,10 +2677,16 @@ impl Transcript {
         }
     }
 
-    fn spawn_attachment_load(&mut self, device_id: String, path: String, cx: &mut Context<Self>) {
+    fn spawn_attachment_load(
+        &mut self,
+        namespace: crate::state::ProfileCacheNamespace,
+        device_id: String,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
         use crate::attachments::{read_attachment_image, store_error, store_loaded};
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            store_error(&device_id, &path);
+            store_error(&namespace, &device_id, &path);
             return;
         };
         let local = self.state.read(cx).local_device_id.clone();
@@ -2690,8 +2698,14 @@ impl Transcript {
             match read_attachment_image(&engine, cx.background_executor(), target.as_deref(), &path)
                 .await
             {
-                Some(loaded) => store_loaded(&device_id, &path, loaded.name.into(), loaded.image),
-                None => store_error(&device_id, &path),
+                Some(loaded) => store_loaded(
+                    &namespace,
+                    &device_id,
+                    &path,
+                    loaded.name.into(),
+                    loaded.image,
+                ),
+                None => store_error(&namespace, &device_id, &path),
             }
             this.update(cx, |transcript, cx| {
                 transcript

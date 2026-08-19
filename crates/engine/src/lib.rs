@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-pub use zeron_proto::{EngineInfo, HarnessId, WorkspaceScope};
+use base64::Engine as _;
+pub use zeron_proto::{EngineInfo, EngineProfileIdentity, HarnessId, WorkspaceScope};
 use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use zeron_sync::DocsStore;
@@ -84,6 +85,84 @@ pub(crate) fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Token provider bound to one immutable engine profile. Authentication is
+/// intentionally mutable so WorkOS can refresh and select another Team, but
+/// an already-open runtime must never carry that new user or org bearer into
+/// its old stores, rooms, relay, or peer links during the shutdown handoff.
+struct ProfileTokenSource {
+    source: Arc<dyn zeron_rpc::TokenSource>,
+    expected_profile: Option<ProfileIdentity>,
+}
+
+impl ProfileTokenSource {
+    fn new(
+        source: Arc<dyn zeron_rpc::TokenSource>,
+        expected_profile: Option<ProfileIdentity>,
+    ) -> Self {
+        Self {
+            source,
+            expected_profile,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileIdentity {
+    org_id: String,
+    user_id: String,
+}
+
+#[async_trait]
+impl zeron_rpc::TokenSource for ProfileTokenSource {
+    async fn token(&self) -> Option<String> {
+        let token = self.source.token().await?;
+        let Some(expected) = self.expected_profile.as_ref() else {
+            return Some(token);
+        };
+        let actual = jwt_profile(&token);
+        if actual.as_ref() != Some(expected) {
+            tracing::warn!(
+                expected_org = expected.org_id,
+                expected_user = expected.user_id,
+                actual_org = actual
+                    .as_ref()
+                    .map(|profile| profile.org_id.as_str())
+                    .unwrap_or("<missing>"),
+                actual_user = actual
+                    .as_ref()
+                    .map(|profile| profile.user_id.as_str())
+                    .unwrap_or("<missing>"),
+                "blocked bearer outside the runtime's fixed user and Team profile"
+            );
+            return None;
+        }
+        Some(token)
+    }
+
+    fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.source.subscribe()
+    }
+}
+
+fn jwt_profile(token: &str) -> Option<ProfileIdentity> {
+    #[derive(serde::Deserialize)]
+    struct Claims {
+        org_id: Option<String>,
+        sub: Option<String>,
+    }
+
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let claims = serde_json::from_slice::<Claims>(&bytes).ok()?;
+    Some(ProfileIdentity {
+        org_id: claims.org_id?,
+        user_id: claims.sub?,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Data directory (default `~/.zeron`, dev `~/.zeron-dev`).
@@ -121,6 +200,7 @@ pub struct EngineCore {
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
+    profile_identity: EngineProfileIdentity,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
@@ -189,6 +269,10 @@ impl EngineCore {
         edge: Option<EdgeConfig>,
         lock: InstanceLock,
     ) -> Result<Self, EngineError> {
+        let profile_identity = EngineProfileIdentity {
+            user_id: profile.user_id().to_string(),
+            organization_id: profile.org_id().to_string(),
+        };
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
@@ -283,6 +367,7 @@ impl EngineCore {
             device_id,
             local_import,
             workspace_scope: profile.scope(),
+            profile_identity,
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
@@ -377,10 +462,12 @@ impl EngineCore {
     /// Start hosting our device room: serve the full RPC surface to relay clients and
     /// warm-open chat docs on nudges (§7 cold-chat command delivery). The token source
     /// re-reads auth on every (re)dial, so token refreshes take effect at reconnect.
-    pub fn start_host_relay(&self, edge_url: &str) -> zeron_rpc::HostRelay {
-        let auth = self.auth();
-        let config =
-            zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
+    pub fn start_host_relay(
+        &self,
+        edge_url: &str,
+        token: Arc<dyn zeron_rpc::TokenSource>,
+    ) -> zeron_rpc::HostRelay {
+        let config = zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), token);
         let doc_host = self.doc_host.clone();
         let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
@@ -408,6 +495,7 @@ impl EngineCore {
             self.agent_accounts.clone(),
             self.workspace_scope,
         )
+        .with_profile_identity(self.profile_identity.clone())
         .with_auth(self.auth());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
@@ -635,10 +723,25 @@ impl Engine {
         config: &EngineConfig,
         workspace_scope: WorkspaceScope,
     ) -> Result<EngineInfo, EngineError> {
+        Self::engine_info_for_profile(config, workspace_scope, None)
+    }
+
+    /// Resolve engine identity with the immutable profile, when bootstrap has
+    /// already captured one. Kept separate so existing EngineInfo callers that
+    /// run before profile onboarding remain source-compatible and fail closed.
+    pub fn engine_info_for_profile(
+        config: &EngineConfig,
+        workspace_scope: WorkspaceScope,
+        profile: Option<&EngineProfile>,
+    ) -> Result<EngineInfo, EngineError> {
         std::fs::create_dir_all(&config.data_dir)?;
         Ok(EngineInfo {
             device_id: load_or_create_device_id(&config.data_dir)?,
             workspace_scope,
+            profile: profile.map(|profile| EngineProfileIdentity {
+                user_id: profile.user_id().to_string(),
+                organization_id: profile.org_id().to_string(),
+            }),
         })
     }
 
@@ -695,9 +798,17 @@ impl Engine {
                 .as_deref()
                 .is_some_and(|token| !token.trim().is_empty()),
         };
+        let fixed_profile = (profile.scope() == WorkspaceScope::Synced).then(|| ProfileIdentity {
+            org_id: profile.org_id().to_string(),
+            user_id: profile.user_id().to_string(),
+        });
+        let profile_token: Arc<dyn zeron_rpc::TokenSource> = Arc::new(ProfileTokenSource::new(
+            Arc::new(auth.clone()),
+            fixed_profile,
+        ));
         let device_id = load_or_create_device_id(profile.device_root())?;
         let edge = edge_enabled.then(|| {
-            EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
+            EdgeConfig::new(config.edge_url.clone(), profile_token.clone()).with_device(device_id)
         });
 
         let core = match lock {
@@ -746,7 +857,7 @@ impl Engine {
         let host_relay = edge.as_ref().map(|edge| {
             let links = zeron_rpc::LinkCache::new(zeron_rpc::LinkCacheConfig::new(
                 edge.url.clone(),
-                Arc::new(auth.clone()),
+                profile_token.clone(),
             ));
             let links_for_presence = links.clone();
             core.workspace
@@ -754,7 +865,7 @@ impl Engine {
                     links_for_presence.reset_cooldown(device_id);
                 }));
             core.set_links(links);
-            core.start_host_relay(&edge.url)
+            core.start_host_relay(&edge.url, profile_token.clone())
         });
 
         Ok(EngineRuntime {
@@ -1002,7 +1113,7 @@ async fn run_org_onboarding(auth: Auth) {
                     continue;
                 }
                 match auth.create_org(name).await {
-                    Ok(()) => return,
+                    Ok(_) => return,
                     Err(err) => println!("Creating workspace failed: {err}"),
                 }
             }
@@ -1099,6 +1210,140 @@ fn native_friendly_device_name() -> Option<String> {
 
     #[cfg(not(target_os = "windows"))]
     None
+}
+
+#[cfg(test)]
+mod profile_token_tests {
+    use super::{ProfileIdentity, ProfileTokenSource, jwt_profile};
+    use base64::Engine as _;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn jwt_with_user(org_id: &str, user_id: Option<&str>) -> String {
+        let mut claims = serde_json::json!({ "org_id": org_id });
+        if let Some(user_id) = user_id {
+            claims["sub"] = serde_json::json!(user_id);
+        }
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).expect("JWT payload"));
+        format!("header.{payload}.signature")
+    }
+
+    fn jwt(org_id: &str, user_id: &str) -> String {
+        jwt_with_user(org_id, Some(user_id))
+    }
+
+    fn profile(org_id: &str, user_id: &str) -> ProfileIdentity {
+        ProfileIdentity {
+            org_id: org_id.into(),
+            user_id: user_id.into(),
+        }
+    }
+
+    struct MutableToken {
+        value: Mutex<String>,
+        changes: tokio::sync::watch::Sender<u64>,
+    }
+
+    impl MutableToken {
+        fn new(value: String) -> Self {
+            let (changes, _) = tokio::sync::watch::channel(0);
+            Self {
+                value: Mutex::new(value),
+                changes,
+            }
+        }
+
+        fn set(&self, value: String) {
+            *self.value.lock().expect("token lock") = value;
+        }
+
+        fn notify(&self) {
+            self.changes
+                .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeron_rpc::TokenSource for MutableToken {
+        async fn token(&self) -> Option<String> {
+            Some(self.value.lock().expect("token lock").clone())
+        }
+
+        fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+            Some(self.changes.subscribe())
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_profile_rechecks_team_and_user_on_one_mutable_source() {
+        let original = jwt("org-a", "user-a");
+        let backing = Arc::new(MutableToken::new(original.clone()));
+        let source = ProfileTokenSource::new(backing.clone(), Some(profile("org-a", "user-a")));
+        let mut changes = zeron_rpc::TokenSource::subscribe(&source)
+            .expect("profile token must forward the auth epoch");
+
+        assert_eq!(
+            zeron_rpc::TokenSource::token(&source).await,
+            Some(original.clone())
+        );
+
+        backing.set(jwt("org-b", "user-a"));
+        // The fence is independent of the async shutdown notification: no
+        // caller can obtain the new Team bearer during that handoff window.
+        assert_eq!(zeron_rpc::TokenSource::token(&source).await, None);
+        backing.notify();
+        tokio::time::timeout(Duration::from_secs(1), changes.changed())
+            .await
+            .expect("Team switch notification")
+            .expect("token epoch stays open");
+        assert_eq!(zeron_rpc::TokenSource::token(&source).await, None);
+
+        backing.set(jwt("org-a", "user-b"));
+        assert_eq!(zeron_rpc::TokenSource::token(&source).await, None);
+        backing.notify();
+        tokio::time::timeout(Duration::from_secs(1), changes.changed())
+            .await
+            .expect("user switch notification")
+            .expect("token epoch stays open");
+        assert_eq!(zeron_rpc::TokenSource::token(&source).await, None);
+
+        backing.set(original.clone());
+        backing.notify();
+        tokio::time::timeout(Duration::from_secs(1), changes.changed())
+            .await
+            .expect("profile restore notification")
+            .expect("token epoch stays open");
+        assert_eq!(zeron_rpc::TokenSource::token(&source).await, Some(original));
+    }
+
+    #[tokio::test]
+    async fn synced_profile_fails_closed_on_malformed_or_incomplete_bearers() {
+        let source = ProfileTokenSource::new(
+            Arc::new(zeron_rpc::StaticToken("not-a-jwt".into())),
+            Some(profile("org-a", "user-a")),
+        );
+        assert_eq!(zeron_rpc::TokenSource::token(&source).await, None);
+        assert_eq!(jwt_profile("not-a-jwt"), None);
+
+        let source = ProfileTokenSource::new(
+            Arc::new(zeron_rpc::StaticToken(jwt_with_user("org-a", None))),
+            Some(profile("org-a", "user-a")),
+        );
+        assert_eq!(zeron_rpc::TokenSource::token(&source).await, None);
+    }
+
+    #[tokio::test]
+    async fn unscoped_development_token_passes_through() {
+        let source = ProfileTokenSource::new(
+            Arc::new(zeron_rpc::StaticToken("dev-user@org".into())),
+            None,
+        );
+        assert_eq!(
+            zeron_rpc::TokenSource::token(&source).await.as_deref(),
+            Some("dev-user@org")
+        );
+    }
 }
 
 #[cfg(test)]
