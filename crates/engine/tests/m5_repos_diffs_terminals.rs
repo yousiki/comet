@@ -1262,6 +1262,28 @@ async fn rpc_dispatch_for_m5_methods() {
         "chat cwd must stay inside its workspace checkout"
     );
 
+    // ReadWorkspaceFile shares SearchFiles' root resolution, then reads the
+    // jailed file (the file-explorer viewer's path).
+    let read = client
+        .call(
+            methods::READ_WORKSPACE_FILE,
+            serde_json::json!({ "chatId": "search-chat", "path": "file.txt" }),
+        )
+        .await
+        .expect("ReadWorkspaceFile by chat");
+    assert_eq!(read["text"], "hello\n");
+    assert_eq!(read["binary"], false);
+    assert!(
+        client
+            .call(
+                methods::READ_WORKSPACE_FILE,
+                serde_json::json!({ "chatId": "search-chat", "path": "../outside/x" }),
+            )
+            .await
+            .is_err(),
+        "reads must stay inside the checkout"
+    );
+
     // ListBranches: default (checked-out) branch first.
     let branches = client
         .call(
