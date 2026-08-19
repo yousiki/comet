@@ -5864,19 +5864,7 @@ impl Shell {
                         }
                     }
                 }
-                menu = menu.child(popover::menu_separator()).child(
-                    popover::menu_row(theme, false, "user-menu-manage-team")
-                        .id("user-menu-manage-team")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_settings(SettingsSection::Team, cx)
-                        }))
-                        .child(
-                            icon(icons::GLOBAL)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(SharedString::from("Manage current Team")),
-                );
+                menu = menu.child(popover::menu_separator());
             }
 
             if !synced && let Some(action) = action {
