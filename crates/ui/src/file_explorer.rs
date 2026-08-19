@@ -288,10 +288,8 @@ impl FileExplorer {
             .zip(new_rows[prefix..].iter().rev())
             .take_while(|(a, b)| a == b)
             .count();
-        self.tree_list.splice(
-            prefix..old.len() - suffix,
-            new_rows.len() - suffix - prefix,
-        );
+        self.tree_list
+            .splice(prefix..old.len() - suffix, new_rows.len() - suffix - prefix);
         self.rows = new_rows;
     }
 
@@ -349,7 +347,10 @@ impl FileExplorer {
 
     fn set_file(&mut self, path: String, file: WorkspaceFileText, cx: &mut Context<Self>) {
         if let Some(text) = &file.text {
-            self.lines = text.lines().map(|l| SharedString::from(l.to_string())).collect();
+            self.lines = text
+                .lines()
+                .map(|l| SharedString::from(l.to_string()))
+                .collect();
             self.viewer_list
                 .reset_with_uniform_height(self.lines.len(), px(LINE_HEIGHT));
             self.spawn_highlight(path, text.clone(), cx);
@@ -443,7 +444,11 @@ impl FileExplorer {
         let theme = Theme::of(cx).clone();
         let selected = self.open_path.as_deref() == Some(row.path.as_str());
         let expanded = row.is_dir && self.expanded.contains(&row.path);
-        let icon_path = if row.is_dir { icons::FOLDER } else { icons::DOCUMENT };
+        let icon_path = if row.is_dir {
+            icons::FOLDER
+        } else {
+            icons::DOCUMENT
+        };
         let chevron = row.is_dir.then(|| {
             icons::icon(if expanded {
                 icons::ALT_ARROW_DOWN
@@ -467,7 +472,9 @@ impl FileExplorer {
             .gap(px(4.0))
             // Chevron-less files get the chevron's 12px as extra padding so
             // names in one directory align.
-            .pl(px(6.0 + row.depth as f32 * 14.0 + if row.is_dir { 0.0 } else { 12.0 }))
+            .pl(px(6.0
+                + row.depth as f32 * 14.0
+                + if row.is_dir { 0.0 } else { 12.0 }))
             .pr(px(6.0))
             .cursor_pointer()
             .when(selected, |el| el.bg(theme::card_selected_bg()))
@@ -492,7 +499,11 @@ impl FileExplorer {
                     .min_w_0()
                     .truncate()
                     .text_size(px(12.5))
-                    .text_color(if selected { theme.text } else { theme.text_muted })
+                    .text_color(if selected {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
                     .child(row.name),
             )
             .into_any_element()
@@ -605,23 +616,22 @@ impl FileExplorer {
             Loadable::Ready(file) if file.truncated => {
                 Self::centered_note(theme, "File too large to preview (2 MiB limit)")
             }
-            Loadable::Ready(_) => list(self.viewer_list.clone(), cx.processor(Self::render_viewer_row))
-                .flex_1()
-                .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-                .into_any_element(),
+            Loadable::Ready(_) => list(
+                self.viewer_list.clone(),
+                cx.processor(Self::render_viewer_row),
+            )
+            .flex_1()
+            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+            .into_any_element(),
         }
     }
 
     fn render_tree(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let root_slot = self.root.as_ref().and_then(|root| self.listings.get(root));
         match root_slot {
-            Some(Loadable::Loading) if self.rows.is_empty() => popover::skeleton_rows(
-                "file-explorer-tree-skeleton",
-                theme,
-                8,
-                cx.entity_id(),
-                cx,
-            ),
+            Some(Loadable::Loading) if self.rows.is_empty() => {
+                popover::skeleton_rows("file-explorer-tree-skeleton", theme, 8, cx.entity_id(), cx)
+            }
             Some(Loadable::Error(message)) => {
                 let message = message.clone();
                 div()

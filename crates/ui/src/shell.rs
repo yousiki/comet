@@ -27,10 +27,10 @@ use zeron_proto::{AuthState, EngineInfo, WorkspaceScope};
 use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
-use crate::file_explorer::FileExplorer;
 use crate::composer::{
     Composer, ComposerEvent, ComposerInput, ComposerInputEvent, ComposerUnsentRisk,
 };
+use crate::file_explorer::FileExplorer;
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -7694,13 +7694,11 @@ impl Shell {
                                     ),
                                 )
                             })
-                            .child(
-                                row("surface-card-files", icons::FOLDER, "Files").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.add_files_surface(cx);
-                                    }),
-                                ),
-                            ),
+                            .child(row("surface-card-files", icons::FOLDER, "Files").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.add_files_surface(cx);
+                                }),
+                            )),
                     ),
             )
             .into_any_element()

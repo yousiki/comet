@@ -488,10 +488,7 @@ async fn workspace_file_read_text_binary_truncated_and_jail() {
     assert!(bin.binary && bin.text.is_none());
 
     // `..` escape and absolute paths outside the root are both rejected.
-    for escape in [
-        root.join("../outside.txt"),
-        tmp.path().join("outside.txt"),
-    ] {
+    for escape in [root.join("../outside.txt"), tmp.path().join("outside.txt")] {
         let err = repos
             .read_workspace_file(root.clone(), escape)
             .await
@@ -515,8 +512,7 @@ async fn workspace_file_read_text_binary_truncated_and_jail() {
     // Symlinks are rejected even when their target lives inside the root.
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(root.join("src/lib.rs"), root.join("link.rs"))
-            .expect("symlink");
+        std::os::unix::fs::symlink(root.join("src/lib.rs"), root.join("link.rs")).expect("symlink");
         let err = repos
             .read_workspace_file(root.clone(), root.join("link.rs"))
             .await

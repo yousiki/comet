@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use zeron_proto::{
     DriveEntry, FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage,
-    GitHistoryRef, GitHistoryRefKind, Repo, RepoRef, Worktree, WorkspaceFileText,
+    GitHistoryRef, GitHistoryRefKind, Repo, RepoRef, WorkspaceFileText, Worktree,
 };
 
 use crate::EngineError;
@@ -1007,7 +1007,10 @@ fn list_folders_blocking(target: &Path, show_hidden: bool) -> Result<FolderListi
 /// through the handle, never trusting a pre-read size. Windows keeps the
 /// weaker name-based check (no `O_NOFOLLOW`; symlink creation is privileged
 /// there). NUL bytes or invalid UTF-8 → `binary` with no text.
-fn read_workspace_file_blocking(root: &Path, path: &Path) -> Result<WorkspaceFileText, EngineError> {
+fn read_workspace_file_blocking(
+    root: &Path,
+    path: &Path,
+) -> Result<WorkspaceFileText, EngineError> {
     use std::io::Read as _;
 
     let canonical_root = std::fs::canonicalize(root)
