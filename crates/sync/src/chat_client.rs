@@ -106,8 +106,11 @@ pub enum ChatEvent {
 /// every method persists doc content AND the room cursor in one transaction
 /// (`DocsStore::save_snapshot_with_cursor`) so they can never diverge.
 pub trait ChatDocSink: Send + Sync + 'static {
-    /// Import one remote update row; `cursor` is the row's seq.
-    fn apply_row(&self, bytes: &[u8], cursor: u64);
+    /// Import one remote update row; `cursor` is the row's seq. `Ok` is the
+    /// protocol-level acknowledgement that every dependency materialized and
+    /// the cursor may advance. A sink must return `Err` for an import parked on
+    /// missing CRDT dependencies (or when its lifecycle is no longer active).
+    fn apply_row(&self, bytes: &[u8], cursor: u64) -> Result<(), String>;
     /// Replace/merge from a checkpoint blob; `cursor` is its checkpointSeq.
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String>;
     /// Client-side precision (replaces the server VV diff): is the server
@@ -119,6 +122,26 @@ pub trait ChatDocSink: Send + Sync + 'static {
     /// Persist `cursor` exactly (including a backwards move) without treating
     /// it as an own-write ack or promoting a generation handoff epoch.
     fn reset_cursor(&self, cursor: u64);
+}
+
+/// Re-anchor after the sink could not materialize a row. A present checkpoint
+/// is the only safe non-zero boundary; without one the complete row log must be
+/// replayed. The reset generation advances even when the numeric cursor is
+/// unchanged so every in-flight HTTP/WS response from the failed lineage is
+/// rejected before it can move the cursor forward again.
+fn reanchor_after_row_import_failure(shared: &mut Shared, sink: &dyn ChatDocSink) -> (u64, u64) {
+    let previous = shared.cursor;
+    let recovery_cursor = shared
+        .server
+        .filter(|state| state.checkpoint_size > 0)
+        // Recovery may move backwards, never forwards: a checkpoint newer
+        // than the last materialized row is not yet a safe local boundary.
+        .map(|state| state.checkpoint_seq.min(previous))
+        .unwrap_or(0);
+    shared.cursor = recovery_cursor;
+    shared.reset_version = shared.reset_version.wrapping_add(1);
+    sink.reset_cursor(recovery_cursor);
+    (previous, recovery_cursor)
 }
 
 /// `GET /chat2/{chatId}/checkpoint` over HTTP. Implementations should resume
@@ -1354,7 +1377,22 @@ async fn offline_sync_once(
         applied = true;
     }
     for (row, payload) in response.rows {
-        sink.apply_row(&payload, row.seq);
+        if let Err(err) = sink.apply_row(&payload, row.seq) {
+            let (previous, recovery_cursor) =
+                reanchor_after_row_import_failure(&mut shared, sink.as_ref());
+            let restored = round_guard.finish_locked(&mut shared);
+            drop(shared);
+            tracing::warn!(
+                error = %err,
+                row_seq = row.seq,
+                previous_cursor = previous,
+                recovery_cursor,
+                restored,
+                "chat2: http row was not materialized; re-anchoring"
+            );
+            let _ = nudge.try_send(());
+            return;
+        }
         shared.cursor = shared.cursor.max(row.seq);
         applied = true;
     }
@@ -1957,7 +1995,19 @@ impl Actor {
                 if shared.reset_version != session_reset_version {
                     return false;
                 }
-                self.sink.apply_row(&frame.payload, row.seq);
+                if let Err(err) = self.sink.apply_row(&frame.payload, row.seq) {
+                    let (previous, recovery_cursor) =
+                        reanchor_after_row_import_failure(&mut shared, self.sink.as_ref());
+                    drop(shared);
+                    tracing::warn!(
+                        error = %err,
+                        row_seq = row.seq,
+                        previous_cursor = previous,
+                        recovery_cursor,
+                        "chat2: websocket row was not materialized; redialing"
+                    );
+                    return false;
+                }
                 shared.cursor = shared.cursor.max(row.seq);
                 drop(shared);
                 let _ = self.events.send(ChatEvent::Applied);

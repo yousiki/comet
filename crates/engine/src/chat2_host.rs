@@ -188,22 +188,46 @@ impl EngineChatSink {
     }
 }
 
+/// Import one Loro blob and prove that every change carried by THIS blob is
+/// present in the materialized oplog. `ImportStatus.pending` catches the first
+/// causally-incomplete delivery; the metadata/frontier check also catches a
+/// replay of that already-parked blob, which Loro otherwise reports as an
+/// empty duplicate. Deliberately do not reject unrelated pending changes from
+/// later rows: replaying the intervening rows is how those gaps get repaired.
+fn import_blob_materialized(doc: &loro::LoroDoc, bytes: &[u8]) -> Result<bool, String> {
+    // `import` below performs the authoritative checksum validation; avoid
+    // hashing large checkpoints twice just to read their version range.
+    let metadata = loro::LoroDoc::decode_import_blob_meta(bytes, false)
+        .map_err(|err| format!("decode import metadata: {err}"))?;
+    let status = doc.import(bytes).map_err(|err| err.to_string())?;
+    Ok(status.pending.is_none() && doc.oplog_vv().includes_vv(&metadata.partial_end_vv))
+}
+
 impl ChatDocSink for EngineChatSink {
-    fn apply_row(&self, bytes: &[u8], cursor: u64) {
+    fn apply_row(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
         let Some(_lifecycle) = self.active_lifecycle() else {
-            return;
+            return Err("chat handle retired during row import".into());
         };
         let Some(doc) = self.doc.upgrade() else {
-            return;
+            return Err("doc evicted during row import".into());
         };
-        if let Err(err) = doc.doc().import(bytes) {
-            // Malformed remote bytes cost the row, never the doc (the same
-            // skip-not-fail rule as transcript reads). The cursor still
-            // advances: replaying a poison row forever is the wedge class.
-            tracing::warn!(chat = %self.chat_id, error = %err,
-                "chat2 sink: row import failed; skipping row");
+        match import_blob_materialized(doc.doc(), bytes) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(chat = %self.chat_id,
+                    "chat2 sink: row import parked on missing dependencies");
+                return Err("row import has unresolved dependencies".into());
+            }
+            Err(err) => {
+                // Malformed remote bytes cost the row, never the doc (the same
+                // skip-not-fail rule as transcript reads). The cursor still
+                // advances: replaying a poison row forever is the wedge class.
+                tracing::warn!(chat = %self.chat_id, error = %err,
+                    "chat2 sink: row import failed; skipping row");
+            }
         }
         self.persist_with_cursor(cursor, false, false);
+        Ok(())
     }
 
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
@@ -211,9 +235,11 @@ impl ChatDocSink for EngineChatSink {
             return Err("chat handle retired during checkpoint import".into());
         };
         let doc = self.doc.upgrade().ok_or("doc evicted")?;
-        doc.doc()
-            .import(bytes)
-            .map_err(|e| format!("checkpoint import: {e}"))?;
+        if !import_blob_materialized(doc.doc(), bytes)
+            .map_err(|err| format!("checkpoint import: {err}"))?
+        {
+            return Err("checkpoint import has unresolved dependencies".into());
+        }
         self.persist_with_cursor(cursor, false, false);
         Ok(())
     }
@@ -620,7 +646,7 @@ mod frontier_tests {
         doc.doc().commit();
         let sink = EngineChatSink::new(&doc, store.clone(), "gen3-chat", 3, 0, 2);
 
-        sink.apply_row(&doc.export_snapshot().unwrap(), 5);
+        sink.apply_row(&doc.export_snapshot().unwrap(), 5).unwrap();
         let (_, cursor, epoch) = store
             .load_snapshot_with_cursor("gen3-chat")
             .unwrap()
@@ -661,7 +687,7 @@ mod frontier_tests {
             .doc()
             .export(loro::ExportMode::updates(&loro::VersionVector::default()))
             .unwrap();
-        sink.apply_row(&update, 1);
+        sink.apply_row(&update, 1).unwrap();
         sink.advance_cursor(1);
         let (_, cursor, epoch) = store
             .load_snapshot_with_cursor("reset-chat")
@@ -672,6 +698,161 @@ mod frontier_tests {
             (1, 3),
             "post-reset row/ack must not be masked by the old cursor 41"
         );
+    }
+
+    #[test]
+    fn missing_dependency_imports_never_advance_the_durable_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let receiver = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        store
+            .save_snapshot_with_cursor(
+                "pending-row",
+                &receiver.export_snapshot().unwrap(),
+                0,
+                CHAT2_DOC_EPOCH,
+            )
+            .unwrap();
+        let sink = EngineChatSink::new(
+            &receiver,
+            store.clone(),
+            "pending-row",
+            CHAT2_DOC_EPOCH,
+            0,
+            CHAT2_DOC_EPOCH,
+        );
+
+        // Export only the second change from one peer. Its first change is a
+        // causal dependency, so importing this payload into an empty peer is
+        // `Ok(ImportStatus { pending: Some(..) })`, not a Loro error.
+        let source = loro::LoroDoc::new();
+        source
+            .get_map("meta")
+            .insert("founding", "dependency")
+            .unwrap();
+        source.commit();
+        let after_founding = source.oplog_vv();
+        source
+            .get_map("meta")
+            .insert("dependent", "must-materialize")
+            .unwrap();
+        source.commit();
+        let dependent_only = source
+            .export(loro::ExportMode::updates(&after_founding))
+            .unwrap();
+
+        let row_error = sink
+            .apply_row(&dependent_only, 9)
+            .expect_err("a parked row must be reported to ChatClient");
+        assert!(row_error.contains("unresolved dependencies"));
+        let replay_error = sink
+            .apply_row(&dependent_only, 9)
+            .expect_err("replaying a parked row must still report its missing deps");
+        assert!(replay_error.contains("unresolved dependencies"));
+        let (_, cursor, epoch) = store
+            .load_snapshot_with_cursor("pending-row")
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor, epoch), (0, CHAT2_DOC_EPOCH));
+        assert!(receiver.doc().get_map("meta").get("dependent").is_none());
+
+        // Checkpoint validation gets an independent empty peer: repeating a
+        // row already parked in this receiver could be classified as a no-op
+        // by a future Loro release and would not exercise the contract.
+        let checkpoint_receiver = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        store
+            .save_snapshot_with_cursor(
+                "pending-checkpoint",
+                &checkpoint_receiver.export_snapshot().unwrap(),
+                0,
+                CHAT2_DOC_EPOCH,
+            )
+            .unwrap();
+        let checkpoint_sink = EngineChatSink::new(
+            &checkpoint_receiver,
+            store.clone(),
+            "pending-checkpoint",
+            CHAT2_DOC_EPOCH,
+            0,
+            CHAT2_DOC_EPOCH,
+        );
+        let checkpoint_error = checkpoint_sink
+            .apply_checkpoint(&dependent_only, 8)
+            .expect_err("a checkpoint with missing dependencies is not a safe frontier");
+        assert!(checkpoint_error.contains("unresolved dependencies"));
+        let (_, cursor, _) = store
+            .load_snapshot_with_cursor("pending-checkpoint")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor, 0, "failed checkpoint must not advance cursor");
+
+        // Importing the complete checkpoint supplies the dependency and
+        // materializes the parked row before establishing its cursor.
+        sink.apply_checkpoint(&source.export(loro::ExportMode::Snapshot).unwrap(), 8)
+            .unwrap();
+        assert!(receiver.doc().get_map("meta").get("dependent").is_some());
+        let (_, cursor, _) = store
+            .load_snapshot_with_cursor("pending-row")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cursor, 8,
+            "complete checkpoint establishes the safe frontier"
+        );
+    }
+
+    #[test]
+    fn earlier_materialized_rows_can_repair_an_unrelated_future_pending_row() {
+        let chain = loro::LoroDoc::new();
+        chain.set_peer_id(101).unwrap();
+        chain
+            .get_map("chain")
+            .insert("first", "dependency-one")
+            .unwrap();
+        chain.commit();
+        let after_first = chain.oplog_vv();
+        let first = chain
+            .export(loro::ExportMode::updates(&loro::VersionVector::default()))
+            .unwrap();
+        chain
+            .get_map("chain")
+            .insert("second", "dependency-two")
+            .unwrap();
+        chain.commit();
+        let after_second = chain.oplog_vv();
+        let second = chain
+            .export(loro::ExportMode::updates(&after_first))
+            .unwrap();
+
+        // A different peer observes both chain changes, then authors a row
+        // that causally depends on them. Deliver that future row first.
+        let future_source = loro::LoroDoc::new();
+        future_source.set_peer_id(202).unwrap();
+        future_source
+            .import(&chain.export(loro::ExportMode::Snapshot).unwrap())
+            .unwrap();
+        future_source
+            .get_map("future")
+            .insert("value", "materialize-last")
+            .unwrap();
+        future_source.commit();
+        let future = future_source
+            .export(loro::ExportMode::updates(&after_second))
+            .unwrap();
+
+        let replica = loro::LoroDoc::new();
+        assert!(!import_blob_materialized(&replica, &future).unwrap());
+
+        // The first repair row itself is fully materialized even though the
+        // later future row remains pending on the second dependency. A global
+        // "any pending" check would reject this forever and never reach row 2.
+        assert!(import_blob_materialized(&replica, &first).unwrap());
+        assert!(replica.get_map("chain").get("first").is_some());
+        assert!(replica.get_map("future").get("value").is_none());
+
+        assert!(import_blob_materialized(&replica, &second).unwrap());
+        assert!(replica.get_map("chain").get("second").is_some());
+        assert!(replica.get_map("future").get("value").is_some());
     }
 
     #[test]
@@ -709,7 +890,8 @@ mod frontier_tests {
                 .export(loro::ExportMode::updates(&loro::VersionVector::default()))
                 .unwrap(),
             10,
-        );
+        )
+        .unwrap();
         sink.advance_cursor(11);
 
         let (bytes, cursor, epoch) = store

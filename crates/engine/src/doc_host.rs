@@ -4431,7 +4431,9 @@ mod agent_send_tests {
     struct NoopChatSink;
 
     impl ChatDocSink for NoopChatSink {
-        fn apply_row(&self, _bytes: &[u8], _cursor: u64) {}
+        fn apply_row(&self, _bytes: &[u8], _cursor: u64) -> Result<(), String> {
+            Ok(())
+        }
         fn apply_checkpoint(&self, _bytes: &[u8], _cursor: u64) -> Result<(), String> {
             Ok(())
         }
@@ -5617,7 +5619,7 @@ mod agent_send_tests {
         host.carry_parked_updates(&handle, detached);
         host.recover_frozen_generation_seed("purge-race", &handle);
         sink.advance_cursor(99);
-        sink.apply_row(&[0xff], 100);
+        assert!(sink.apply_row(&[0xff], 100).is_err());
 
         assert!(!lock(&host.inner.handles).contains_key("purge-race"));
         assert!(!lock(&host.inner.chat2_pending_local).contains_key("purge-race"));

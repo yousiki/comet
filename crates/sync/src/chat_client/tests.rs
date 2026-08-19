@@ -199,6 +199,7 @@ impl ChatTransport for ErrorTransport {
 #[derive(Default)]
 struct RecordingSink {
     rows: Mutex<Vec<(Vec<u8>, u64)>>,
+    row_results: Mutex<VecDeque<Result<(), String>>>,
     checkpoints: Mutex<Vec<(Vec<u8>, u64)>>,
     cursor_advances: Mutex<Vec<u64>>,
     cursor_resets: Mutex<Vec<u64>>,
@@ -209,9 +210,10 @@ struct RecordingSink {
 }
 
 impl ChatDocSink for RecordingSink {
-    fn apply_row(&self, bytes: &[u8], cursor: u64) {
+    fn apply_row(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
         lock(&self.rows).push((bytes.to_vec(), cursor));
         lock(&self.ops).push(format!("row@{cursor}"));
+        lock(&self.row_results).pop_front().unwrap_or(Ok(()))
     }
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
         lock(&self.checkpoints).push((bytes.to_vec(), cursor));
@@ -665,6 +667,71 @@ async fn offline_push_followed_by_server_reset_keeps_pending_and_resets_cursor()
 }
 
 #[tokio::test]
+async fn http_pending_row_reanchors_to_checkpoint_and_schedules_a_fresh_pull() {
+    let body = http_rows_body([
+        encode(
+            frame_type::STATE,
+            &serde_json::json!({
+                "headSeq": 8,
+                "seqFloor": 5,
+                "checkpointSeq": 5,
+                "checkpointSize": 128,
+                "rowCount": 1,
+                "rowBytes": 10,
+            }),
+            b"contained-frontier",
+        ),
+        encode(
+            frame_type::ROW,
+            &serde_json::json!({"seq": 8, "device": "dev-b", "batchId": "dependent"}),
+            b"dependent-row",
+        ),
+        encode(
+            frame_type::ROWS_DONE,
+            &serde_json::json!({"headSeq": 8}),
+            &[],
+        ),
+    ]);
+    let transport = Arc::new(ScriptedTransport::default());
+    lock(&transport.fetch_results).push_back(Ok(body));
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 7,
+        ..Shared::default()
+    }));
+    let sink = Arc::new(RecordingSink::default());
+    sink.frontier_contained
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    lock(&sink.row_results).push_back(Err("missing dependencies".into()));
+    let (fetch, fetch_calls) = fetcher(b"unused-checkpoint");
+    let (events, _) = broadcast::channel(8);
+    let (nudge, mut nudge_rx) = mpsc::channel(1);
+
+    offline_sync_once(
+        transport.clone(),
+        shared.clone(),
+        sink.clone(),
+        fetch,
+        events,
+        Arc::new(Flags::default()),
+        nudge,
+    )
+    .await;
+
+    assert_eq!(*lock(&transport.fetch_after), vec![7]);
+    assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 5, "checkpoint is the last safe boundary");
+    assert_eq!(shared.reset_version, 1, "in-flight sibling work is fenced");
+    drop(shared);
+    assert_eq!(*lock(&sink.cursor_resets), vec![5]);
+    assert!(lock(&sink.cursor_advances).is_empty());
+    nudge_rx
+        .recv()
+        .await
+        .expect("pending import must schedule a fresh pull");
+}
+
+#[tokio::test]
 async fn websocket_ack_racing_a_failed_http_push_is_staged_until_reset_pull() {
     let shared = Arc::new(Mutex::new(Shared {
         cursor: 0,
@@ -1115,6 +1182,66 @@ fn stale_websocket_ack_cannot_retire_work_after_http_reset() {
     assert!(lock(&sink.cursor_advances).is_empty());
 }
 
+#[test]
+fn websocket_pending_row_reanchors_and_forces_reconnect_before_caught_up() {
+    let shared = Arc::new(Mutex::new(Shared {
+        cursor: 7,
+        server: Some(wire::StateHeader {
+            head_seq: 8,
+            seq_floor: 5,
+            checkpoint_seq: 5,
+            checkpoint_size: 128,
+            row_count: 1,
+            row_bytes: 10,
+        }),
+        ..Shared::default()
+    }));
+    let sink = Arc::new(RecordingSink::default());
+    lock(&sink.row_results).push_back(Err("missing dependencies".into()));
+    let actor = frame_actor(shared.clone(), sink.clone());
+    let row = decode(&encode(
+        frame_type::ROW,
+        &serde_json::json!({"seq": 8, "device": "dev-b", "batchId": "dependent"}),
+        b"dependent-row",
+    ))
+    .unwrap();
+
+    assert!(
+        !actor.handle_frame(row, 0),
+        "the session must reconnect instead of reaching ROWS_DONE/CaughtUp"
+    );
+    let shared = lock(&shared);
+    assert_eq!(shared.cursor, 5);
+    assert_eq!(shared.reset_version, 1);
+    drop(shared);
+    assert_eq!(*lock(&sink.cursor_resets), vec![5]);
+    assert!(lock(&sink.cursor_advances).is_empty());
+}
+
+#[test]
+fn pending_recovery_never_advances_to_a_newer_checkpoint() {
+    let mut shared = Shared {
+        cursor: 4,
+        server: Some(wire::StateHeader {
+            head_seq: 8,
+            seq_floor: 5,
+            checkpoint_seq: 5,
+            checkpoint_size: 128,
+            row_count: 3,
+            row_bytes: 30,
+        }),
+        ..Shared::default()
+    };
+    let sink = RecordingSink::default();
+
+    let (previous, recovery_cursor) = reanchor_after_row_import_failure(&mut shared, &sink);
+
+    assert_eq!((previous, recovery_cursor), (4, 4));
+    assert_eq!(shared.cursor, 4, "recovery must never move forward");
+    assert_eq!(shared.reset_version, 1);
+    assert_eq!(*lock(&sink.cursor_resets), vec![4]);
+}
+
 #[tokio::test]
 async fn malformed_http_pull_never_retires_a_staged_ack() {
     let transport = Arc::new(ScriptedTransport::default());
@@ -1397,6 +1524,48 @@ async fn fresh_join_backfills_rows_and_advances_cursor() {
     assert!(stats.connected);
     assert_eq!(stats.cursor, 2);
     client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_row_prevents_the_initial_join_from_reporting_caught_up() {
+    let (pipe, mut end) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default());
+    sink.frontier_contained
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    lock(&sink.row_results).push_back(Err("missing dependencies".into()));
+    let (fetch, fetch_calls) = fetcher(b"unused-checkpoint");
+
+    let server = tokio::spawn(async move {
+        let after = serve_join(
+            &mut end,
+            serde_json::json!({"headSeq": 6, "seqFloor": 5, "checkpointSeq": 5,
+                "checkpointSize": 128, "rowCount": 1, "rowBytes": 10}),
+            b"contained-frontier",
+            vec![(6, "dev-b", b"dependent-row".to_vec())],
+            false,
+        )
+        .await;
+        assert_eq!(after, 5);
+    });
+
+    let joined = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        sink.clone(),
+        fetch,
+        "dev-a",
+        5,
+        ChatTuning::default(),
+    )
+    .await;
+    server.await.unwrap();
+
+    assert!(
+        joined.is_err(),
+        "pending import must fail the initial catch-up instead of reporting ready"
+    );
+    assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(*lock(&sink.cursor_resets), vec![5]);
+    assert!(lock(&sink.cursor_advances).is_empty());
 }
 
 #[tokio::test(start_paused = true)]

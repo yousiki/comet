@@ -51,13 +51,14 @@ actor ChatRoomClient {
     static let maxPushBytes = 1024 * 1024 - 4096
 
     /// MainActor-isolated bridge to SessionStore's doc. Every apply persists
-    /// doc + cursor together; `applyCheckpoint` returns false on an import
-    /// failure (the session redials rather than run blind).
+    /// doc + cursor together. An apply closure returns false when Loro accepted
+    /// the bytes but left causal dependencies pending; the client re-anchors
+    /// and redials rather than advancing a cursor past unmaterialized ops.
     struct Delegate: Sendable {
         var cursor: @MainActor @Sendable () -> UInt64
         var containsFrontier: @MainActor @Sendable (Data) -> Bool
         var applyCheckpoint: @MainActor @Sendable (Data, UInt64) -> Bool
-        var applyRow: @MainActor @Sendable (Data, UInt64) -> Void
+        var applyRow: @MainActor @Sendable (Data, UInt64) -> Bool
         var advanceCursor: @MainActor @Sendable (UInt64) -> Void
         /// Cursor amnesty: lower the cursor to the checkpoint seq (no-op if
         /// already at or below). See the once-per-session clamp in
@@ -130,6 +131,10 @@ actor ChatRoomClient {
     /// Bytes moved on the checkpoint stream recently — download progress IS
     /// liveness while it runs; the silence lease defers to it.
     private var checkpointProgressAt: DispatchTime?
+    /// Safe replay anchor advertised by the STATE for the current socket.
+    /// It is version-bound and cleared before every dial; a missing-dependency
+    /// row must never recover from a stale room incarnation's checkpoint.
+    private var socketRecoveryAnchor: (version: UInt64, cursor: UInt64)?
     private var joined = false
     private var closed = false
     private var generation = 0
@@ -279,6 +284,9 @@ actor ChatRoomClient {
                                observedVersion: cycleVersion)
             return
         }
+        // This response's STATE is the only recovery authority for its rows.
+        // Do not borrow the concurrently dialing socket's checkpoint anchor.
+        let recoveryCursor = chatResetAnchor(state: state)
         guard chatHTTPPullCoversFrontier(capturedCursor: pullSince, pull: pull) else {
             roomLog.error("chat2 \(self.chatId, privacy: .public): http pull has a row gap or inconsistent frontier; keeping pushes")
             return
@@ -313,8 +321,10 @@ actor ChatRoomClient {
             // the backfill deadline ("chat frozen", 2026-08-18).
             guard !fetchInFlight else { return }  // socket's fetch owns it
             fetchInFlight = true
-            await completeCheckpointFetch(seq: state.checkpointSeq,
-                                          expectedVersion: cycleVersion)
+            guard await completeCheckpointFetch(
+                seq: state.checkpointSeq, expectedVersion: cycleVersion) else {
+                return
+            }
             guard isCurrent(version: cycleVersion) else { return }
             let fetchedFrontierContained = await delegate.containsFrontier(stateFrame.payload)
             guard fetchedFrontierContained else {
@@ -335,8 +345,9 @@ actor ChatRoomClient {
         guard isCurrent(version: cycleVersion) else { return }
         for row in pull.rows {
             guard isCurrent(version: cycleVersion) else { return }
-            await applyRowFrame(row.frame)
-            guard isCurrent(version: cycleVersion) else { return }
+            guard await applyRowFrame(row.frame, recoveryCursor: recoveryCursor,
+                                      observedVersion: cycleVersion),
+                  isCurrent(version: cycleVersion) else { return }
         }
         let appliedCursor = await delegate.cursor()
         guard isCurrent(version: cycleVersion) else { return }
@@ -428,6 +439,7 @@ actor ChatRoomClient {
         cursorAmnestyDone = false
         stateReceived = false
         joined = false
+        socketRecoveryAnchor = nil
         checkpointBuffer = nil
         partialCheckpoint.removeAll()
         partialCheckpointSeq = nil
@@ -461,6 +473,7 @@ actor ChatRoomClient {
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         joined = false
+        socketRecoveryAnchor = nil
     }
 
     /// Queue one local update batch for push. The batch survives reconnects
@@ -524,6 +537,7 @@ actor ChatRoomClient {
         let sessionVersion = resetVersion
         joined = false
         stateReceived = false
+        socketRecoveryAnchor = nil
         checkpointBuffer = nil
         helloSentAt = nil
         backfillStartedAt = nil
@@ -714,7 +728,11 @@ actor ChatRoomClient {
                 checkpointBuffer?.append(frame)
                 return
             }
-            await applyRowFrame(frame)
+            let recoveryCursor = socketRecoveryAnchor.flatMap {
+                $0.version == sessionVersion ? $0.cursor : nil
+            } ?? 0
+            _ = await applyRowFrame(frame, recoveryCursor: recoveryCursor,
+                                    observedVersion: sessionVersion)
 
         case ChatFrameType.ack:
             guard let batchId = frame.header["batchId"] as? String,
@@ -782,6 +800,10 @@ actor ChatRoomClient {
                                observedVersion: sessionVersion)
             return
         }
+        // Bind missing-dependency recovery to this exact STATE generation.
+        // A room with no checkpoint must always replay from zero.
+        socketRecoveryAnchor = (version: sessionVersion,
+                                cursor: chatResetAnchor(state: state))
         // Same presence rule as chatPlanCatchUp: SIZE, not seq — a seeded
         // room's checkpoint covers seq 0.
         var contained = state.checkpointSize == 0
@@ -822,8 +844,8 @@ actor ChatRoomClient {
                 fetchInFlight = true
                 let seq = state.checkpointSeq
                 Task {
-                    await self.completeCheckpointFetch(seq: seq,
-                                                       expectedVersion: sessionVersion)
+                    _ = await self.completeCheckpointFetch(
+                        seq: seq, expectedVersion: sessionVersion)
                 }
             }
             after = a
@@ -841,7 +863,8 @@ actor ChatRoomClient {
     /// replay the rows that buffered while it downloaded. Deliberately NOT
     /// socket-generation-guarded on the apply: reconnects within one room
     /// incarnation may reuse it, but a reset-version change must discard it.
-    private func completeCheckpointFetch(seq: UInt64, expectedVersion: UInt64) async {
+    private func completeCheckpointFetch(seq: UInt64,
+                                         expectedVersion: UInt64) async -> Bool {
         let bytes = await fetchCheckpoint()
         fetchInFlight = false
         checkpointProgressAt = nil
@@ -854,9 +877,9 @@ actor ChatRoomClient {
                 checkpointBuffer = nil
                 restartSocketAfterReset()
             }
-            return
+            return false
         }
-        guard !closed else { return }
+        guard !closed else { return false }
         guard let bytes else {
             // Redial only if a session is actually waiting on this blob
             // (buffer armed) — a stale failure must not kill a healthy
@@ -866,7 +889,7 @@ actor ChatRoomClient {
                 checkpointBuffer = nil
                 await onSocketError(gen: generation)
             }
-            return
+            return false
         }
         guard await delegate.applyCheckpoint(bytes, seq), !closed else {
             if !closed {
@@ -874,30 +897,49 @@ actor ChatRoomClient {
                 checkpointBuffer = nil
                 await onSocketError(gen: generation)
             }
-            return
+            return false
         }
-        guard isCurrent(version: expectedVersion) else { return }
+        guard isCurrent(version: expectedVersion) else { return false }
+        let recoveryCursor = socketRecoveryAnchor.flatMap {
+            $0.version == expectedVersion ? $0.cursor : nil
+        } ?? 0
         while let frame = checkpointBuffer?.first {
             checkpointBuffer?.removeFirst()
-            await applyRowFrame(frame)
-            guard isCurrent(version: expectedVersion) else { return }
+            guard await applyRowFrame(frame, recoveryCursor: recoveryCursor,
+                                      observedVersion: expectedVersion),
+                  isCurrent(version: expectedVersion) else { return false }
         }
         checkpointBuffer = nil
+        return true
     }
 
     /// One backfill/broadcast frame: a row, or the ROWS_DONE terminator.
     /// Factored out so frames buffered during a parallel checkpoint fetch
     /// replay through exactly the live path.
-    private func applyRowFrame(_ frame: ChatWireFrame) async {
+    @discardableResult
+    private func applyRowFrame(_ frame: ChatWireFrame, recoveryCursor: UInt64,
+                               observedVersion: UInt64) async -> Bool {
         if frame.kind == ChatFrameType.row {
-            guard let seq = (frame.header["seq"] as? NSNumber)?.uint64Value else { return }
+            guard let seq = (frame.header["seq"] as? NSNumber)?.uint64Value else { return true }
             // Own-device rows can still arrive (first-backfill redownload, a
             // racing second socket) — Loro re-import is a no-op; the cursor
             // advance is what matters.
-            await delegate.applyRow(frame.payload, seq)
-            return
+            guard await delegate.applyRow(frame.payload, seq) else {
+                // A Loro import can succeed while parking the update because
+                // a causal dependency is absent. Keeping this numeric cursor
+                // would permanently hide that gap, so invalidate this session
+                // before ROWS_DONE/HTTP ACK logic can claim convergence.
+                guard isCurrent(version: observedVersion) else { return false }
+                roomLog.warning("chat2 \(self.chatId, privacy: .public): row \(seq) is causally pending; recovering from cursor \(recoveryCursor)")
+                await confirmReset(cursor: recoveryCursor, snapshot: [],
+                                   observedVersion: observedVersion)
+                return false
+            }
+            return isCurrent(version: observedVersion)
         }
-        guard backfillStartedAt != nil else { return }
+        guard isCurrent(version: observedVersion), backfillStartedAt != nil else {
+            return false
+        }
         backfillStartedAt = nil
         let wasResumed = resumed
         resumed = true
@@ -908,6 +950,7 @@ actor ChatRoomClient {
         // Anything not yet in flight goes now — the server's batchId dedupe
         // makes replays exact no-ops.
         await pushPending()
+        return isCurrent(version: observedVersion)
     }
 
     private func handleErrorFrame(_ header: [String: Any], gen: Int,

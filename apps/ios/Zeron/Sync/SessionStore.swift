@@ -17,6 +17,26 @@ import Foundation
 import Loro
 import Observation
 
+/// Loro accepts causally incomplete updates into an internal pending buffer
+/// without throwing. Callers must distinguish that from an update whose ops
+/// are actually materialized before they persist a room cursor.
+enum ChatDocImportResult: Equatable {
+    case applied
+    case missingDependencies
+}
+
+func chatImportRemote(into doc: LoroDoc, bytes: Data) throws -> ChatDocImportResult {
+    // `pending` catches the first incomplete delivery. The blob frontier also
+    // catches a replay of that already parked row, which Loro can otherwise
+    // report as an empty duplicate. Do not reject unrelated future pending
+    // rows: importing the intervening rows is how those gaps are repaired.
+    // The import immediately below performs the authoritative checksum check.
+    let metadata = try decodeImportBlobMeta(bytes: bytes, checkChecksum: false)
+    let status = try doc.importWith(bytes: bytes, origin: "remote")
+    let materialized = doc.oplogVv().includesVv(other: metadata.partialEndVv)
+    return status.pending == nil && materialized ? .applied : .missingDependencies
+}
+
 @MainActor
 @Observable
 final class SessionStore {
@@ -196,8 +216,16 @@ final class SessionStore {
                 return self.doc.oplogVv().includesVv(other: vv)
             },
             applyCheckpoint: { [weak self] bytes, seq in
-                guard let self,
-                      (try? self.doc.importWith(bytes: bytes, origin: "remote")) != nil else {
+                guard let self else { return false }
+                let result: ChatDocImportResult
+                do {
+                    result = try chatImportRemote(into: self.doc, bytes: bytes)
+                } catch {
+                    roomLog.warning("chat2 \(self.chatId, privacy: .public): checkpoint import failed: \(error.localizedDescription, privacy: .public)")
+                    return false
+                }
+                guard result == .applied else {
+                    roomLog.warning("chat2 \(self.chatId, privacy: .public): checkpoint has missing causal dependencies; refusing cursor \(seq)")
                     return false
                 }
                 self.cursor = max(self.cursor, seq)
@@ -206,16 +234,26 @@ final class SessionStore {
                 return true
             },
             applyRow: { [weak self] bytes, seq in
-                guard let self else { return }
+                guard let self else { return false }
                 // Malformed remote bytes cost the row, never the doc. The
                 // cursor still advances: replaying a poison row forever is
                 // the wedge class chat2 replaces.
-                if (try? self.doc.importWith(bytes: bytes, origin: "remote")) == nil {
-                    roomLog.warning("chat2 \(self.chatId, privacy: .public): row import failed; skipping row \(seq)")
+                do {
+                    let result = try chatImportRemote(into: self.doc, bytes: bytes)
+                    guard result == .applied else {
+                        // A successful import can still be causally pending.
+                        // Do not persist/project or let the room cursor cross
+                        // this row; ChatRoomClient will re-anchor and redial.
+                        roomLog.warning("chat2 \(self.chatId, privacy: .public): row \(seq) has missing causal dependencies; refusing cursor advance")
+                        return false
+                    }
+                } catch {
+                    roomLog.warning("chat2 \(self.chatId, privacy: .public): row import failed; skipping row \(seq): \(error.localizedDescription, privacy: .public)")
                 }
                 self.cursor = max(self.cursor, seq)
                 self.project()
                 self.saver?.poke()
+                return true
             },
             advanceCursor: { [weak self] seq in
                 guard let self else { return }

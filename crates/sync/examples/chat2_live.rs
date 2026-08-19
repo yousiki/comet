@@ -23,16 +23,27 @@ struct DocSink {
     rows_applied: AtomicU64,
 }
 
+fn import_materialized(doc: &LoroDoc, bytes: &[u8]) -> Result<bool, String> {
+    let metadata = LoroDoc::decode_import_blob_meta(bytes, false).map_err(|err| err.to_string())?;
+    let status = doc.import(bytes).map_err(|err| err.to_string())?;
+    Ok(status.pending.is_none() && doc.oplog_vv().includes_vv(&metadata.partial_end_vv))
+}
+
 impl ChatDocSink for DocSink {
-    fn apply_row(&self, bytes: &[u8], cursor: u64) {
+    fn apply_row(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
         let doc = self.doc.lock().unwrap();
-        doc.import(bytes).expect("row import");
+        if !import_materialized(&doc, bytes)? {
+            return Err("row import has unresolved dependencies".into());
+        }
         self.cursor.store(cursor, Relaxed);
         self.rows_applied.fetch_add(1, Relaxed);
+        Ok(())
     }
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
         let doc = self.doc.lock().unwrap();
-        doc.import(bytes).map_err(|e| e.to_string())?;
+        if !import_materialized(&doc, bytes)? {
+            return Err("checkpoint import has unresolved dependencies".into());
+        }
         self.cursor.store(cursor, Relaxed);
         self.checkpoint_applied.store(true, Relaxed);
         Ok(())
