@@ -5592,14 +5592,11 @@ impl Shell {
     ) -> AnyElement {
         let open = self.user_menu.is_open();
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
-        // Bottom-of-sidebar identity: avatar circle + scope/account label and
-        // its secondary status line.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
+        // Bottom-of-sidebar identity: generated blob avatar + scope/account
+        // label and its secondary status line. The avatar is seeded from the
+        // stable identity string (email when signed in, scope label
+        // otherwise), so the same account wears the same face everywhere.
+        let avatar = crate::avatar::blob_avatar(&menu_identity, 28.0);
         let mut trigger = div()
             .id("user-menu")
             .key_context("TeamMenu")
@@ -5654,21 +5651,7 @@ impl Shell {
                     cx.stop_propagation();
                 }
             }))
-            .child(
-                // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
-                div()
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
-            )
+            .child(avatar)
             .child(
                 // Name with an optional status line underneath — no chip on the right.
                 div()
