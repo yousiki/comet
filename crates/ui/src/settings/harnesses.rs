@@ -25,6 +25,7 @@ use zeron_rpc::methods;
 
 use crate::pickers::visible_harnesses;
 use crate::popover::{self, Loadable};
+use crate::settings::composer::ComposerDefaults;
 use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -61,6 +62,10 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
 pub struct HarnessesPage {
     state: Entity<AppState>,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
+    /// The composer's sticky picks, read for the defaults readout below the
+    /// toggles. Loaded once per visit — the shell rebuilds this page every
+    /// time it's opened, so it can't go stale behind the composer's writes.
+    defaults: ComposerDefaults,
     /// Which device's harnesses are shown/edited; `None` = this device (no
     /// passthrough). Retargeted by the page-header device switcher.
     target_device: Option<String>,
@@ -78,8 +83,15 @@ pub struct HarnessesPage {
 
 impl HarnessesPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let defaults = state
+            .read(cx)
+            .data_dir
+            .as_deref()
+            .map(ComposerDefaults::load)
+            .unwrap_or_default();
         let mut page = Self {
             state,
+            defaults,
             harnesses: Loadable::Idle,
             target_device: None,
             device_menu_open: false,
@@ -331,6 +343,90 @@ impl HarnessesPage {
         trigger.into_any_element()
     }
 
+    /// Forget the sticky new-chat option picks. Only the option memory — the
+    /// harness/model/reasoning ones already show as composer chips and are
+    /// re-picked in one click, while an option sits two menus deep.
+    fn reset_option_defaults(&mut self, cx: &mut Context<Self>) {
+        self.defaults.options_by_model.clear();
+        if let Some(dir) = self.state.read(cx).data_dir.clone()
+            && let Err(err) = self.defaults.save(&dir)
+        {
+            self.error = Some(format!("Couldn't clear defaults: {err}"));
+        }
+        // Every open composer holds its own copy and would write the cleared
+        // entries straight back on its next pick.
+        crate::pickers::bump_composer_defaults(cx);
+        cx.notify();
+    }
+
+    /// Readout for the sticky model-option picks (the composer's traits menu:
+    /// Context Window, Fast Mode, Thinking, Service Tier). Device-local, so
+    /// the page's device switcher deliberately doesn't retarget it.
+    fn render_option_defaults(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self.defaults.remembered_option_rows();
+        let mut card = widgets::section_card(theme);
+        if rows.is_empty() {
+            return card
+                .child(
+                    widgets::card_row(theme, true).child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.5))
+                            .text_color(theme.text_muted.opacity(0.75))
+                            .child(SharedString::from(
+                                "Nothing remembered yet — every model is on its catalog default.",
+                            )),
+                    ),
+                )
+                .into_any_element();
+        }
+        for (ix, (harness, model, summary)) in rows.into_iter().enumerate() {
+            let (icon_path, tint) = crate::pickers::harness_brand_icon(harness);
+            card = card.child(
+                widgets::card_row(theme, ix == 0)
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(28.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(crate::theme::ink(0.03))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                crate::icons::icon(icon_path)
+                                    .size(px(14.0))
+                                    .text_color(tint.unwrap_or(theme.text_muted)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(theme, model))
+                            .child(widgets::meta_line(
+                                theme,
+                                vec![div().child(SharedString::from(summary)).into_any_element()],
+                            )),
+                    ),
+            );
+        }
+        card.child(
+            widgets::card_row(theme, false).child(
+                widgets::ghost_action(theme)
+                    .id("composer-option-defaults-reset")
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .on_click(cx.listener(|page, _, _, cx| page.reset_option_defaults(cx)))
+                    .child(SharedString::from("Reset to catalog defaults")),
+            ),
+        )
+        .into_any_element()
+    }
+
     fn rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let theme = Theme::of(cx).clone();
         let Loadable::Ready(list) = &self.harnesses else {
@@ -455,6 +551,7 @@ impl Render for HarnessesPage {
             .clone()
             .map(|message| widgets::error_strip(&theme, message).into_any_element());
         let switcher = self.render_device_switcher(&theme, cx);
+        let option_defaults = self.render_option_defaults(&theme, cx);
 
         div()
             .id("harnesses-page")
@@ -482,7 +579,23 @@ impl Render for HarnessesPage {
                         .line_height(px(20.0)),
                     )
                     .children(error)
-                    .child(body),
+                    .child(body)
+                    .child(
+                        div()
+                            .mt(px(32.0))
+                            .child(widgets::field_label(&theme, "New-chat model options"))
+                            .child(
+                                widgets::page_subtitle(
+                                    &theme,
+                                    "The traits menu's per-model picks (context window, fast \
+                                     mode, thinking, service tier) are remembered on this \
+                                     device and reused by the next new chat on the same model.",
+                                )
+                                .max_w(px(512.0))
+                                .line_height(px(20.0)),
+                            ),
+                    )
+                    .child(option_defaults),
             )
     }
 }

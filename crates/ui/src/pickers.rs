@@ -57,6 +57,20 @@ pub fn bump_harness_catalog(cx: &mut App) {
     cx.default_global::<HarnessCatalogChanged>();
 }
 
+/// Marker global for the same reason, one file over: Settings → Agents can
+/// reset the sticky composer defaults, and every [`Pickers`] holds its own
+/// in-memory copy that would otherwise write the cleared entries straight
+/// back on the next pick.
+#[derive(Default)]
+pub struct ComposerDefaultsChanged;
+
+impl gpui::Global for ComposerDefaultsChanged {}
+
+/// Notify all composers that `composer-defaults.json` changed underneath them.
+pub fn bump_composer_defaults(cx: &mut App) {
+    cx.default_global::<ComposerDefaultsChanged>();
+}
+
 // ---------------------------------------------------------------------------
 // Draft config (what the pickers accumulate)
 // ---------------------------------------------------------------------------
@@ -219,6 +233,27 @@ pub fn traits_summary(
     } else {
         Some(parts.join(" · "))
     }
+}
+
+/// Remembered option picks narrowed to what the model still advertises: a
+/// renamed option or a dropped choice would otherwise ride a run request long
+/// after the catalog moved on (the picks outlive any one catalog load).
+pub fn offered_options(
+    model: &Model,
+    picks: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    picks
+        .iter()
+        .filter(|(option_id, value)| {
+            model.options.iter().any(|option| {
+                option.id == **option_id
+                    && value
+                        .as_str()
+                        .is_some_and(|id| option.choices.iter().any(|c| c.id == id))
+            })
+        })
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect()
 }
 
 /// Whether any trait departs from its default — the trigger brightens only
@@ -456,6 +491,7 @@ pub struct Pickers {
     _search_events: Subscription,
     _state_observe: Subscription,
     _catalog_observe: Subscription,
+    _defaults_observe: Subscription,
 }
 
 impl Pickers {
@@ -527,6 +563,17 @@ impl Pickers {
             this.ensure_harnesses(true, cx);
             cx.notify();
         });
+        // Settings reset the sticky defaults: re-read the file so this copy
+        // stops shadowing it (and drop the draft options, which were seeded
+        // from the memory that just went away).
+        let defaults_observe =
+            cx.observe_global::<ComposerDefaultsChanged>(|this: &mut Self, cx| {
+                if let Some(dir) = this.data_dir.as_deref() {
+                    this.defaults = ComposerDefaults::load(dir);
+                }
+                this.config.model_options.clear();
+                cx.notify();
+            });
         // Dev/testing knob: `ZERON_OPEN_PICKER=model|traits|repo|branch` boots
         // with that popover open — synthetic input can't reach the app on
         // headless compositors, so captures need a data-side path.
@@ -597,6 +644,7 @@ impl Pickers {
             _search_events: search_events,
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
+            _defaults_observe: defaults_observe,
         }
     }
 
@@ -715,16 +763,31 @@ impl Pickers {
     }
 
     /// The explicit (non-default) option picks: the chat's persisted
-    /// selections for existing chats, the draft's for the new-chat canvas.
+    /// selections for existing chats, the draft's — else the sticky last-used
+    /// picks for this model — for the new-chat canvas.
     fn explicit_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
-        match self
+        if let Some(config) = self
             .state
             .read(cx)
             .selected_chat_row()
             .and_then(|c| c.config.as_ref())
         {
-            Some(config) => config.model_options.clone(),
-            None => self.config.model_options.clone(),
+            return config.model_options.clone();
+        }
+        if !self.config.model_options.is_empty() {
+            return self.config.model_options.clone();
+        }
+        // No draft pick (or a draft deliberately reset to all-defaults, which
+        // [`Self::pick_option`] mirrors into the memory as an empty map): the
+        // remembered selection for this harness+model. Filtered against the
+        // loaded catalog so a renamed or dropped option never rides a run.
+        let (Some(harness), Some(model)) = (self.effective_harness(cx), self.selected_model(cx))
+        else {
+            return serde_json::Map::new();
+        };
+        match self.defaults.options_for(harness, &model.id) {
+            Some(picks) => offered_options(model, picks),
+            None => serde_json::Map::new(),
         }
     }
 
@@ -1005,7 +1068,10 @@ impl Pickers {
                     let fresh = pickers
                         .defaults
                         .remember_labels(models.iter().map(|m| (m.id.as_str(), m.label.as_str())));
-                    if fresh {
+                    // Settings reads the remembered option picks back without a
+                    // catalog of its own, so cache their labels here too.
+                    let fresh_options = pickers.defaults.remember_option_labels(models.iter());
+                    if fresh || fresh_options {
                         pickers.save_defaults();
                     }
                 }
@@ -1224,6 +1290,10 @@ impl Pickers {
             self.update_chat_config(cx, move |config| config.model = Some(model_id));
         } else {
             // New chat: draft pick + sticky last-used memory for this harness.
+            // Option picks belong to the model that advertised them (Fast Mode
+            // is an Opus row, not a Sonnet one) — drop the draft so the new
+            // model's own remembered picks take over via `explicit_options`.
+            self.config.model_options.clear();
             self.config.model = Some(model_id.clone());
             if let Some(harness) = self.effective_harness(cx) {
                 let label = self
@@ -1269,12 +1339,25 @@ impl Pickers {
                         .insert(option_id, serde_json::Value::String(choice_id));
                 }
             });
-        } else if default {
-            self.config.model_options.remove(&option_id);
         } else {
-            self.config
-                .model_options
-                .insert(option_id, serde_json::Value::String(choice_id));
+            if default {
+                self.config.model_options.remove(&option_id);
+            } else {
+                self.config
+                    .model_options
+                    .insert(option_id, serde_json::Value::String(choice_id));
+            }
+            // Sticky, like the harness/model/reasoning picks: the next new
+            // chat on this model opens with the same options instead of
+            // snapping back to the catalog defaults.
+            let picks = self.config.model_options.clone();
+            if let (Some(harness), Some(model)) = (
+                self.effective_harness(cx),
+                self.selected_model(cx).map(|m| m.id.clone()),
+            ) {
+                self.defaults.remember_options(harness, model, picks);
+                self.save_defaults();
+            }
         }
         cx.notify();
     }
@@ -3841,6 +3924,46 @@ mod tests {
     }
 
     #[test]
+    fn offered_options_drops_catalog_drift() {
+        let model = Model {
+            id: "opus".into(),
+            label: "Opus".into(),
+            description: None,
+            reasoning_levels: vec![],
+            options: vec![ModelOption {
+                id: "context".into(),
+                label: "Context window".into(),
+                choices: vec![
+                    ModelOptionChoice {
+                        id: "standard".into(),
+                        label: "Standard".into(),
+                    },
+                    ModelOptionChoice {
+                        id: "1m".into(),
+                        label: "1M".into(),
+                    },
+                ],
+                default_choice: "standard".into(),
+            }],
+        };
+        let mut picks = serde_json::Map::new();
+        picks.insert("context".into(), serde_json::Value::String("1m".into()));
+        // Option the model dropped, and a choice it no longer offers.
+        picks.insert("fastMode".into(), serde_json::Value::String("on".into()));
+        picks.insert("context2".into(), serde_json::Value::String("1m".into()));
+        let kept = offered_options(&model, &picks);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept.get("context").and_then(|v| v.as_str()), Some("1m"));
+
+        let mut stale_choice = serde_json::Map::new();
+        stale_choice.insert("context".into(), serde_json::Value::String("10m".into()));
+        assert!(offered_options(&model, &stale_choice).is_empty());
+        // A model with no options keeps nothing.
+        let bare = bare_model("haiku", "Haiku");
+        assert!(offered_options(&bare, &picks).is_empty());
+    }
+
+    #[test]
     fn folder_paths_and_breadcrumbs() {
         assert_eq!(parent_path("/home/w/dev"), Some("/home/w".to_string()));
         assert_eq!(parent_path("/home"), Some("/".to_string()));
@@ -4069,5 +4192,93 @@ mod tests {
         let offered =
             offered_harnesses_impl(&catalog(Some(false), Some(false), Some(false)), false);
         assert_eq!(offered.len(), 3);
+    }
+
+    /// End-to-end for the sticky option picks: a Traits choice made on one
+    /// new-chat canvas is what the NEXT one runs with, without re-picking.
+    #[gpui::test]
+    fn option_picks_stick_to_the_next_new_chat(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let opus = Model {
+            id: "opus".into(),
+            label: "Opus".into(),
+            description: None,
+            reasoning_levels: vec![],
+            options: vec![ModelOption {
+                id: "contextWindow".into(),
+                label: "Context Window".into(),
+                choices: vec![
+                    ModelOptionChoice {
+                        id: "200k".into(),
+                        label: "200K".into(),
+                    },
+                    ModelOptionChoice {
+                        id: "1m".into(),
+                        label: "1M".into(),
+                    },
+                ],
+                default_choice: "200k".into(),
+            }],
+        };
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.data_dir = Some(dir.path().to_path_buf());
+            state
+        });
+        // A composer primed on Opus with a loaded catalog, as after a boot.
+        let prime = |pickers: &mut Pickers| {
+            pickers.models.insert(
+                HarnessId::ClaudeCode,
+                Loadable::Ready(vec![opus.clone(), bare_model("haiku", "Haiku")]),
+            );
+            pickers.config.harness = Some(HarnessId::ClaudeCode);
+            pickers.config.model = Some("opus".into());
+        };
+
+        let first = cx.new(|cx| Pickers::new(state.clone(), cx));
+        first.update(cx, |pickers, cx| {
+            prime(pickers);
+            assert!(pickers.resolved(cx).model_options.is_empty());
+            pickers.pick_option("contextWindow".into(), "1m".into(), false, cx);
+        });
+
+        // A second composer reading the same data dir — the next new chat.
+        let second = cx.new(|cx| Pickers::new(state.clone(), cx));
+        second.update(cx, |pickers, cx| {
+            prime(pickers);
+            assert_eq!(
+                pickers
+                    .resolved(cx)
+                    .model_options
+                    .get("contextWindow")
+                    .and_then(|v| v.as_str()),
+                Some("1m"),
+                "the remembered pick should seed the new chat"
+            );
+            // Options belong to the model that advertised them: switching to a
+            // model without the option must not carry it over.
+            pickers.pick_model("haiku".into(), cx);
+            assert!(pickers.resolved(cx).model_options.is_empty());
+            // Back on Opus, the memory still applies.
+            pickers.pick_model("opus".into(), cx);
+            assert_eq!(
+                pickers
+                    .resolved(cx)
+                    .model_options
+                    .get("contextWindow")
+                    .and_then(|v| v.as_str()),
+                Some("1m")
+            );
+            // Choosing the default back is remembered as such, not refilled
+            // from the older memory.
+            pickers.pick_option("contextWindow".into(), "200k".into(), true, cx);
+            assert!(pickers.resolved(cx).model_options.is_empty());
+        });
+
+        let third = cx.new(|cx| Pickers::new(state.clone(), cx));
+        third.update(cx, |pickers, cx| {
+            prime(pickers);
+            assert!(pickers.resolved(cx).model_options.is_empty());
+        });
     }
 }
