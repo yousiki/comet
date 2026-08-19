@@ -40,6 +40,7 @@ fn request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
         mcp_servers: Vec::new(),
     }
@@ -327,4 +328,31 @@ async fn shim_crash_mid_run_reports_stderr_tail() {
         }
         other => panic!("expected errored done, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn model_discovery_maps_the_live_catalog() {
+    let models = harness().models().await.expect("models");
+    // Parameterized Auto first; its bare `default` alias twin skipped.
+    assert_eq!(models.len(), 2, "{models:?}");
+    assert_eq!(models[0].id, "auto-smart");
+    assert_eq!(models[0].label, "Auto");
+    let optimize = &models[0].options[0];
+    assert_eq!(optimize.id, "optimize_for");
+    assert_eq!(optimize.label, "Optimize For");
+    assert_eq!(
+        optimize
+            .choices
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["intelligence", "balanced", "cost"]
+    );
+    // The default comes from the isDefault variant, not the first value.
+    assert_eq!(optimize.default_choice, "balanced");
+    assert_eq!(models[1].id, "claude-fable-5");
+    assert_eq!(models[1].description.as_deref(), Some("Anthropic frontier"));
+    // A parameter without displayName labels by id; default = first value.
+    assert_eq!(models[1].options[0].id, "thinking");
+    assert_eq!(models[1].options[0].default_choice, "enabled");
 }

@@ -117,6 +117,16 @@ case "$first" in
   exec sleep 30
   ;;
 
+*'"subtype":"initialize"'*)
+  # Command discovery: the initialize control request arrives as the FIRST
+  # stdin line (no user message ever follows). Shape mirrors 2.1.228's
+  # control_response: commands under response.response.
+  rid=$(printf '%s\n' "$first" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"\",\"description\":\"nameless: dropped\"}],\"output_style\":\"default\"}}}"
+  # Stay alive until the driver tears us down, like the real CLI would.
+  exec sleep 30
+  ;;
+
 *scenario:error*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-err"}'
   # Terse assistant-level error code with no content.

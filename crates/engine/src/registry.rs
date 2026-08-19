@@ -453,6 +453,24 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::pi().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
     );
+    // opencode over ACP (`opencode acp`), same lazy pattern: the static
+    // descriptor mirrors AcpHarness::opencode() exactly. No steering
+    // extension (turn boundaries) and no effort ladder — opencode exposes no
+    // thought_level config over ACP today (effort stays per-model in its own
+    // config).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Opencode,
+            name: "OpenCode".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::opencode().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -509,7 +527,8 @@ mod tests {
                 HarnessId::Cursor,
                 HarnessId::Grok,
                 HarnessId::Hermes,
-                HarnessId::Pi
+                HarnessId::Pi,
+                HarnessId::Opencode
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -543,6 +562,11 @@ mod tests {
         assert_eq!(hermes.display_name(), "Hermes");
         assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
         assert!(hermes.reasoning_levels().is_empty());
+        let opencode = registry.resolve(HarnessId::Opencode).unwrap();
+        assert_eq!(opencode.id(), HarnessId::Opencode);
+        assert_eq!(opencode.display_name(), "OpenCode");
+        assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(opencode.reasoning_levels().is_empty());
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");

@@ -69,6 +69,7 @@ async fn probe_once(harness: AcpHarness) -> ProbeOutcome {
         auto_approve: true,
         attachments: Vec::new(),
         mcp_servers: Vec::new(),
+        worktree: None,
         resume: None,
     };
     let mut stream = match harness.run(req, controls).await {
@@ -203,6 +204,7 @@ async fn real_all_harnesses_quiet_survey() {
         ("grok", AcpHarness::grok),
         ("hermes", AcpHarness::hermes),
         ("pi", AcpHarness::pi),
+        ("opencode", AcpHarness::opencode),
     ];
     let mut failures: Vec<String> = Vec::new();
     for (name, ctor) in agents {

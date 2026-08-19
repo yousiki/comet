@@ -132,6 +132,11 @@ icon_assets![
     (WINDOW_MINIMIZE, "window-minimize"),
     (WINDOW_MAXIMIZE, "window-maximize"),
     (WINDOW_RESTORE, "window-restore"),
+    // Hand-drawn hard-drive + home glyphs in the Solar Linear style (like the
+    // terminal/plus/return ports) — drawn for the add-space palette's
+    // Locations rail; the set has neither.
+    (HARD_DRIVE, "hard-drive"),
+    (HOME, "home"),
     (STOP, "stop"),
     (CHECK, "check"),
     (COPY, "copy"),
@@ -148,6 +153,7 @@ icon_assets![
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
+    (OPENCODE_MARK, "opencode-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — zeron keeps it even on the

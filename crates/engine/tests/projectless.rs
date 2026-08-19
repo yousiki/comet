@@ -168,6 +168,7 @@ async fn projectless_chat_runs_from_home_and_mints_no_space() {
                     auto_approve: true,
                     attachments: Vec::new(),
                     mcp_servers: Vec::new(),
+                    worktree: None,
                     resume: None,
                 },
                 message_id: "msg-np-1".into(),

@@ -2765,6 +2765,15 @@ impl Transcript {
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             let state = self.attachment_state(&device_ids, &att.path, cx);
+            // The in-flight send's upload progress belongs ON the thumbnail:
+            // only the un-refreshed echo carries synthetic `pending/` refs, so
+            // the pair (pending path, upload in flight) is exactly "this image
+            // is crossing the relay right now" (2026-08-18 user request).
+            let uploading = att
+                .path
+                .starts_with("pending/")
+                .then(|| self.state.read(cx).upload_progress_percent())
+                .flatten();
             let frame = div()
                 .flex_none()
                 .w(px(ATT_THUMB_W))
@@ -2779,6 +2788,7 @@ impl Transcript {
                     };
                     frame
                         .id(SharedString::from(format!("{row_id}#att{aix}")))
+                        .relative()
                         .border_1()
                         .border_color(crate::theme::hairline(0.11))
                         .bg(crate::theme::ink(0.035))
@@ -2798,6 +2808,27 @@ impl Transcript {
                                 .rounded(px(7.0))
                                 .object_fit(ObjectFit::Cover),
                         )
+                        .when_some(uploading, |el, pct| {
+                            // The pulse read registers this entity for frames,
+                            // so the percent stays live even once the trailer's
+                            // 30s pending-send bridge has lapsed.
+                            let pulse = motion::pulse_wave(motion::pulse_delta(
+                                &motion::ZERON_PULSE,
+                                cx.entity_id(),
+                                cx,
+                            ));
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .rounded(px(7.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
+                                    .child(crate::loaders::upload_progress_ring(pct, 34.0)),
+                            )
+                        })
                         .into_any_element()
                 }
                 // Errored/unavailable: the dashed "missing" thumb.

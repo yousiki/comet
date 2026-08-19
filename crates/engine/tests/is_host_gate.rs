@@ -326,6 +326,7 @@ async fn first_registry_sync_redrains_commands_parked_by_claim_gate() {
                     auto_approve: true,
                     attachments: Vec::new(),
                     mcp_servers: Vec::new(),
+                    worktree: None,
                     resume: None,
                 },
                 message_id: "m-before-sync".into(),

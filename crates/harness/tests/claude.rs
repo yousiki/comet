@@ -45,6 +45,7 @@ fn request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
         mcp_servers: Vec::new(),
     }
@@ -624,4 +625,37 @@ async fn live_real_cli_single_turn() {
             ..
         })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Slash-command discovery
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn commands_come_from_the_initialize_control_request() {
+    let h = harness();
+    let commands = h.commands().await.expect("discovery succeeds");
+    assert_eq!(commands.len(), 2, "nameless entries are dropped: {commands:?}");
+    assert_eq!(commands[0].name, "review");
+    assert_eq!(commands[0].description, "Review a pull request");
+    assert_eq!(commands[0].input_hint.as_deref(), Some("[pr number]"));
+    assert_eq!(commands[1].name, "compact");
+    assert_eq!(commands[1].input_hint, None, "empty hint reads as None");
+
+    // Cached: the second call reuses the first probe's result (the fake has
+    // exited; a re-probe against a dead binary path would still work here,
+    // but object identity of the cached list is the cheap assertion).
+    let again = h.commands().await.expect("cache hit");
+    assert_eq!(again, commands);
+}
+
+/// Live smoke against the real CLI: `cargo test -p zeron-harness --test
+/// claude -- --ignored live_commands`. No model turn, no API cost.
+#[tokio::test]
+#[ignore]
+async fn live_commands_discovery() {
+    let h = ClaudeHarness::new();
+    let commands = h.commands().await.expect("live discovery");
+    assert!(!commands.is_empty());
+    eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
 }

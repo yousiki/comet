@@ -15,6 +15,12 @@ update() { # $1 = update json object body
   emit "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"$SID\",\"update\":$1}}"
 }
 
+xnotify() { # $1 = update json object body — grok's extension channel (the
+  # subagent lifecycle rides _x.ai/session_notification, NOT session/update;
+  # same {sessionId, update} envelope. Verified live, 1.0.4.)
+  emit "{\"method\":\"_x.ai/session_notification\",\"params\":{\"sessionId\":\"$SID\",\"update\":$1}}"
+}
+
 # ---- handshake -------------------------------------------------------------
 read -r line || exit 1 # initialize
 has "$line" '"method":"initialize"' || exit 1
@@ -120,6 +126,24 @@ case "$promptline" in
   # TOTAL silence after the prompt — the leader-wedge signature. Nothing is
   # ever emitted; the harness's prompt-stall watchdog must error the run.
   exec sleep 60
+  ;;
+
+*scenario:subagent*)
+  # Grok's background subagent lifecycle (wire shapes captured live, 1.0.4):
+  # spawn tool_call tagged _meta["x.ai/tool"], completion echoing the minted
+  # subagent_id in its output text, then the subagent_spawned/finished
+  # extension updates. The transcript itself never rides the wire — the test
+  # seeds/app ends a chat_history.jsonl under the harness's sessions root
+  # and the tail turns it into tagged events during the sleep window.
+  update '{"sessionUpdate":"tool_call","toolCallId":"sp1","title":"spawn_subagent","rawInput":{"description":"Count files","prompt":"Count the files.","subagent_type":"explore"},"_meta":{"x.ai/tool":{"version":1,"name":"spawn_subagent","kind":"task","namespace":"grok_build","label":"Subagent","read_only":false},"subagentBackground":true}}'
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"sp1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"Subagent started in background.\nsubagent_id: sub-1\ntype: explore"}}],"rawOutput":{"type":"Text","text":"Subagent started in background.\nsubagent_id: sub-1\ntype: explore"}}'
+  xnotify "{\"sessionUpdate\":\"subagent_spawned\",\"subagent_id\":\"sub-1\",\"parent_session_id\":\"$SID\",\"child_session_id\":\"sub-1\",\"subagent_type\":\"explore\",\"description\":\"Count files\"}"
+  # A NESTED spawned update (another parent session) must not bind here.
+  xnotify '{"sessionUpdate":"subagent_spawned","subagent_id":"sub-nested","parent_session_id":"sub-1","child_session_id":"sub-nested","subagent_type":"explore","description":"Count files"}'
+  sleep 1.4
+  xnotify '{"sessionUpdate":"subagent_finished","subagent_id":"sub-1","child_session_id":"sub-1","status":"completed","tool_calls":1,"turns":1,"output":"two files","will_wake":false}'
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
 *scenario:happy*)

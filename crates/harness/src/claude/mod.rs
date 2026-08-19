@@ -49,8 +49,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
@@ -119,6 +119,9 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// Command discovery cache: only a successful probe is cached, so a
+    /// broken CLI retries on the next picker open (ACP-harness parity).
+    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
 }
 
 impl Default for ClaudeHarness {
@@ -127,6 +130,7 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            commands: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -253,6 +257,118 @@ impl ClaudeHarness {
             .kill_on_drop(true);
         cmd
     }
+
+    /// Short-lived discovery probe: spawn the CLI in stream-json mode, send
+    /// the `initialize` control request, and read the commands out of its
+    /// control_response. No user message is ever written, so no turn (and no
+    /// API call) happens; the child is torn down as soon as the response
+    /// lands.
+    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let mut cmd = Command::new(&exe);
+        crate::compose_child_path(&mut cmd, &exe);
+        cmd.args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            // Mandatory with --print + stream-json output; without it the
+            // CLI exits immediately with a usage error.
+            "--verbose",
+        ]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(exe.display().to_string())
+            } else {
+                HarnessError::Io(e)
+            }
+        })?;
+        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            shutdown_child(&mut child, self.kill_grace).await;
+            return Err(HarnessError::Protocol("claude child has no stdio".into()));
+        };
+        const PROBE_ID: &str = "zeron-command-probe";
+        let discovery = async {
+            let request = serde_json::json!({
+                "type": "control_request",
+                "request_id": PROBE_ID,
+                "request": { "subtype": "initialize" },
+            });
+            stdin
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .map_err(HarnessError::Io)?;
+            stdin.flush().await.map_err(HarnessError::Io)?;
+            let mut lines = BufReader::new(stdout).lines();
+            while let Some(line) = lines.next_line().await.map_err(HarnessError::Io)? {
+                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+                    continue;
+                }
+                let response = frame.get("response").cloned().unwrap_or(Value::Null);
+                if response.get("request_id").and_then(Value::as_str) != Some(PROBE_ID) {
+                    continue;
+                }
+                if response.get("subtype").and_then(Value::as_str) == Some("error") {
+                    let msg = response
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("initialize control request failed");
+                    return Err(HarnessError::Protocol(msg.into()));
+                }
+                return Ok(parse_initialize_commands(&response));
+            }
+            Err(HarnessError::Protocol(
+                "claude exited before answering the initialize control request".into(),
+            ))
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
+        }
+    }
+}
+
+/// `commands` out of an `initialize` control_response payload
+/// (`response.response.commands`: name / description / argumentHint).
+fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
+    response
+        .get("response")
+        .and_then(|r| r.get("commands"))
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(SlashCommand {
+                name: name.to_owned(),
+                description: c
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                input_hint: c
+                    .get("argumentHint")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -292,6 +408,18 @@ impl Harness for ClaudeHarness {
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
         Ok(static_models())
+    }
+
+    /// Slash commands from the CLI's `initialize` control-request handshake —
+    /// the same channel the Claude Agent SDK's `query()` opens. The response
+    /// carries every command with description + argument hint and involves no
+    /// model turn (verified live, 2.1.228: the control_response is the first
+    /// stdout line, well before any API traffic). Cached on success.
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.commands
+            .get_or_try_init(|| self.discover_commands())
+            .await
+            .cloned()
     }
 
     async fn run(

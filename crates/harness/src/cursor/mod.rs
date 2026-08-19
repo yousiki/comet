@@ -77,6 +77,9 @@ pub struct CursorHarness {
     executable: Option<PathBuf>,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    /// Discovery cache: only a successful, non-empty catalog is cached, so a
+    /// failed probe (offline, SDK churn) retries on the next picker open.
+    models_cache: tokio::sync::OnceCell<Vec<Model>>,
 }
 
 impl Default for CursorHarness {
@@ -85,6 +88,7 @@ impl Default for CursorHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            models_cache: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -105,10 +109,42 @@ impl CursorHarness {
         self
     }
 
+    /// Spawn the shim in models mode and map its one catalog frame.
+    async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let (exe, args) = self.resolve_shim().await?;
+        let mut cmd = Command::new(&exe);
+        cmd.args(&args);
+        crate::compose_child_path(&mut cmd, &exe);
+        cmd.arg("models")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let run = async {
+            let output = cmd
+                .output()
+                .await
+                .map_err(|e| HarnessError::Protocol(format!("cursor models probe: {e}")))?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let items = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+                .find(|v| v.get("ev").and_then(Value::as_str) == Some("models"))
+                .and_then(|v| v.get("items").cloned())
+                .ok_or_else(|| {
+                    HarnessError::Protocol("cursor models probe returned no catalog".into())
+                })?;
+            Ok::<_, HarnessError>(map_model_items(&items))
+        };
+        tokio::time::timeout(Duration::from_secs(15), run)
+            .await
+            .map_err(|_| HarnessError::Protocol("cursor models probe timed out".into()))?
+    }
+
     /// (program, args) for the shim process: the test override, or node
     /// running the shim inside the managed SDK install (installing it on
     /// first use).
-    async fn resolve_shim(&self) -> Result<(PathBuf, Vec<String>), HarnessError> {
+    pub async fn resolve_shim(&self) -> Result<(PathBuf, Vec<String>), HarnessError> {
         if let Some(p) = &self.executable {
             return Ok((p.clone(), Vec::new()));
         }
@@ -123,6 +159,20 @@ impl CursorHarness {
                 .await?;
         crate::adapter_install::launch_for_entry(&shim)
     }
+}
+
+/// A ready-to-spawn command for the shim's LOGIN mode: the SDK's PKCE
+/// browser flow, minting the key into `store_path` (never the live
+/// `~/.cursor/sdk/auth.json` — the engine snapshots the store file as an
+/// account slot). Emits `{"ev":"auth-url"}` then `{"ev":"logged-in"}` /
+/// `{"ev":"fatal"}` JSONL on stdout; kill to cancel.
+pub async fn login_command(store_path: &std::path::Path) -> Result<Command, HarnessError> {
+    let (exe, args) = CursorHarness::default().resolve_shim().await?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(&args);
+    crate::compose_child_path(&mut cmd, &exe);
+    cmd.arg("login").arg(store_path);
+    Ok(cmd)
 }
 
 #[async_trait]
@@ -155,44 +205,26 @@ impl Harness for CursorHarness {
         true
     }
 
-    /// Static catalog (the SDK's `Cursor.models.list()` needs its own auth;
-    /// well-known public ids keep the picker useful without it).
+    /// Live catalog via the shim's models mode (`Cursor.models.list()` —
+    /// public, no auth; verified live on 1.0.28). Falls back to a minimal
+    /// static pair when the probe fails, UNCACHED so the next picker open
+    /// retries.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![
-            Model {
-                id: "auto".into(),
-                label: "Auto".into(),
-                description: Some("Cursor picks the model per request".into()),
-                reasoning_levels: Vec::new(),
-                options: vec![ModelOption {
-                    id: "optimizeFor".into(),
-                    label: "Optimize for".into(),
-                    choices: vec![
-                        ModelOptionChoice {
-                            id: "balanced".into(),
-                            label: "Balanced".into(),
-                        },
-                        ModelOptionChoice {
-                            id: "speed".into(),
-                            label: "Speed".into(),
-                        },
-                        ModelOptionChoice {
-                            id: "intelligence".into(),
-                            label: "Intelligence".into(),
-                        },
-                    ],
-                    default_choice: "balanced".into(),
-                }],
-            },
-            Model {
-                id: "composer-2.5".into(),
-                label: "Composer 2.5".into(),
-                description: Some("Cursor's own fast coding model".into()),
-                reasoning_levels: Vec::new(),
-                options: Vec::new(),
-            },
-        ])
+        if let Some(models) = self.models_cache.get() {
+            return Ok(models.clone());
+        }
+        match self.discover_models().await {
+            Ok(models) if !models.is_empty() => {
+                let _ = self.models_cache.set(models.clone());
+                Ok(models)
+            }
+            Ok(_) | Err(_) => Ok(static_models()),
+        }
     }
+
+    // No `commands()` override: @cursor/sdk 1.0.28 exposes no slash-command
+    // listing (the cursor-agent TUI's slash commands are client-side only),
+    // so the trait's empty default is the honest answer, not a gap.
 
     async fn run(
         &self,
@@ -245,6 +277,9 @@ impl Harness for CursorHarness {
             "prompt": request.prompt,
             "cwd": request.cwd,
             "model": request.model,
+            // Typed parameter picks (thinking/context/effort/fast/…) — the
+            // shim folds them into the SDK's ModelSelection params.
+            "modelOptions": request.model_options,
             "resume": request.resume,
         });
         if !request.mcp_servers.is_empty() {
@@ -271,6 +306,111 @@ impl Harness for CursorHarness {
         })
         .boxed())
     }
+}
+
+/// The fallback pair when discovery fails: well-known ids that resolve as
+/// aliases in Cursor's real catalog, so a degraded picker still runs.
+fn static_models() -> Vec<Model> {
+    vec![
+        Model {
+            id: "auto".into(),
+            label: "Auto".into(),
+            description: Some("Cursor picks the model per request".into()),
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        },
+        Model {
+            id: "composer-2.5".into(),
+            label: "Composer 2.5".into(),
+            description: Some("Cursor's own fast coding model".into()),
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        },
+    ]
+}
+
+/// `Cursor.models.list()` items → picker models. Item shape (1.0.28
+/// `options.d.ts` `ModelListItem`): `{id, displayName, description?,
+/// aliases?, parameters?: [{id, displayName?, values: [{value,
+/// displayName?}]}], variants?: [{params: [{id, value}], isDefault?}]}`.
+fn map_model_items(items: &Value) -> Vec<Model> {
+    let str_of = |v: &Value, key: &str| -> Option<String> {
+        v.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    items
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            let id = str_of(item, "id")?;
+            // `default` is a bare alias twin of the parameterized Auto entry
+            // (`auto-smart`) — two "Auto" rows would just confuse the picker.
+            if id == "default" {
+                return None;
+            }
+            let label = str_of(item, "displayName").unwrap_or_else(|| id.clone());
+            // A variant marked default carries the catalog's preferred value
+            // for each parameter (e.g. Auto's optimize_for=balanced).
+            let default_variant = item
+                .get("variants")
+                .and_then(Value::as_array)
+                .map(|a| a.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .find(|v| v.get("isDefault").and_then(Value::as_bool) == Some(true))
+                .and_then(|v| v.get("params").and_then(Value::as_array).cloned())
+                .unwrap_or_default();
+            let options: Vec<ModelOption> = item
+                .get("parameters")
+                .and_then(Value::as_array)
+                .map(|a| a.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|p| {
+                    let pid = str_of(p, "id")?;
+                    let choices: Vec<ModelOptionChoice> = p
+                        .get("values")
+                        .and_then(Value::as_array)
+                        .map(|a| a.as_slice())
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|c| {
+                            let cid = str_of(c, "value")?;
+                            Some(ModelOptionChoice {
+                                label: str_of(c, "displayName").unwrap_or_else(|| cid.clone()),
+                                id: cid,
+                            })
+                        })
+                        .collect();
+                    if choices.is_empty() {
+                        return None;
+                    }
+                    let default_choice = default_variant
+                        .iter()
+                        .find(|dv| dv.get("id").and_then(Value::as_str) == Some(pid.as_str()))
+                        .and_then(|dv| str_of(dv, "value"))
+                        .unwrap_or_else(|| choices[0].id.clone());
+                    Some(ModelOption {
+                        label: str_of(p, "displayName").unwrap_or_else(|| pid.clone()),
+                        id: pid,
+                        choices,
+                        default_choice,
+                    })
+                })
+                .collect();
+            Some(Model {
+                id,
+                label,
+                description: str_of(item, "description"),
+                reasoning_levels: Vec::new(),
+                options,
+            })
+        })
+        .collect()
 }
 
 async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<String>) {

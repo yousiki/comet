@@ -4608,9 +4608,6 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
-        let space_remote = space
-            .as_ref()
-            .is_some_and(|s| local_device_id.as_deref() != Some(s.device_id.as_str()));
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
         // back into the chat's stash.
@@ -4727,6 +4724,12 @@ impl Composer {
                 }
                 .unwrap_or_else(|| ".".to_string());
                 let mut worktree_cwd: Option<String> = None;
+                // Fresh-worktree plans ride the QUEUED Run command (a
+                // WorktreeSpec the HOST materializes at drain time) instead of
+                // a blocking CreateWorktree relay RPC here: the RPC had no
+                // timeout, so a lost relay frame wedged the send on "Sending…"
+                // forever while the session ran remotely anyway (2026-08-18).
+                let mut run_worktree: Option<zeron_proto::WorktreeSpec> = None;
                 // The picked ref rides createChat so the session footer names
                 // it from the first frame (it read "Select ref" until the
                 // host's diff reconciler got around to stamping the branch).
@@ -4742,29 +4745,17 @@ impl Composer {
                             chat_branch = Some(branch.clone());
                         }
                         crate::pickers::CheckoutPlan::NewWorktree { base } => {
+                            // Footer shows the base until the host stamps the
+                            // actual zeron/<name> branch post-creation. cwd
+                            // stays the repo folder — an old host that doesn't
+                            // know the spec degrades to the main checkout
+                            // instead of failing the run.
                             chat_branch = base.clone();
                             if let (Some(repo_path), Some(base)) = (&space_path, base) {
-                                let mut params = serde_json::json!({
-                                    "repoPath": repo_path,
-                                    "branch": base,
+                                run_worktree = Some(zeron_proto::WorktreeSpec {
+                                    repo_path: repo_path.clone(),
+                                    base: base.clone(),
                                 });
-                                if space_remote
-                                    && let Some(object) = params.as_object_mut()
-                                {
-                                    object.insert(
-                                        "targetDeviceId".into(),
-                                        serde_json::Value::String(device_id.clone()),
-                                    );
-                                }
-                                let value = engine
-                                    .client()
-                                    .call(methods::CREATE_WORKTREE, params)
-                                    .await
-                                    .map_err(|e| format!("Worktree failed: {e}"))?;
-                                let worktree: zeron_proto::Worktree = serde_json::from_value(value)
-                                    .map_err(|e| format!("Worktree reply malformed: {e}"))?;
-                                cwd = worktree.path.clone();
-                                worktree_cwd = Some(worktree.path);
                             }
                         }
                     }
@@ -4827,12 +4818,28 @@ impl Composer {
                 let mut content = text.clone();
                 let mut attachment_paths: Vec<String> = Vec::new();
                 if !staged.is_empty() {
+                    // Publish upload progress so the working label can read
+                    // "Uploading… N%" instead of an opaque "Sending…" while
+                    // the chunks cross the relay.
+                    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let total: u64 = staged.iter().map(|a| a.bytes().len() as u64).sum();
+                    {
+                        let progress = progress.clone();
+                        this.update(cx, |composer, cx| {
+                            composer.state.update(cx, |s, cx| {
+                                s.begin_upload_progress(total, progress);
+                                cx.notify();
+                            });
+                        })
+                        .ok();
+                    }
                     for att in &staged {
                         match attachments::upload_attachment(
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
                             att,
+                            Some(progress.clone()),
                         )
                         .await
                         {
@@ -4915,6 +4922,7 @@ impl Composer {
                             resume: None,
                             attachments: attachment_paths,
                             mcp_servers: Vec::new(),
+                            worktree: run_worktree,
                         },
                         message_id: message_id.clone(),
                     }
@@ -4932,6 +4940,9 @@ impl Composer {
             .await;
             this.update(cx, |composer, cx| {
                 composer.sending = false;
+                composer
+                    .state
+                    .update(cx, |s, _| s.end_upload_progress());
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
                     // draft, staged files back in the chat's stash.

@@ -42,6 +42,7 @@ fn request(prompt: &str) -> RunRequest {
         auto_approve: true,
         attachments: Vec::new(),
         mcp_servers: Vec::new(),
+        worktree: None,
         resume: None,
     }
 }
@@ -574,6 +575,13 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
     assert!(hermes.reasoning_levels().is_empty());
 
+    let opencode = AcpHarness::opencode();
+    assert_eq!(opencode.id(), HarnessId::Opencode);
+    assert_eq!(opencode.display_name(), "OpenCode");
+    assert!(opencode.supports_steering());
+    assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
+    assert!(opencode.reasoning_levels().is_empty());
+
     let pi = AcpHarness::pi();
     assert_eq!(pi.id(), HarnessId::Pi);
     assert_eq!(pi.display_name(), "Pi");
@@ -672,4 +680,116 @@ async fn stale_prompt_complete_never_settles_a_newer_turn() {
         input_tokens: 9,
         output_tokens: 4
     }));
+}
+
+#[tokio::test]
+async fn grok_subagent_lifecycle_tails_the_disk_transcript_into_tagged_events() {
+    // The child session's chat_history.jsonl, one level under the sessions
+    // root exactly like grok's `<root>/<urlencoded-cwd>/<session-id>/` layout
+    // (entry shapes captured from a real 1.0.4 run).
+    let tmp = tempfile::tempdir().unwrap();
+    let child_dir = tmp.path().join("%2Ftmp").join("sub-1");
+    std::fs::create_dir_all(&child_dir).unwrap();
+    let history = child_dir.join("chat_history.jsonl");
+    std::fs::write(
+        &history,
+        concat!(
+            "{\"type\":\"system\",\"content\":\"You are a Grok Build subagent\"}\n",
+            "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Count the files.\"}],\"prompt_index\":0}\n",
+            "{\"type\":\"reasoning\",\"id\":\"rs-1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Listing the directory.\"}],\"encrypted_content\":\"opaque\",\"status\":\"completed\"}\n",
+            "{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call-1-0\",\"name\":\"run_terminal_command\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}],\"model_id\":\"grok-4.6-build\"}\n",
+            "{\"type\":\"tool_result\",\"tool_call_id\":\"call-1-0\",\"content\":\"a.txt\\nb.txt\"}\n",
+        ),
+    )
+    .unwrap();
+    // A mid-run append: the tail must pick it up incrementally, before the
+    // wire's subagent_finished lands (the fake agent sleeps 1.4s).
+    let append_to = history.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(append_to)
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            "{\"type\":\"assistant\",\"content\":\"two files\",\"model_id\":\"grok-4.6-build\"}"
+        )
+        .unwrap();
+    });
+
+    let (controls, _steer, _token) = controls();
+    let harness = harness().with_sessions_root(tmp.path());
+    let events = run_to_end(&harness, request("scenario:subagent"), controls).await;
+
+    // The spawn chip is named after the task, claude-driver parity.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
+                if id == "sp1" && name == "Agent: Count files"
+        )),
+        "{events:?}"
+    );
+
+    // Tagged transcript: every wrapped event attributes to the spawn chip,
+    // and the disk entries surfaced in order — reasoning, the typed tool
+    // call + result, the mid-run append — then the lifecycle Done.
+    let tagged: Vec<&AgentEvent> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Subagent {
+                parent_tool_use_id,
+                event,
+            } => {
+                assert_eq!(parent_tool_use_id, "sp1", "{events:?}");
+                Some(event.as_ref())
+            }
+            _ => None,
+        })
+        .collect();
+    let pos = |pred: &dyn Fn(&AgentEvent) -> bool| tagged.iter().position(|e| pred(e));
+    let reasoning = pos(&|e| {
+        matches!(e, AgentEvent::ReasoningDelta { text } if text.starts_with("Listing the directory."))
+    })
+    .expect("reasoning entry tailed");
+    let tool = pos(&|e| {
+        matches!(
+            e,
+            AgentEvent::ToolCall { id, call: zeron_proto::ToolCall::Exec { command } }
+                if id == "call-1-0" && command == "ls"
+        )
+    })
+    .expect("tool call typed from disk");
+    let result = pos(&|e| {
+        matches!(
+            e,
+            AgentEvent::ToolResult { id, is_error: false, output: Some(o), .. }
+                if id == "call-1-0" && o.contains("a.txt")
+        )
+    })
+    .expect("tool result tailed");
+    let text =
+        pos(&|e| matches!(e, AgentEvent::TextDelta { text } if text.starts_with("two files")))
+            .expect("mid-run append tailed");
+    let done = pos(&|e| {
+        matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )
+    })
+    .expect("tagged done from subagent_finished");
+    assert!(
+        reasoning < tool && tool < result && result < text && text < done,
+        "{tagged:?}"
+    );
+    // The nested spawned update (another parent session) bound nothing —
+    // every wrapped event attributed to sp1 (the assert in the filter) — and
+    // the parent's own turn settled cleanly with its single untagged Done.
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }

@@ -749,6 +749,16 @@ fn fixed_synced_profile_gate(
     }
 }
 
+/// A send's attachment-upload leg in flight. `done` is bumped by the upload
+/// task per completed chunk (binary bytes); the working label reads it every
+/// paint (the spinner already animates each frame), so no notify plumbing is
+/// needed. A slow upload renders as "Uploading… N%" instead of a
+/// hang-indistinguishable "Sending…" (2026-08-18 user report).
+pub struct UploadProgress {
+    done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total: u64,
+}
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
@@ -794,6 +804,8 @@ pub struct AppState {
     /// Send-in-flight overlay per chat id: a queued doc command the host
     /// hasn't executed yet (see [`Self::begin_pending_send`]).
     pending_sends: HashMap<String, PendingSend>,
+    /// The in-flight send's attachment upload, when it has one.
+    upload_progress: Option<UploadProgress>,
     /// Written by the changes pane, read by the composer.
     diff_comments: HashMap<String, Vec<DiffComment>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
@@ -842,6 +854,7 @@ impl AppState {
             transcript: Vec::new(),
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
+            upload_progress: None,
             diff_comments: HashMap::new(),
             local_device_id: None,
             update: None,
@@ -1131,6 +1144,36 @@ impl AppState {
         }
     }
 
+    /// Attachment upload starting: expose its progress to the working label.
+    pub fn begin_upload_progress(
+        &mut self,
+        total: u64,
+        done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.upload_progress = Some(UploadProgress { done, total });
+    }
+
+    /// Upload leg over (success or failure) — the label goes back to plain
+    /// send/working wording.
+    pub fn end_upload_progress(&mut self) {
+        self.upload_progress = None;
+    }
+
+    /// Percent of the in-flight attachment upload, clamped to 99 — the last
+    /// point belongs to the commit + queue, so "100% but still spinning"
+    /// never shows. `None` when no upload is in flight (or it's empty).
+    pub fn upload_progress_percent(&self) -> Option<u8> {
+        let progress = self.upload_progress.as_ref()?;
+        if progress.total == 0 {
+            return None;
+        }
+        let done = progress
+            .done
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(progress.total);
+        Some(((done * 100) / progress.total).min(99) as u8)
+    }
+
     /// Is a send still in flight for this chat (unacked, inside the TTL)?
     pub fn send_pending(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
         self.pending_sends.get(chat_id).is_some_and(|p| {
@@ -1387,6 +1430,7 @@ impl AppState {
         self.diff_comments.clear();
         self.sub_watch_tasks.clear();
         self.sub_transcripts.clear();
+        self.upload_progress = None;
         self.local_device_id = None;
         self.update = None;
         self.profile_cache_namespace =
@@ -2763,6 +2807,33 @@ mod tests {
 
         state.apply_devices(vec![device("local", "José's MacBook Pro")]);
         assert_eq!(state.device_name("local"), Some("José's MacBook Pro"));
+    }
+
+    #[test]
+    fn upload_progress_percent_clamps_and_clears() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut s = AppState::new();
+        assert_eq!(s.upload_progress_percent(), None);
+
+        let done = Arc::new(AtomicU64::new(0));
+        s.begin_upload_progress(1_000, done.clone());
+        assert_eq!(s.upload_progress_percent(), Some(0));
+        done.store(430, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(43));
+        // The last point belongs to commit+queue — never show a stuck 100%.
+        done.store(1_000, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(99));
+        // Overshoot (b64 padding rounding) stays clamped.
+        done.store(1_002, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(99));
+
+        s.end_upload_progress();
+        assert_eq!(s.upload_progress_percent(), None);
+
+        // A zero-byte total renders as plain "Sending…", not a percent.
+        s.begin_upload_progress(0, Arc::new(AtomicU64::new(0)));
+        assert_eq!(s.upload_progress_percent(), None);
     }
 
     #[test]

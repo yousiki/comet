@@ -6,6 +6,14 @@
 emit() { printf '%s\n' "$1"; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
+# Models mode (argv, no stdin protocol): one catalog frame, real 1.0.28
+# shapes — parameterized Auto + its bare `default` alias twin (skipped by the
+# harness) + a plain model.
+if [ "$1" = "models" ]; then
+  emit '{"ev":"models","items":[{"id":"auto-smart","displayName":"Auto","parameters":[{"id":"optimize_for","displayName":"Optimize For","values":[{"value":"intelligence","displayName":"Intelligence"},{"value":"balanced","displayName":"Balance"},{"value":"cost","displayName":"Cost"}]}],"variants":[{"params":[{"id":"optimize_for","value":"balanced"}],"displayName":"Auto","isDefault":true}]},{"id":"default","displayName":"Auto","aliases":["auto"]},{"id":"claude-fable-5","displayName":"Claude Fable 5","description":"Anthropic frontier","parameters":[{"id":"thinking","values":[{"value":"enabled"},{"value":"disabled"}]}]}]}'
+  exit 0
+fi
+
 read -r first || exit 1
 case "$first" in
 *'"op":"run"'*) ;;

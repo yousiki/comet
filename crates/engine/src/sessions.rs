@@ -718,6 +718,7 @@ impl SessionsEngine {
                             attachments: Vec::new(),
                             mcp_servers: Vec::new(),
                             resume: None,
+                            worktree: None,
                         })
                     });
                 let Some(mut request) = request else {

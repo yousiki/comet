@@ -296,6 +296,22 @@ pub struct FolderListing {
     pub truncated: bool,
 }
 
+/// A browse root beyond home: a mounted drive/volume (or the system root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveEntry {
+    /// Display name (volume label / mount folder name; "System" for `/`).
+    pub name: String,
+    /// Absolute mount point.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveListing {
+    pub drives: Vec<DriveEntry>,
+}
+
 /// A workspace-relative file or directory returned by `SearchFiles`.
 /// Contents deliberately never cross this boundary: mentioning a path leaves
 /// the harness to read it through its normal workspace tools when needed.

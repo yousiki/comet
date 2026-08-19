@@ -1189,7 +1189,7 @@ impl WorkspaceHostInner {
 /// checkout (`.git` is a directory), a non-repo folder, or any other layout
 /// (bare-repo worktrees have no `<root>` working copy to attribute to). Pure
 /// fs reads — no git subprocess; this runs on the synchronous claim path.
-fn linked_worktree_root(path: &std::path::Path) -> Option<String> {
+pub(crate) fn linked_worktree_root(path: &std::path::Path) -> Option<String> {
     let gitfile = path.join(".git");
     if !std::fs::metadata(&gitfile).ok()?.is_file() {
         return None;

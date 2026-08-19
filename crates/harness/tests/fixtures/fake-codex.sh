@@ -27,6 +27,12 @@ has "$line" '"method":"initialized"' || exit 1
 # ---- thread start / resume -------------------------------------------------
 read -r line || exit 1
 thread_line="$line"
+if has "$line" '"method":"skills/list"'; then
+  # Command discovery probe: answer with two cwd groups sharing one skill
+  # (dedupe by name) and settle; no thread ever starts.
+  emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"cwd\":\"/w\",\"skills\":[{\"name\":\"imagegen\",\"description\":\"Model-facing paragraph about images.\",\"interface\":{\"displayName\":\"Image Gen\",\"shortDescription\":\"Generate or edit images\"}},{\"name\":\"bare\",\"description\":\"No interface block\"}]},{\"cwd\":\"/x\",\"skills\":[{\"name\":\"imagegen\",\"description\":\"dupe\",\"interface\":{\"shortDescription\":\"dupe\"}}]}]}}"
+  exec sleep 30
+fi
 if has "$line" '"method":"thread/resume"'; then
   if has "$line" '"threadId":"resume-fail"'; then
     # Missing/foreign rollout: reject, expect the fresh-start fallback.

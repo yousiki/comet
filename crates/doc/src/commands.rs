@@ -333,6 +333,7 @@ mod tests {
             auto_approve: false,
             attachments: Vec::new(),
             mcp_servers: Vec::new(),
+            worktree: None,
             resume: None,
         }
     }

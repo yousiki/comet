@@ -44,6 +44,7 @@ fn request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
         mcp_servers: Vec::new(),
     }
@@ -785,4 +786,40 @@ async fn live_real_app_server_single_turn() {
             ..
         })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Slash-command discovery
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn commands_come_from_skills_list() {
+    let h = harness();
+    let commands = h.commands().await.expect("discovery succeeds");
+    assert_eq!(
+        commands.len(),
+        2,
+        "same-name skills across cwd groups dedupe: {commands:?}"
+    );
+    assert_eq!(commands[0].name, "imagegen");
+    assert_eq!(
+        commands[0].description, "Generate or edit images",
+        "interface.shortDescription wins over the model-facing paragraph"
+    );
+    assert_eq!(commands[1].name, "bare");
+    assert_eq!(
+        commands[1].description, "No interface block",
+        "top-level description is the fallback"
+    );
+    assert_eq!(h.commands().await.expect("cache hit"), commands);
+}
+
+/// Live smoke against the real CLI: `cargo test -p zeron-harness --test
+/// codex -- --ignored live_commands`.
+#[tokio::test]
+#[ignore]
+async fn live_commands_discovery() {
+    let h = CodexHarness::new();
+    let commands = h.commands().await.expect("live discovery");
+    eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
 }
