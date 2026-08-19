@@ -361,6 +361,16 @@ enum MutateParams {
     DeleteChat { chat_id: String },
     #[serde(rename_all = "camelCase")]
     RenameDevice { device_id: String, name: String },
+    /// Hard delete a retired device: cascades to its spaces and every chat it
+    /// hosts. A live device re-registers on its next boot (this is cleanup,
+    /// not a kick); the local device is refused — use SetDeviceShared.
+    #[serde(rename_all = "camelCase")]
+    DeleteDevice { device_id: String },
+    /// Register/withdraw THIS device in the profile's registry (persisted
+    /// per profile). Off = guest mode: no device row, no presence, never a
+    /// host — spaces and chats it created stay.
+    #[serde(rename_all = "camelCase")]
+    SetDeviceShared { shared: bool },
     /// Synced seen marker (LWW + monotonic guard): clears the "completed"
     /// badge on every device. `at` is epoch ms; default = now.
     #[serde(rename_all = "camelCase")]
@@ -774,6 +784,27 @@ impl EngineRpc {
                 .rename_device(&device_id, &name)
                 .map_err(failed)
                 .map(drop),
+            MutateParams::DeleteDevice { device_id } => {
+                let deleted = self.workspace.delete_device(&device_id).map_err(failed)?;
+                // Same teardown as DeleteSpace: rows are already tombstoned;
+                // interrupt any runs we were driving for the removed chats and
+                // drop their doc-host handles.
+                let sessions = self.sessions.clone();
+                let doc_host = self.doc_host.clone();
+                let chat_ids = deleted.chat_ids;
+                tokio::spawn(async move {
+                    for chat_id in chat_ids {
+                        if let Err(err) = sessions.interrupt(&chat_id).await {
+                            tracing::debug!(chat = %chat_id, error = %err, "deleteDevice interrupt skipped");
+                        }
+                        doc_host.purge_chat(&chat_id);
+                    }
+                });
+                Ok(())
+            }
+            MutateParams::SetDeviceShared { shared } => {
+                self.workspace.set_device_shared(shared).map_err(failed)
+            }
             MutateParams::MarkChatSeen { chat_id, at } => {
                 let at = at
                     .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)

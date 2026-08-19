@@ -592,6 +592,77 @@ fn delete_space_cascades_and_converges() {
 }
 
 #[test]
+fn delete_device_cascades_and_converges() {
+    let mut a = RegistryDoc::new("dev-a");
+    a.upsert_device(&device("dev-a", "Mine")).unwrap();
+    a.upsert_device(&device("dev-b", "Theirs")).unwrap();
+    a.upsert_space(&space("sp-b", "dev-b", "/tmp/theirs")).unwrap();
+    a.upsert_space(&space("sp-a", "dev-a", "/tmp/mine")).unwrap();
+    // In dev-b's space, hosted by dev-b — dies with the space.
+    let mut spaced = chat("chat-spaced", "dev-b");
+    spaced.space_id = Some("sp-b".into());
+    // Space-less but hosted by dev-b — dies with the host.
+    let projectless = chat("chat-projectless", "dev-b");
+    // dev-a's chat survives.
+    let mut mine = chat("chat-mine", "dev-a");
+    mine.space_id = Some("sp-a".into());
+    a.upsert_chat(&spaced).unwrap();
+    a.upsert_chat(&projectless).unwrap();
+    a.upsert_chat(&mine).unwrap();
+    a.upsert_session(&session("chat-spaced", "dev-b", SessionStatus::Working))
+        .unwrap();
+    let mut b = RegistryDoc::new("dev-b");
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+
+    let deleted = a.delete_device("dev-b").unwrap();
+    assert!(deleted.existed);
+    let mut chat_ids = deleted.chat_ids.clone();
+    chat_ids.sort();
+    assert_eq!(chat_ids, vec!["chat-projectless", "chat-spaced"]);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+
+    for ws in [&a, &b] {
+        let state = ws.read_all().unwrap();
+        assert_eq!(
+            state.devices.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            vec!["dev-a"]
+        );
+        assert_eq!(
+            state.spaces.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["sp-a"]
+        );
+        assert_eq!(
+            state.chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["chat-mine"]
+        );
+        assert!(state.sessions.is_empty());
+    }
+    let again = b.delete_device("dev-b").unwrap();
+    assert!(!again.existed);
+    assert!(again.chat_ids.is_empty());
+}
+
+#[test]
+fn remove_device_row_leaves_spaces_and_chats() {
+    let mut a = RegistryDoc::new("dev-a");
+    a.upsert_device(&device("dev-a", "Mine")).unwrap();
+    a.upsert_space(&space("sp-a", "dev-a", "/tmp/mine")).unwrap();
+    let mut mine = chat("chat-mine", "dev-a");
+    mine.space_id = Some("sp-a".into());
+    a.upsert_chat(&mine).unwrap();
+
+    a.remove_device_row("dev-a");
+    assert!(a.read_devices().unwrap().is_empty());
+    assert_eq!(a.read_spaces().unwrap().len(), 1);
+    assert_eq!(a.read_chats().unwrap().len(), 1);
+    // A later boot re-registers: newer clocks beat the tombstone.
+    a.upsert_device(&device("dev-a", "Back")).unwrap();
+    assert_eq!(a.read_devices().unwrap().len(), 1);
+}
+
+#[test]
 fn persistence_round_trips_rows_pending_and_cursor() {
     let mut doc = RegistryDoc::new("dev-a");
     doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();

@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use chrono::Utc;
 use tokio::sync::watch;
 
-use zeron_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
+use zeron_doc::{DeletedDevice, DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
 use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
 use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
 
@@ -35,6 +35,10 @@ use crate::{EngineError, now_ms};
 /// Legacy Loro workspace snapshot row — now only read once, as the migration
 /// source for the registry seed. Kept on disk for rollback.
 pub const WORKSPACE_DOC_ID: &str = "workspace2";
+/// Per-profile device-share opt-out marker (DocsStore row, value `b"0"`).
+/// Present = this device must NOT register itself in this profile's registry:
+/// no device row, no presence beats, never a host. Absent = shared (default).
+const DEVICE_SHARE_DOC_ID: &str = "device-share1";
 /// Legacy (pre-spaces) snapshot row — best-effort deleted on open.
 const LEGACY_WORKSPACE_DOC_ID: &str = "workspace";
 /// Org used when none is configured (matches the edge's dev-mode `user@org` bearers).
@@ -169,6 +173,12 @@ struct WorkspaceHostInner {
     /// claiming a foreign chat before the first sync would double-execute its
     /// commands. Local-only (no edge) hosts never wait.
     synced_once: std::sync::atomic::AtomicBool,
+    /// Device-share state for THIS profile (persisted via
+    /// [`DEVICE_SHARE_DOC_ID`]). False = guest mode: no device row, no
+    /// presence beats, `is_host`/claims always refuse — the org can see this
+    /// user's writes but cannot address this machine. Arc: the HTTP registry
+    /// transport holds a clone to gate its `?beat=1` presence side effect.
+    shared: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -237,29 +247,22 @@ impl WorkspaceHost {
         // Destructive-break hygiene: the pre-spaces row stays unreachable.
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
 
-        // Boot: upsert our own device row. A user-set name (RenameDevice is LWW from
-        // any device) survives restarts. The old fallback sentinel is repaired with
-        // the platform-resolved name because it was never a user-selected name.
-        let now = Utc::now();
+        // Boot: upsert our own device row — unless sharing is opted out for
+        // this profile, in which case any row a previously-shared boot left
+        // behind is withdrawn instead (self-healing across upgrades/restarts).
+        let shared = !matches!(
+            store.load_snapshot(DEVICE_SHARE_DOC_ID),
+            Ok(Some(v)) if v == b"0"
+        );
         let existing = doc
             .read_devices()?
             .into_iter()
             .find(|d| d.id == config.device_id);
-        doc.upsert_device(&Device {
-            id: config.device_id.clone(),
-            name: device_name_on_boot(
-                existing.as_ref().map(|device| device.name.as_str()),
-                &config.device_name,
-            ),
-            platform: config.platform.clone(),
-            last_seen_at: Some(now),
-            // First registration stamps `createdAt`; restarts keep the original
-            // (the Devices page "Added …" fragment).
-            created_at: existing.and_then(|d| d.created_at).or(Some(now)),
-            // Every boot restamps the running binary's version (fleet staleness
-            // on the Devices page; workspace version — same for every crate).
-            version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        })?;
+        if shared {
+            doc.upsert_device(&own_device_row(&config, existing.as_ref(), Utc::now()))?;
+        } else if existing.is_some() {
+            doc.remove_device_row(&config.device_id);
+        }
 
         let state = doc.read_all()?;
         let (chats_tx, _) = watch::channel(state.chats);
@@ -283,6 +286,7 @@ impl WorkspaceHost {
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 synced_once: std::sync::atomic::AtomicBool::new(false),
+                shared: Arc::new(std::sync::atomic::AtomicBool::new(shared)),
             }),
         };
         // Persist immediately: after this boot the migration source is never
@@ -325,6 +329,7 @@ impl WorkspaceHost {
         let org_id = self.inner.config.org_id.clone();
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
+        let shared = self.inner.shared.clone();
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
             let mut wake = zeron_sync::wake::subscribe();
@@ -352,7 +357,7 @@ impl WorkspaceHost {
                         reg.clone(),
                         &device_id,
                         tuning,
-                        Arc::new(WsDerivedRegistryTransport::new(url.clone())),
+                        Arc::new(WsDerivedRegistryTransport::new(url.clone(), shared.clone())),
                     )
                     .await
                 } else {
@@ -362,7 +367,9 @@ impl WorkspaceHost {
                 match result {
                     Ok(client) => {
                         let client = Arc::new(client);
-                        client.set_presence(now_ms());
+                        if shared.load(std::sync::atomic::Ordering::Acquire) {
+                            client.set_presence(now_ms());
+                        }
                         // Subscribe before reading the sticky readiness bit:
                         // if a fast HTTP pull/WS hello lands between the two,
                         // either `has_synced` observes it or `Synced` is queued.
@@ -603,6 +610,12 @@ impl WorkspaceHost {
     /// unsynced device believing it hosts a foreign chat would double-execute
     /// its commands. Read errors are likewise no longer treated as ownership.
     pub fn is_host(&self, chat_id: &str) -> bool {
+        // Guest mode: an unshared device never hosts in this profile, even for
+        // chats whose row still names it — org members must not be able to
+        // execute here by pointing a chat at our device id.
+        if !self.device_shared() {
+            return false;
+        }
         match self.read(|doc| doc.chat(chat_id)) {
             Ok(Some(chat)) => chat.device_id == self.inner.config.device_id,
             Ok(None) => self.ownership_ready(),
@@ -639,6 +652,11 @@ impl WorkspaceHost {
     /// racing ahead of the run command) leaves `spaceId` unset; the row is
     /// invisible to the UI until a spaced claim/create lands.
     pub fn claim_chat(&self, chat_id: &str, cwd: Option<&str>) -> Result<(), EngineError> {
+        if !self.device_shared() {
+            return Err(EngineError::Other(
+                "device sharing is off for this workspace".into(),
+            ));
+        }
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(());
         }
@@ -797,6 +815,11 @@ impl WorkspaceHost {
                 ));
             }
         };
+        if host_device == self.inner.config.device_id && !self.device_shared() {
+            return Err(EngineError::Other(
+                "device sharing is off for this workspace".into(),
+            ));
+        }
         self.mutate(|doc| {
             doc.upsert_chat(&Chat {
                 id: chat_id.to_string(),
@@ -851,6 +874,11 @@ impl WorkspaceHost {
         name: Option<String>,
         git_detected: bool,
     ) -> Result<(), EngineError> {
+        if device_id == self.inner.config.device_id && !self.device_shared() {
+            return Err(EngineError::Other(
+                "device sharing is off for this workspace".into(),
+            ));
+        }
         let spaces = self.read(|doc| doc.read_spaces())?;
         if spaces
             .iter()
@@ -997,6 +1025,60 @@ impl WorkspaceHost {
 
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.rename_device(device_id, name))?)
+    }
+
+    /// Whether this device registers itself (and hosts) in this profile.
+    pub fn device_shared(&self) -> bool {
+        self.inner.shared.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Flip device sharing for this profile: persist the choice, then register
+    /// (upsert our row) or withdraw (tombstone our row — spaces and chats stay;
+    /// only registry presence and host addressability are withdrawn).
+    pub fn set_device_shared(&self, shared: bool) -> Result<(), EngineError> {
+        if shared {
+            self.inner.store.delete_snapshot(DEVICE_SHARE_DOC_ID)?;
+        } else {
+            self.inner.store.save_snapshot(DEVICE_SHARE_DOC_ID, b"0")?;
+        }
+        let was = self
+            .inner
+            .shared
+            .swap(shared, std::sync::atomic::Ordering::AcqRel);
+        if shared == was {
+            return Ok(());
+        }
+        let device_id = self.inner.config.device_id.clone();
+        if shared {
+            let existing = self
+                .read(|doc| doc.read_devices())?
+                .into_iter()
+                .find(|d| d.id == device_id);
+            self.mutate(|doc| {
+                doc.upsert_device(&own_device_row(
+                    &self.inner.config,
+                    existing.as_ref(),
+                    Utc::now(),
+                ))
+            })?;
+            self.inner.presence_tick();
+        } else {
+            self.mutate(|doc| doc.remove_device_row(&device_id));
+        }
+        Ok(())
+    }
+
+    /// Cascade-delete a device row and everything it owns (spaces → chats →
+    /// session rows). Retired-device cleanup: a LIVE device re-upserts its row
+    /// on next boot, so deletion never kicks a running peer. Refuses the local
+    /// device — turning off sharing is the way to withdraw this machine.
+    pub fn delete_device(&self, device_id: &str) -> Result<DeletedDevice, EngineError> {
+        if device_id == self.inner.config.device_id {
+            return Err(EngineError::Other(
+                "cannot delete this device; turn off device sharing instead".into(),
+            ));
+        }
+        Ok(self.mutate(|doc| doc.delete_device(device_id))?)
     }
 
     // ── git metadata (diff-sync host writes) ────────────────────────────────
@@ -1177,7 +1259,11 @@ impl WorkspaceHostInner {
     }
 
     /// Presence heartbeat — a memory-only frame on the room, never a row write.
+    /// Unshared devices stay silent: no row, no heartbeat, no footprint.
     fn presence_tick(&self) {
+        if !self.shared.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         if let Some(room) = lock(&self.room).as_ref() {
             room.set_presence(now_ms());
         }
@@ -1362,6 +1448,32 @@ fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> Stri
         .to_string()
 }
 
+/// This device's registry row as a (re)registration writes it. A user-set name
+/// (RenameDevice is LWW from any device) survives restarts; the old fallback
+/// sentinel is repaired with the platform-resolved name because it was never a
+/// user-selected name.
+fn own_device_row(
+    config: &WorkspaceHostConfig,
+    existing: Option<&Device>,
+    now: chrono::DateTime<Utc>,
+) -> Device {
+    Device {
+        id: config.device_id.clone(),
+        name: device_name_on_boot(
+            existing.map(|device| device.name.as_str()),
+            &config.device_name,
+        ),
+        platform: config.platform.clone(),
+        last_seen_at: Some(now),
+        // First registration stamps `createdAt`; restarts keep the original
+        // (the Devices page "Added …" fragment).
+        created_at: existing.and_then(|d| d.created_at).or(Some(now)),
+        // Every boot restamps the running binary's version (fleet staleness
+        // on the Devices page; workspace version — same for every crate).
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+    }
+}
+
 /// Plain-HTTPS registry pull/push derived from the SAME WebSocket URL
 /// provider the dial uses (`wss://…/registry/{org}/ws?token=…&device=…`):
 /// swap the scheme, swap the `/ws` leaf for `/rows` or `/push`, keep the
@@ -1371,13 +1483,20 @@ fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> Stri
 struct WsDerivedRegistryTransport {
     url: Arc<dyn zeron_sync::UrlProvider>,
     client: reqwest::Client,
+    /// Live view of the host's device-share flag — unshared devices must not
+    /// leave presence beats through the HTTP path either.
+    shared: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WsDerivedRegistryTransport {
-    fn new(url: Arc<dyn zeron_sync::UrlProvider>) -> Self {
+    fn new(
+        url: Arc<dyn zeron_sync::UrlProvider>,
+        shared: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         Self {
             url,
             client: reqwest::Client::new(),
+            shared,
         }
     }
 
@@ -1409,11 +1528,13 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
     ) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
         let provider = self.url.clone();
         let client = self.client.clone();
+        let beat = self.shared.load(std::sync::atomic::Ordering::Acquire);
         Box::pin(async move {
             let mut u = Self::leaf_url(&provider, "rows").await?;
-            u.query_pairs_mut()
-                .append_pair("since", &since.to_string())
-                .append_pair("beat", "1");
+            u.query_pairs_mut().append_pair("since", &since.to_string());
+            if beat {
+                u.query_pairs_mut().append_pair("beat", "1");
+            }
             let resp = client
                 .get(u)
                 .send()

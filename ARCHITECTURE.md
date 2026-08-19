@@ -100,6 +100,8 @@ Two persistent doc kinds. When sync is enabled, session docs ride the chat2 row 
 
    Writer discipline: each device writes its own device and session-status rows, rows for chats it hosts, and git stamps for spaces it owns. Creates, renames, archives, and seen marks are LWW sets accepted from any device. `deleteSpace` tombstones the space and every chat/session row in it in one commit. Presence uses ephemeral room frames rather than durable heartbeat writes.
 
+   Device membership is opt-out per profile (`setDeviceShared`, Settings → Devices): an unshared device withdraws its device row, sends no presence beats, and refuses every host path (`is_host`, claims, createChat/createSpace targeting itself) — org members cannot execute on it, while the user still participates in foreign-hosted chats as a guest. `deleteDevice` is retired-device cleanup: one batch tombstones the device row, its spaces, and every chat it hosts; a live shared device simply re-registers on its next boot (deletion is not a kick — org membership is).
+
    *Why one registry and not N tiny docs:* the sidebar needs one subscription for the whole list (grouping, resort animations, unseen markers). Its rows contain indexes rather than transcripts, so one local snapshot and, when enabled, one room connection remain bounded and cheap.
 
 3. **Mirror layer** (`zeron-doc` crate) — Rust equivalent of loro-mirror: typed structs for the

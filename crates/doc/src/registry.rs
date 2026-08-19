@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
 
 use crate::schema::DocError;
-use crate::workspace::{DeletedSpace, WorkspaceState};
+use crate::workspace::{DeletedDevice, DeletedSpace, WorkspaceState};
 
 /// Row kinds — the four sidebar tables.
 pub const KIND_DEVICES: &str = "devices";
@@ -722,6 +722,51 @@ impl RegistryDoc {
             fields([("lastSeenAt", json!(at.timestamp_millis()))]),
         );
         Ok(true)
+    }
+
+    /// Tombstone ONE device row, nothing else — device-share opt-out. The
+    /// owning engine's spaces/chats stay; only the registry presence (and with
+    /// it host addressability) is withdrawn.
+    pub fn remove_device_row(&mut self, device_id: &str) {
+        self.delete_row_ops(&[(KIND_DEVICES, device_id)]);
+    }
+
+    /// Hard-delete a device and cascade to everything it owns: its spaces and
+    /// every chat it hosts (plus their session rows) in one batch. Retired-
+    /// device cleanup — a LIVE device re-upserts its row on next boot (newer
+    /// clocks beat the tombstone), so deletion never kicks a running peer.
+    pub fn delete_device(&mut self, device_id: &str) -> Result<DeletedDevice, DocError> {
+        let existed = self.row_exists(KIND_DEVICES, device_id);
+        let space_ids: Vec<String> = self
+            .read_spaces()?
+            .into_iter()
+            .filter(|s| s.device_id == device_id)
+            .map(|s| s.id)
+            .collect();
+        // Hosted chats (space-less ones included) and chats living in its spaces.
+        let chat_ids: Vec<String> = self
+            .read_chats()?
+            .into_iter()
+            .filter(|c| {
+                c.device_id == device_id
+                    || c.space_id
+                        .as_deref()
+                        .is_some_and(|sid| space_ids.iter().any(|s| s == sid))
+            })
+            .map(|c| c.id)
+            .collect();
+        let mut keys: Vec<(&str, &str)> =
+            Vec::with_capacity(chat_ids.len() * 2 + space_ids.len() + 1);
+        for chat_id in &chat_ids {
+            keys.push((KIND_CHATS, chat_id));
+            keys.push((KIND_SESSIONS, chat_id));
+        }
+        for space_id in &space_ids {
+            keys.push((KIND_SPACES, space_id));
+        }
+        keys.push((KIND_DEVICES, device_id));
+        self.delete_row_ops(&keys);
+        Ok(DeletedDevice { existed, chat_ids })
     }
 
     pub fn read_devices(&self) -> Result<Vec<Device>, DocError> {
