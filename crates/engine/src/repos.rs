@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use zeron_proto::{
     DriveEntry, FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage,
-    GitHistoryRef, GitHistoryRefKind, Repo, RepoRef, Worktree,
+    GitHistoryRef, GitHistoryRefKind, Repo, RepoRef, Worktree, WorkspaceFileText,
 };
 
 use crate::EngineError;
@@ -32,6 +32,9 @@ const PATH_EXISTS_TIMEOUT: Duration = Duration::from_secs(2);
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
 /// Cap on returned folder entries (bounds response size).
 const FOLDER_LIST_MAX_ENTRIES: usize = 500;
+/// Cap on one workspace-file read (file-explorer viewer). Matches the diff
+/// pane's per-file source cap — over it, contents are withheld, not partial.
+const WORKSPACE_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Cap on returned drives (a machine with more mounts than this is a server
 /// farm, not a laptop picking a project folder).
 const DRIVE_LIST_MAX_ENTRIES: usize = 50;
@@ -782,13 +785,19 @@ impl Repos {
 
     // ── ListFolders ─────────────────────────────────────────────────────────
 
-    /// One directory level (home by default): dotfiles hidden, directories first,
-    /// capped at [`FOLDER_LIST_MAX_ENTRIES`] with a `truncated` flag. The walk runs
-    /// in a spawned blocking task under a 6s wall-clock ceiling — a wedged path
-    /// (dead mount, permission-gated folder) fails this listing without blocking
-    /// anything else; the abandoned task unwinds on its own thread.
-    pub async fn list_folders(&self, path: Option<String>) -> Result<FolderListing, EngineError> {
-        self.list_folders_with(path, FOLDER_LIST_TIMEOUT, false)
+    /// One directory level (home by default): directories first, capped at
+    /// [`FOLDER_LIST_MAX_ENTRIES`] with a `truncated` flag. `show_hidden`
+    /// includes dotfiles (file-explorer tree; `.git` stays excluded) — the
+    /// folder picker passes false. The walk runs in a spawned blocking task
+    /// under a 6s wall-clock ceiling — a wedged path (dead mount,
+    /// permission-gated folder) fails this listing without blocking anything
+    /// else; the abandoned task unwinds on its own thread.
+    pub async fn list_folders(
+        &self,
+        path: Option<String>,
+        show_hidden: bool,
+    ) -> Result<FolderListing, EngineError> {
+        self.list_folders_with(path, show_hidden, FOLDER_LIST_TIMEOUT, false)
             .await
     }
 
@@ -853,6 +862,7 @@ impl Repos {
     pub async fn list_folders_with(
         &self,
         path: Option<String>,
+        show_hidden: bool,
         timeout: Duration,
         hang_for_test: bool,
     ) -> Result<FolderListing, EngineError> {
@@ -869,7 +879,7 @@ impl Repos {
                     // exit reclaims it) — the caller must hit its timeout.
                     std::thread::sleep(Duration::from_secs(3600));
                 }
-                let _ = tx.send(list_folders_blocking(&target));
+                let _ = tx.send(list_folders_blocking(&target, show_hidden));
             });
         if let Err(err) = spawned {
             return Err(EngineError::Other(format!("folder listing failed: {err}")));
@@ -899,6 +909,31 @@ impl Repos {
             )),
         }
     }
+
+    // ── ReadWorkspaceFile ───────────────────────────────────────────────────
+
+    /// One text file for the file-explorer viewer, jailed to `root` (a checkout
+    /// resolved by the RPC layer): symlinks and non-regular files are rejected,
+    /// both sides are canonicalized before the containment check, and files
+    /// over [`WORKSPACE_FILE_MAX_BYTES`] come back `truncated` with no text
+    /// (never partial). Same disposable worker + wall-clock ceiling as
+    /// `ListFolders` — a dead mount fails this read, not the runtime.
+    pub async fn read_workspace_file(
+        &self,
+        root: PathBuf,
+        path: PathBuf,
+    ) -> Result<WorkspaceFileText, EngineError> {
+        let worker = disposable_worker("workspace-file-read", move || {
+            read_workspace_file_blocking(&root, &path)
+        });
+        match tokio::time::timeout(FOLDER_LIST_TIMEOUT, worker).await {
+            Ok(Some(result)) => result,
+            Ok(None) => Err(EngineError::Other("file read worker exited".into())),
+            Err(_) => Err(EngineError::Other(
+                "file read timed out on the device".into(),
+            )),
+        }
+    }
 }
 
 struct CancelOnDrop(std::sync::Arc<AtomicBool>);
@@ -924,8 +959,9 @@ async fn disposable_worker<T: Send + 'static>(
 }
 
 /// The blocking walk: ONE readdir of the target; `is_repo` is a cheap `.git`
-/// existence probe per directory entry.
-fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
+/// existence probe per directory entry. `show_hidden` keeps dotfiles except
+/// `.git` itself (repository metadata, never a browse target).
+fn list_folders_blocking(target: &Path, show_hidden: bool) -> Result<FolderListing, EngineError> {
     let read = std::fs::read_dir(target).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
             EngineError::Other("Zeron doesn't have access to this folder on the device.".into())
@@ -935,7 +971,7 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
     let mut entries: Vec<FolderEntry> = Vec::new();
     for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
+        if name == ".git" || (!show_hidden && name.starts_with('.')) {
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -958,6 +994,54 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
         path: target.to_string_lossy().to_string(),
         entries,
         truncated,
+    })
+}
+
+/// The blocking jailed read (mirrors `diff_sync::read_worktree_source`):
+/// reject symlinks/non-regular files via `symlink_metadata`, canonicalize BOTH
+/// sides so `..` segments and symlinked parents can't escape, then cap.
+/// NUL bytes or invalid UTF-8 → `binary` with no text.
+fn read_workspace_file_blocking(root: &Path, path: &Path) -> Result<WorkspaceFileText, EngineError> {
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|e| EngineError::Other(format!("canonical workspace root: {e}")))?;
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let metadata = std::fs::symlink_metadata(&full)
+        .map_err(|e| EngineError::Other(format!("read file metadata: {e}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(EngineError::Other(
+            "path is not a regular workspace file".into(),
+        ));
+    }
+    let canonical = std::fs::canonicalize(&full)
+        .map_err(|e| EngineError::Other(format!("canonical file path: {e}")))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(EngineError::Other("file escapes the workspace".into()));
+    }
+    let size = metadata.len();
+    if size > WORKSPACE_FILE_MAX_BYTES {
+        return Ok(WorkspaceFileText {
+            text: None,
+            binary: false,
+            truncated: true,
+            size,
+        });
+    }
+    let bytes = std::fs::read(&canonical)
+        .map_err(|e| EngineError::Other(format!("read workspace file: {e}")))?;
+    let text = if bytes.contains(&0) {
+        None
+    } else {
+        String::from_utf8(bytes).ok()
+    };
+    Ok(WorkspaceFileText {
+        binary: text.is_none(),
+        truncated: false,
+        size,
+        text,
     })
 }
 

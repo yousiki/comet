@@ -322,6 +322,21 @@ pub struct FileSearchMatch {
     pub is_dir: bool,
 }
 
+/// One workspace file's contents for the read-only file-explorer viewer
+/// (`ReadWorkspaceFile`). Unlike `SearchFiles`, contents DO cross this
+/// boundary — the read is jailed to the chat/space checkout root and capped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileText {
+    /// UTF-8 contents; `None` when `binary` or `truncated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub binary: bool,
+    /// True when the file exceeds the read cap (contents withheld, not partial).
+    pub truncated: bool,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffFileSummary {
