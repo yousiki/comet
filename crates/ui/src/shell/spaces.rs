@@ -1089,8 +1089,7 @@ impl Shell {
         if rows.is_empty() {
             let text = flow.search.read(cx).text().to_string();
             if text.starts_with('/') || text.starts_with('~') {
-                if let Some(target) =
-                    crate::pickers::typed_path_target(&text, flow.home.as_deref())
+                if let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref())
                 {
                     self.add_space_descend(target, false, cx);
                 }
@@ -1665,12 +1664,9 @@ impl Shell {
                     (SharedString::from(d.name.clone()), mount, at_mount)
                 });
                 let folded = 1 + match (&drive_crumb, home.as_deref()) {
-                    (Some((_, mount, _)), _) => {
-                        mount.split('/').filter(|s| !s.is_empty()).count()
-                    }
+                    (Some((_, mount, _)), _) => mount.split('/').filter(|s| !s.is_empty()).count(),
                     (None, Some(h))
-                        if listing.path == h
-                            || listing.path.starts_with(&format!("{h}/")) =>
+                        if listing.path == h || listing.path.starts_with(&format!("{h}/")) =>
                     {
                         h.split('/').filter(|s| !s.is_empty()).count()
                     }
