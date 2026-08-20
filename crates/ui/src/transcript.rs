@@ -3067,14 +3067,33 @@ impl Transcript {
 
     /// Resolve the sender of a right-side (user-authored) row. `author` is
     /// the entry's `user_id`: `None` on optimistic echoes (always the local
-    /// user), an `agent:{chatId}` sentinel on agent-to-agent sends
+    /// user) and on rows written before sender attribution shipped, an
+    /// `agent:{chatId}` sentinel on agent-to-agent sends
     /// (`DocHost::send_to_session`), or an org member's opaque user id.
-    fn sender_for(&self, author: Option<&str>, cx: &Context<Self>) -> Sender {
+    fn sender_for(&self, author: Option<&str>, pending: bool, cx: &Context<Self>) -> Sender {
         let state = self.state.read(cx);
         let me = state.auth_user();
+        // The engine's fixed profile identity also names "me": local-profile
+        // engines have no auth user and author their rows with the profile
+        // UUID — without this arm the user's own messages wore a raw-UUID
+        // author chip.
+        let engine_user = state
+            .engine()
+            .and_then(|e| e.engine_info().profile)
+            .map(|p| p.user_id);
+        let is_me = match author {
+            // An author-less row is the local user only while it is our own
+            // optimistic echo; a committed row without attribution predates
+            // the feature and is UNKNOWN — claiming it as "me" would mark it
+            // as own-message in every member's UI at once.
+            None => pending,
+            Some(author) => {
+                me.is_some_and(|me| me.id == author) || engine_user.as_deref() == Some(author)
+            }
+        };
         // Local user: no chip (own messages stay unmarked); avatar and hue
         // seeded by email so the face matches the sidebar avatar.
-        if author.is_none() || me.is_some_and(|me| Some(me.id.as_str()) == author) {
+        if is_me {
             let seed = me
                 .map(|me| me.email.clone())
                 .or_else(|| author.map(str::to_string))
@@ -3085,7 +3104,14 @@ impl Transcript {
                 avatar: SenderAvatar::Blob(seed),
             };
         }
-        let author = author.expect("author is Some past the local-user arm");
+        let Some(author) = author else {
+            // Unknown pre-attribution author: neutral, unclaimed treatment.
+            return Sender {
+                display: None,
+                glow: crate::avatar::seed_color(""),
+                avatar: SenderAvatar::Blob(String::new()),
+            };
+        };
         // Agent-to-agent send: the source chat's harness brand mark. The glow
         // is seeded by the chat id, not the brand — stable even when the
         // source chat isn't in the local registry (another member's device).
@@ -3178,7 +3204,7 @@ impl Transcript {
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
-                let sender = self.sender_for(author.as_deref(), cx);
+                let sender = self.sender_for(author.as_deref(), pending, cx);
                 // Attachment thumbnails ride ABOVE the bubble, right-aligned
                 // (chat-view.tsx RowView: UserAttachmentStrip then the text
                 // HStack); image-only sends show no bubble at all.

@@ -29,7 +29,7 @@ use crate::changes::Changes;
 use crate::icons;
 use crate::markdown::render;
 use crate::popover::{self, Loadable};
-use crate::state::{AppState, call_with_legacy_method};
+use crate::state::{AppState, call_with_legacy_method, rpc_error_notice};
 use crate::theme::{self, Theme};
 
 /// Tree column width (Zed's project panel default neighborhood).
@@ -214,7 +214,7 @@ impl FileExplorer {
                         Ok(listing) => Loadable::Ready(listing),
                         Err(err) => Loadable::Error(err.to_string()),
                     },
-                    Err(err) => Loadable::Error(err.to_string()),
+                    Err(err) => Loadable::Error(rpc_error_notice(&err)),
                 };
                 this.listings.insert(path, slot);
                 this.rebuild_rows();
@@ -337,7 +337,7 @@ impl FileExplorer {
                         Ok(file) => this.set_file(path, file, cx),
                         Err(err) => this.file = Loadable::Error(err.to_string()),
                     },
-                    Err(err) => this.file = Loadable::Error(err.to_string()),
+                    Err(err) => this.file = Loadable::Error(rpc_error_notice(&err)),
                 }
                 cx.notify();
             })

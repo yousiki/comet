@@ -1933,13 +1933,15 @@ impl RpcService for EngineRpc {
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
                 // The terminal runs in the chat's checkout; a chat with no cwd (or
-                // no row yet) gets the home directory.
+                // no row yet) gets the home directory. Registry rows store
+                // project-less cwds as the literal "~" — expand before use.
                 let cwd = self
                     .registry
                     .chat(&p.chat_id)
                     .ok()
                     .flatten()
                     .and_then(|chat| chat.cwd)
+                    .map(|cwd| crate::repos::expand_home(&cwd))
                     .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
                 let session = self
                     .terminals
@@ -2060,12 +2062,16 @@ impl RpcService for EngineRpc {
             }
             methods::READ_ATTACHMENT_CHUNK => {
                 let p: ReadAttachmentChunkParams = parse_params(params)?;
-                // Path jail: the uploads dir plus every known chat working directory.
+                // Path jail: the uploads dir plus THIS device's chat working
+                // directories (the registry is organization-shared; foreign
+                // rows describe other machines' paths).
+                let local_device = self.doc_host.device_id();
                 let roots: Vec<std::path::PathBuf> = self
                     .registry
                     .read_chats()
                     .unwrap_or_default()
                     .into_iter()
+                    .filter(|chat| chat.device_id == local_device)
                     .filter_map(|chat| chat.cwd)
                     .map(std::path::PathBuf::from)
                     .collect();

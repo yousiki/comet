@@ -3368,6 +3368,12 @@ impl DocHost {
         if handle.retired.load(Ordering::Relaxed) {
             return;
         }
+        // Host duties only: viewers of a doc hosted elsewhere would get a
+        // silent 403 on every quiesce tick (tail PUT and checkpoint POST are
+        // both host-slot writes on the edge).
+        if !self.is_host(&handle.chat_id) {
+            return;
+        }
         let stats = match &*lock(&handle.chat2) {
             Some(client) => match client.try_stats() {
                 Some(stats) => stats,
@@ -3388,10 +3394,17 @@ impl DocHost {
             let edge_tail = edge.clone();
             let chat = chat_id.clone();
             let prefix = room_prefix(handle.room_gen);
+            let host = self.clone();
             self.spawn_worker(async move {
                 let Some(bearer) = edge_tail.bearer().await else {
                     return;
                 };
+                // Recheck ownership after the (async) bearer fetch: a re-home
+                // or unshare in that window must not let a former host publish
+                // a stale tail sidecar.
+                if !host.is_host(&chat) {
+                    return;
+                }
                 let url = format!(
                     "{}/{}/{}/tail",
                     edge_tail.url.trim_end_matches('/'),
@@ -3523,14 +3536,20 @@ impl DocHost {
                         post_backoff = (post_backoff * 2).min(POST_RETRY_CAP);
                         continue;
                     };
-                    let still_current = weak.upgrade().is_some_and(|handle| {
-                        !handle.generation_frozen.load(Ordering::Acquire)
-                            && !handle.retired.load(Ordering::Acquire)
-                            && !handle.purged.load(Ordering::Acquire)
-                            && lock(&host.inner.handles)
-                                .get(&chat_id)
-                                .is_some_and(|candidate| Arc::ptr_eq(candidate, &handle))
-                    });
+                    // Recheck ownership immediately before the POST: a live
+                    // re-home (or an unshare) between retries must stop a
+                    // former host from publishing a stale checkpoint. The
+                    // edge's 403 covers a different-user takeover; this covers
+                    // same-user device migration, which the edge accepts.
+                    let still_current = host.is_host(&chat_id)
+                        && weak.upgrade().is_some_and(|handle| {
+                            !handle.generation_frozen.load(Ordering::Acquire)
+                                && !handle.retired.load(Ordering::Acquire)
+                                && !handle.purged.load(Ordering::Acquire)
+                                && lock(&host.inner.handles)
+                                    .get(&chat_id)
+                                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &handle))
+                        });
                     if !still_current {
                         let mut checkpoint = lock(&state);
                         checkpoint.requested = false;
@@ -3574,6 +3593,17 @@ impl DocHost {
                                 }
                                 host.maybe_clear_replay_from_zero(&handle);
                             }
+                            break;
+                        }
+                        Ok(res) if res.status() == 403 => {
+                            // Authorization verdict (chat-room.ts gate → 403):
+                            // this device does not hold, and will not be
+                            // granted, the room's host slot — e.g. a viewer of
+                            // a doc hosted elsewhere. Retrying every 30s per
+                            // denied doc lived forever. (401 stays retryable —
+                            // it is token expiry/JWKS, which a refresh heals.)
+                            tracing::warn!(chat = %chat_id, status = res.status().as_u16(), reason,
+                                "chat2 checkpoint refused (not this room's host); giving up");
                             break;
                         }
                         Ok(res) => {

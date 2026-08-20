@@ -733,9 +733,41 @@ impl RegistryHost {
         if !self.device_shared() {
             return false;
         }
-        match self.read(|doc| doc.chat(chat_id)) {
-            Ok(Some(chat)) => chat.device_id == self.inner.config.device_id,
-            Ok(None) => self.ownership_ready(),
+        // Resolve exact row + subagent-ancestor walk + the row-less claim
+        // decision under ONE snapshot: sampling readiness after the lock
+        // released let a foreign row land (and `synced_once` flip) between
+        // "no row" and the claim, executing a teammate's command here.
+        let device_id = &self.inner.config.device_id;
+        let resolved: Result<bool, EngineError> = self.read(|doc| {
+            // An exact row always wins: a top-level chat whose id merely
+            // contains "--sub--" is a real chat, not a subagent doc.
+            if let Some(chat) = doc.chat(chat_id)? {
+                return Ok(chat.device_id == *device_id);
+            }
+            // Subagent docs (`{parent}--sub--{suffix}`, sessions.rs
+            // subagent_doc_id) have no row of their own: ownership follows the
+            // nearest registered ANCESTOR chat. Walk parents right-to-left so a
+            // nested sub (`a--sub--b--sub--c`) resolves to `a--sub--b` if that
+            // row exists, else `a` — and a real top-level chat that contains
+            // the delimiter still wins via the exact lookup above. Without this
+            // every synced Organization device claimed host on every sub doc it
+            // merely viewed; the room's sticky per-user host slot then denied
+            // either the viewer or the real writer.
+            let mut candidate = chat_id;
+            while let Some((parent, _)) = candidate.rsplit_once("--sub--") {
+                if let Some(chat) = doc.chat(parent)? {
+                    return Ok(chat.device_id == *device_id);
+                }
+                candidate = parent;
+            }
+            // No row anywhere. A row-less subagent doc is never claimable; a
+            // row-less ordinary chat is claim-on-first-command once the
+            // registry has synced (readiness read under the same lock hold as
+            // the row absence — no TOCTOU with an arriving foreign row).
+            Ok(!chat_id.contains("--sub--") && self.ownership_ready())
+        });
+        match resolved {
+            Ok(is_ours) => is_ours,
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry chat read failed");
                 false

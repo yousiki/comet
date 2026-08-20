@@ -52,9 +52,12 @@ const MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024;
 const PRESENCE_TTL_MS = 30_000;
 /** Per-(user, device) push quota, rolling window (in-memory; resets on
  * hibernation — it exists to contain a runaway client loop, not to meter
- * honest traffic). */
+ * honest traffic). Honest traffic peaks at one push per STREAM_COMMIT_MS
+ * (120ms) during agent streaming ≈ 500/min; the cap must clear that with
+ * headroom while still catching replay storms (the 2026-08-20 incident ran
+ * at ~15k/min). Bytes stay tight — they are the real cost. */
 const QUOTA_WINDOW_MS = 60_000;
-const QUOTA_MAX_PUSHES = 300;
+const QUOTA_MAX_PUSHES = 1500;
 const QUOTA_MAX_BYTES = 8 * 1024 * 1024;
 
 interface SocketState {

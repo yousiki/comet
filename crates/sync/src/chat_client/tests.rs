@@ -574,6 +574,7 @@ async fn offline_push_pulls_from_the_pre_ack_cursor_before_retiring() {
         pending: VecDeque::from([PendingPush {
             batch_id: "local".into(),
             bytes: b"local-row".to_vec(),
+            sent: false,
         }]),
         ..Shared::default()
     }));
@@ -625,6 +626,7 @@ async fn offline_push_followed_by_server_reset_keeps_pending_and_resets_cursor()
         pending: VecDeque::from([PendingPush {
             batch_id: "pre-reset".into(),
             bytes: vec![9],
+            sent: false,
         }]),
         ..Shared::default()
     }));
@@ -671,6 +673,7 @@ async fn websocket_ack_racing_a_failed_http_push_is_staged_until_reset_pull() {
         pending: VecDeque::from([PendingPush {
             batch_id: "racing".into(),
             bytes: b"must-replay".to_vec(),
+            sent: false,
         }]),
         ..Shared::default()
     }));
@@ -740,6 +743,7 @@ async fn aba_ack_reset_reanchors_from_zero_instead_of_the_captured_cursor() {
         pending: VecDeque::from([PendingPush {
             batch_id: "aba-race".into(),
             bytes: b"must-replay".to_vec(),
+            sent: false,
         }]),
         ..Shared::default()
     }));
@@ -816,6 +820,7 @@ async fn ack_sequence_reused_by_a_foreign_batch_forces_zero_reanchor() {
         pending: VecDeque::from([PendingPush {
             batch_id: "old-local".into(),
             bytes: b"must-replay".to_vec(),
+            sent: false,
         }]),
         ..Shared::default()
     }));
@@ -881,6 +886,7 @@ async fn contained_checkpoint_does_not_prove_a_staged_ack_identity() {
         pending: VecDeque::from([PendingPush {
             batch_id: "pruned-old-local".into(),
             bytes: b"must-replay".to_vec(),
+            sent: false,
         }]),
         ..Shared::default()
     }));
@@ -952,6 +958,7 @@ async fn pull_failure_after_a_sibling_reset_still_restores_the_round_snapshot() 
         pending: VecDeque::from([PendingPush {
             batch_id: "failed-pull".into(),
             bytes: b"must-replay".to_vec(),
+            sent: false,
         }]),
         ..Shared::default()
     }));
@@ -1002,10 +1009,12 @@ async fn reset_restoration_does_not_resurrect_a_permanently_rejected_head() {
             PendingPush {
                 batch_id: "bad-full".into(),
                 bytes: b"oversized".to_vec(),
+                sent: false,
             },
             PendingPush {
                 batch_id: "small".into(),
                 bytes: b"small-delta".to_vec(),
+                sent: false,
             },
         ]),
         ..Shared::default()
@@ -1065,6 +1074,7 @@ fn stale_websocket_ack_cannot_retire_work_after_http_reset() {
         pending: VecDeque::from([PendingPush {
             batch_id: "pre-reset".into(),
             bytes: vec![9],
+            sent: false,
         }]),
         ..Shared::default()
     }));
@@ -1128,6 +1138,7 @@ async fn malformed_http_pull_never_retires_a_staged_ack() {
         pending: VecDeque::from([PendingPush {
             batch_id: "local".into(),
             bytes: b"row".to_vec(),
+            sent: false,
         }]),
         ..Shared::default()
     }));
@@ -1170,10 +1181,12 @@ async fn permanent_http_rejection_does_not_wedge_the_following_delta() {
             PendingPush {
                 batch_id: "full".into(),
                 bytes: vec![0; 8],
+                sent: false,
             },
             PendingPush {
                 batch_id: "small".into(),
                 bytes: b"small-delta".to_vec(),
+                sent: false,
             },
         ]),
         ..Shared::default()
@@ -1214,6 +1227,7 @@ async fn failed_http_pull_self_nudges_a_steady_socket_to_repush() {
         pending: VecDeque::from([PendingPush {
             batch_id: "retry-me".into(),
             bytes: vec![7],
+            sent: false,
         }]),
         ..Shared::default()
     }));
@@ -1653,6 +1667,74 @@ async fn permanent_rejection_retires_transient_keeps_and_retries() {
     client.shutdown().await;
 }
 
+/// The 2026-08-20 quota storm root cause: the nudge path re-pushed the ENTIRE
+/// pending queue on every enqueue (~8 nudges/s during streaming × queue depth
+/// = 15k frames/min). The `sent` flag fixes it: a nudge pushes each batch at
+/// most once per socket. Here two batches are enqueued and never acked, so
+/// they stay pending; a burst of extra nudges must NOT re-push them.
+#[tokio::test(start_paused = true)]
+async fn nudges_never_repush_an_already_sent_batch() {
+    let (pipe, mut end) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let empty_state = serde_json::json!({"headSeq": 0, "seqFloor": 0,
+        "checkpointSeq": 0, "checkpointSize": 0, "rowCount": 0, "rowBytes": 0});
+
+    // Server → client: the payload of every PUSH received, so the client can
+    // wait for A to be genuinely SENT (not merely queued) before enqueuing B.
+    // Sequencing this way is what forces the already-sent-then-nudge path the
+    // storm lived in; queuing all three up front would push them in one batch
+    // under both the fixed and the buggy code, hiding the difference.
+    let (got_tx, mut got_rx) = mpsc::channel::<Vec<u8>>(16);
+    let server = tokio::spawn(async move {
+        serve_join(&mut end, empty_state, &[], vec![], false).await;
+        let mut pushes: Vec<Vec<u8>> = Vec::new();
+        while let Ok(Some(bytes)) =
+            tokio::time::timeout(Duration::from_secs(3), end.rx.recv()).await
+        {
+            if let Some(frame) = decode(&bytes)
+                && frame.kind == frame_type::PUSH
+            {
+                pushes.push(frame.payload.to_vec());
+                let _ = got_tx.send(frame.payload.to_vec()).await;
+            }
+        }
+        // Nothing is ever acked, so all three stay pending. With the `sent`
+        // flag each is pushed exactly once; the pre-fix nudge re-pushed the
+        // whole pending queue, so an already-sent batch reappears (e.g.
+        // [A, A, B, ...]).
+        assert_eq!(
+            pushes,
+            vec![vec![0xa0], vec![0xb0], vec![0xc0]],
+            "each batch pushed exactly once, no re-blast of already-sent batches"
+        );
+        end
+    });
+
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        sink.clone(),
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+    )
+    .await
+    .expect("join succeeds");
+
+    // Enqueue each batch only AFTER the previous one has actually been pushed,
+    // so every successor nudge fires with a prior batch already `sent`.
+    for payload in [vec![0xa0], vec![0xb0], vec![0xc0]] {
+        client.enqueue_update(payload.clone());
+        let seen = got_rx.recv().await.expect("server observed the push");
+        assert_eq!(seen, payload, "nudge pushed the just-enqueued batch");
+    }
+
+    let _keep = server.await.unwrap();
+    assert_eq!(client.stats().pending_pushes, 3, "all three still pending");
+    client.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn permanent_rejection_rearms_an_already_queued_successor() {
     let (pipe, mut end) = pipe_pair();
@@ -1704,6 +1786,7 @@ async fn permanent_rejection_rearms_an_already_queued_successor() {
     lock(&client.shared).pending.push_back(PendingPush {
         batch_id: "successor".into(),
         bytes: vec![2],
+        sent: false,
     });
     reject_tx.send(()).unwrap();
 

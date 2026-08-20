@@ -607,6 +607,20 @@ pub(crate) async fn subscribe_with_legacy_method(
     }
 }
 
+/// Translate an RPC failure for user-facing error slots. `UnknownMethod` is
+/// the version-skew case — the target device runs an older zeron than this
+/// UI — and the raw "unknown method: X" wire string reads like a bug instead
+/// of the upgrade prompt it actually is (the 2026-08-20 stale-daemon
+/// incident). Everything else passes through unchanged.
+pub(crate) fn rpc_error_notice(err: &RpcError) -> String {
+    match err {
+        RpcError::UnknownMethod(_) => {
+            "This device runs an older zeron — update it to use this feature".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure state + reducers
 // ---------------------------------------------------------------------------
@@ -1203,43 +1217,44 @@ impl AppState {
             return;
         };
         self.members_task = Some(cx.spawn(async move |this, cx| {
-            let reply = engine
-                .client()
-                .call(
-                    methods::LIST_MEMBERS,
-                    serde_json::json!({ "organizationId": org.as_str() }),
-                )
-                .await;
-            let rows: Option<Vec<crate::settings::organization::MemberRow>> = match reply {
-                Ok(value) => value
-                    .get("members")
-                    .and_then(|m| serde_json::from_value(m.clone()).ok()),
-                Err(err) => {
-                    tracing::debug!(error = %err, "ListMembers failed; raw ids remain");
-                    None
-                }
-            };
-            // A missing/unparsable roster is a failure too: clear the org
-            // marker so the next auth frame retries instead of pinning an
-            // empty map for the rest of the run.
-            let Some(rows) = rows else {
-                this.update(cx, |state, _| {
+            // Retry in-task with capped backoff: a SignedIn token refresh
+            // republishes an identical AuthState, so the watch never fires
+            // again and "retry on the next auth frame" meant "never" — one
+            // failed fetch left raw ids for the rest of the run.
+            let mut backoff = std::time::Duration::from_secs(5);
+            loop {
+                let reply = engine
+                    .client()
+                    .call(
+                        methods::LIST_MEMBERS,
+                        serde_json::json!({ "organizationId": org.as_str() }),
+                    )
+                    .await;
+                let rows: Option<Vec<crate::settings::organization::MemberRow>> = match reply {
+                    Ok(value) => value
+                        .get("members")
+                        .and_then(|m| serde_json::from_value(m.clone()).ok()),
+                    Err(err) => {
+                        tracing::debug!(error = %err, "ListMembers failed; raw ids remain");
+                        None
+                    }
+                };
+                let Some(rows) = rows else {
+                    cx.background_executor().timer(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+                    continue;
+                };
+                this.update(cx, |state, cx| {
+                    // Guard against a stale fetch racing an org switch.
                     if state.members_org.as_deref() == Some(org.as_str()) {
-                        state.members_org = None;
+                        state.members = rows.into_iter().map(|r| (r.user_id.clone(), r)).collect();
+                        state.members_epoch += 1;
+                        cx.notify();
                     }
                 })
                 .ok();
                 return;
-            };
-            this.update(cx, |state, cx| {
-                // Guard against a stale fetch racing an org switch.
-                if state.members_org.as_deref() == Some(org.as_str()) {
-                    state.members = rows.into_iter().map(|r| (r.user_id.clone(), r)).collect();
-                    state.members_epoch += 1;
-                    cx.notify();
-                }
-            })
-            .ok();
+            }
         }));
     }
 

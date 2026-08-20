@@ -374,3 +374,46 @@ async fn row_ownership_is_authoritative_regardless_of_sync_state() {
     assert!(host.is_host("chat-own"));
     assert!(!host.is_host("chat-foreign"));
 }
+
+/// Subagent docs (`{parent}--sub--{suffix}`) have no registry row of their
+/// own: ownership follows the PARENT chat's row, and a row-less sub doc is
+/// never claimable. Without this an edged host claimed every sub doc it merely
+/// viewed. A top-level chat whose id merely CONTAINS "--sub--" keeps its own
+/// row's authority.
+#[tokio::test]
+async fn subagent_docs_inherit_parent_ownership_and_never_self_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let edge = zeron_engine::EdgeConfig::with_static_token("http://127.0.0.1:1", "alice");
+    let host = open_host(dir.path(), Some(edge));
+    host.create_space("space-1", "dev-me", "/tmp/repo", None, true)
+        .expect("space");
+    host.create_chat("parent-own", Some("space-1"), None, None, None)
+        .expect("own parent");
+    host.create_space("space-2", "dev-bob", "/tmp/other", None, true)
+        .expect("space");
+    host.create_chat("parent-foreign", Some("space-2"), None, None, None)
+        .expect("foreign parent");
+
+    // Sub docs resolve to their parent's device.
+    assert!(host.is_host("parent-own--sub--call_abc"));
+    assert!(!host.is_host("parent-foreign--sub--call_xyz"));
+    // Nested sub docs resolve to the nearest registered ancestor (here the
+    // top-level parent, since the middle level has no row).
+    assert!(host.is_host("parent-own--sub--call_abc--sub--nested"));
+    assert!(!host.is_host("parent-foreign--sub--call_a--sub--call_b"));
+    // A sub doc whose parent has no row is NOT claimable (even edged-and-synced
+    // would still fail-closed here) — the row-less-claim path is off for subs.
+    assert!(!host.is_host("ghost-parent--sub--call_1"));
+
+    // A real top-level chat that merely contains the delimiter keeps its own
+    // row's authority — the exact row wins over ancestor resolution.
+    host.create_chat("weird--sub--name", Some("space-1"), None, None, None)
+        .expect("weird own chat");
+    assert!(host.is_host("weird--sub--name"));
+    host.create_chat("weird--sub--foreign", Some("space-2"), None, None, None)
+        .expect("weird foreign chat");
+    assert!(!host.is_host("weird--sub--foreign"));
+    // A subagent OF that delimiter-containing real chat resolves to the real
+    // chat's row (nearest ancestor), not the stripped-to-first-segment "weird".
+    assert!(host.is_host("weird--sub--name--sub--call_z"));
+}

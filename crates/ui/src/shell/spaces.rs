@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
+use crate::state::rpc_error_notice;
 use gpui::FocusHandle;
 use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
 
@@ -1077,7 +1078,7 @@ impl Shell {
                             Ok(listing) => Loadable::Ready(listing.drives),
                             Err(err) => Loadable::Error(err.to_string()),
                         },
-                        Err(err) => Loadable::Error(err.to_string()),
+                        Err(err) => Loadable::Error(rpc_error_notice(&err)),
                     };
                 }
                 cx.notify();
@@ -1292,7 +1293,7 @@ impl Shell {
                             }
                             Err(err) => Loadable::Error(err.to_string()),
                         },
-                        Err(err) => Loadable::Error(err.to_string()),
+                        Err(err) => Loadable::Error(rpc_error_notice(&err)),
                     };
                 }
                 cx.notify();
