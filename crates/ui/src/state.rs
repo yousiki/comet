@@ -885,6 +885,19 @@ pub struct AppState {
     /// the engine LRU — closing a tab MUST go through
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
+    /// Organization roster (`ListMembers`) keyed by user id — resolves the
+    /// opaque `user_id` on shared-session messages to a name/email. Fetched
+    /// once per org on AUTH_STATUS frames; empty until it lands (views fall
+    /// back to raw ids).
+    members: HashMap<String, crate::settings::organization::MemberRow>,
+    /// Org the `members` map was fetched for (AUTH_STATUS re-fires often;
+    /// same org → no refetch). Cleared on fetch failure so the next auth
+    /// frame retries.
+    members_org: Option<String>,
+    /// Bumped on every `members` change so views that cache identity-derived
+    /// output know to repaint.
+    members_epoch: u64,
+    members_task: Option<Task<()>>,
 }
 
 impl Default for AppState {
@@ -926,6 +939,10 @@ impl AppState {
             change_request_tasks: HashMap::new(),
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
+            members: HashMap::new(),
+            members_org: None,
+            members_epoch: 0,
+            members_task: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -1147,6 +1164,83 @@ impl AppState {
             AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
             AuthState::SignedOut => None,
         }
+    }
+
+    /// Roster entry for `user_id`, once the member list has loaded.
+    pub fn member(&self, user_id: &str) -> Option<&crate::settings::organization::MemberRow> {
+        self.members.get(user_id)
+    }
+
+    /// Bumped on every roster change — views that cache identity-derived
+    /// output compare it to decide whether to repaint.
+    pub fn members_epoch(&self) -> u64 {
+        self.members_epoch
+    }
+
+    /// (Re)fetch the org roster when the signed-in org changes. Same org →
+    /// no-op; signed out / no org → clear. A failed fetch leaves the map
+    /// empty (raw ids remain the fallback) and retries on the next auth
+    /// frame.
+    fn refresh_members(&mut self, cx: &mut Context<Self>) {
+        let org = match self.auth.as_ref() {
+            Some(AuthState::SignedIn {
+                organization_id: Some(o),
+                ..
+            }) => Some(o.clone()),
+            _ => None,
+        };
+        if org == self.members_org {
+            return;
+        }
+        self.members_org = org.clone();
+        self.members_task = None;
+        if !self.members.is_empty() {
+            self.members.clear();
+            self.members_epoch += 1;
+            cx.notify();
+        }
+        let (Some(org), Some(engine)) = (org, self.engine.clone()) else {
+            return;
+        };
+        self.members_task = Some(cx.spawn(async move |this, cx| {
+            let reply = engine
+                .client()
+                .call(
+                    methods::LIST_MEMBERS,
+                    serde_json::json!({ "organizationId": org.as_str() }),
+                )
+                .await;
+            let rows: Option<Vec<crate::settings::organization::MemberRow>> = match reply {
+                Ok(value) => value
+                    .get("members")
+                    .and_then(|m| serde_json::from_value(m.clone()).ok()),
+                Err(err) => {
+                    tracing::debug!(error = %err, "ListMembers failed; raw ids remain");
+                    None
+                }
+            };
+            // A missing/unparsable roster is a failure too: clear the org
+            // marker so the next auth frame retries instead of pinning an
+            // empty map for the rest of the run.
+            let Some(rows) = rows else {
+                this.update(cx, |state, _| {
+                    if state.members_org.as_deref() == Some(org.as_str()) {
+                        state.members_org = None;
+                    }
+                })
+                .ok();
+                return;
+            };
+            this.update(cx, |state, cx| {
+                // Guard against a stale fetch racing an org switch.
+                if state.members_org.as_deref() == Some(org.as_str()) {
+                    state.members = rows.into_iter().map(|r| (r.user_id.clone(), r)).collect();
+                    state.members_epoch += 1;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     pub(crate) fn profile_cache_namespace(&self) -> ProfileCacheNamespace {
@@ -1580,6 +1674,10 @@ impl AppState {
         self.diff_comments.clear();
         self.sub_watch_tasks.clear();
         self.sub_transcripts.clear();
+        self.members.clear();
+        self.members_org = None;
+        self.members_task = None;
+        self.members_epoch += 1;
         self.upload_progress = None;
         self.local_device_id = None;
         self.update = None;
@@ -2062,6 +2160,9 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                     apply(state, parsed);
                     if matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
                         state.reconcile_change_request_watches(cx);
+                    }
+                    if method == methods::AUTH_STATUS {
+                        state.refresh_members(cx);
                     }
                     cx.notify();
                 });

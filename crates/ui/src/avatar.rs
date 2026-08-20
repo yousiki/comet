@@ -73,6 +73,13 @@ fn hex(color: gpui::Hsla) -> String {
     )
 }
 
+/// The seed's theme color: the top stop of the avatar gradient. Reproduces
+/// the FIRST draw from the trait stream — `gradient` is the stream's first
+/// consumer — so it matches [`blob_avatar`]'s hue for the same seed, forever.
+pub fn seed_color(seed: &str) -> gpui::Hsla {
+    gpui::hsla(Traits::new(seed).unit(), 0.62, 0.66, 1.0)
+}
+
 /// Two-stop vertical gradient, hue per seed. Saturation/lightness are pinned to
 /// a band that reads on both the light and dark themes. Consumes exactly one
 /// value from the stream, so both avatar kinds stay hue-compatible.
@@ -166,7 +173,20 @@ fn organization_svg(seed: &str, dim: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{organization_svg, svg};
+    use super::{hex, organization_svg, seed_color, svg};
+
+    #[test]
+    fn seed_color_matches_avatar_gradient_top_stop() {
+        for seed in ["a@b.c", "", "agent-chat-1", "组织"] {
+            let s = svg(seed, 56);
+            let top = s
+                .split("stop-color=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_else(|| panic!("no stop-color: {s}"));
+            assert_eq!(hex(seed_color(seed)), top, "seed {seed:?}");
+        }
+    }
 
     #[test]
     fn deterministic_distinct_and_well_formed() {

@@ -1453,6 +1453,11 @@ pub struct Transcript {
     /// frames reuse settled blocks' text+runs; the incremental parser's stable
     /// boundary invalidates only the live tail per commit.
     render_cache: Rc<RefCell<RenderCache>>,
+    /// Last identity/branding stamp from [`Self::sync`] (roster epoch, auth
+    /// user, chat titles/harnesses). Author names/avatars resolve at render
+    /// time, so a stamp change without any row diff still needs a repaint —
+    /// `sync`'s no-diff early return checks this.
+    identity_epoch: u64,
     highlights: HighlightStore,
     show_jump_button: bool,
     /// Distance from the bottom at the last observation (wheel event or spring
@@ -1631,6 +1636,7 @@ impl Transcript {
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
             render_cache: Rc::new(RefCell::new(RenderCache::default())),
+            identity_epoch: 0,
             highlights: HighlightStore::default(),
             show_jump_button: false,
             last_scroll_distance: 0.0,
@@ -2320,8 +2326,29 @@ impl Transcript {
 
     /// Rebuild rows from app state; splice minimal ranges into the list.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let (selected, entries, echoes) = {
+        let (selected, entries, echoes, identity_stamp) = {
             let s = self.state.read(cx);
+            // Everything sender/branding resolves from at render time: the
+            // roster, the signed-in user (local-vs-remote split, own avatar
+            // seed), and chat titles/harnesses (agent chips, the turn icon).
+            // A change here must repaint even when the row diff is empty.
+            let stamp = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                s.members_epoch().hash(&mut h);
+                if let Some(me) = s.auth_user() {
+                    me.id.hash(&mut h);
+                    me.email.hash(&mut h);
+                }
+                for chat in &s.chats {
+                    chat.id.hash(&mut h);
+                    chat.title.hash(&mut h);
+                    if let Some(config) = &chat.config {
+                        std::mem::discriminant(&config.harness).hash(&mut h);
+                    }
+                }
+                h.finish()
+            };
             match &self.doc_override {
                 // Pinned to a subagent doc: `selected` equals `chat_id` by
                 // construction, so the attach/reset branch below never fires,
@@ -2330,14 +2357,18 @@ impl Transcript {
                     Some(doc_id.clone()),
                     s.sub_transcript(doc_id).to_vec(),
                     Vec::new(),
+                    stamp,
                 ),
                 None => (
                     s.selected_chat.clone(),
                     s.transcript.clone(),
                     s.pending_echoes().to_vec(),
+                    stamp,
                 ),
             }
         };
+        let identity_changed =
+            std::mem::replace(&mut self.identity_epoch, identity_stamp) != identity_stamp;
 
         let attached = selected != self.chat_id;
         if attached {
@@ -2416,6 +2447,11 @@ impl Transcript {
             None => {
                 self.rows = new_rows;
                 self.refresh_protected_attachments(cx);
+                // No row diff, but author names/avatars resolve at render
+                // time — a roster arrival still needs a repaint.
+                if identity_changed {
+                    cx.notify();
+                }
                 return;
             }
             Some((old_range, count)) => {
@@ -3029,6 +3065,62 @@ impl Transcript {
         )
     }
 
+    /// Resolve the sender of a right-side (user-authored) row. `author` is
+    /// the entry's `user_id`: `None` on optimistic echoes (always the local
+    /// user), an `agent:{chatId}` sentinel on agent-to-agent sends
+    /// (`DocHost::send_to_session`), or an org member's opaque user id.
+    fn sender_for(&self, author: Option<&str>, cx: &Context<Self>) -> Sender {
+        let state = self.state.read(cx);
+        let me = state.auth_user();
+        // Local user: no chip (own messages stay unmarked); avatar and hue
+        // seeded by email so the face matches the sidebar avatar.
+        if author.is_none() || me.is_some_and(|me| Some(me.id.as_str()) == author) {
+            let seed = me
+                .map(|me| me.email.clone())
+                .or_else(|| author.map(str::to_string))
+                .unwrap_or_default();
+            return Sender {
+                display: None,
+                glow: crate::avatar::seed_color(&seed),
+                avatar: SenderAvatar::Blob(seed),
+            };
+        }
+        let author = author.expect("author is Some past the local-user arm");
+        // Agent-to-agent send: the source chat's harness brand mark. The glow
+        // is seeded by the chat id, not the brand — stable even when the
+        // source chat isn't in the local registry (another member's device).
+        if let Some(chat_id) = author.strip_prefix("agent:") {
+            let chat = state.chats.iter().find(|c| c.id == chat_id);
+            let (path, tint) = chat
+                .and_then(|c| c.config.as_ref())
+                .map(|config| crate::pickers::harness_brand_icon(config.harness))
+                .unwrap_or((crate::icons::BOT, None));
+            let display = chat
+                .and_then(|c| c.title.clone())
+                .unwrap_or_else(|| author.to_string());
+            return Sender {
+                display: Some(display.into()),
+                glow: crate::avatar::seed_color(chat_id),
+                avatar: SenderAvatar::Icon(path, tint),
+            };
+        }
+        // Another org member: the roster resolves id → name/email once it
+        // loads (AppState::member); until then the raw id is label and seed,
+        // healed by the members_epoch repaint.
+        match state.member(author) {
+            Some(m) => Sender {
+                display: Some(m.name.clone().unwrap_or_else(|| m.email.clone()).into()),
+                glow: crate::avatar::seed_color(&m.email),
+                avatar: SenderAvatar::Blob(m.email.clone()),
+            },
+            None => Sender {
+                display: Some(author.to_string().into()),
+                glow: crate::avatar::seed_color(author),
+                avatar: SenderAvatar::Blob(author.to_string()),
+            },
+        }
+    }
+
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
@@ -3086,27 +3178,21 @@ impl Transcript {
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
-                // Author chip (Organization-shared sessions): shown when the entry
-                // names a user other than the signed-in one — another member or
-                // an `agent:{chatId}` send. Informational, muted, above the
-                // bubble.
-                let author_chip = author.clone().filter(|a| {
-                    self.state
-                        .read(cx)
-                        .auth_user()
-                        .is_none_or(|me| me.id != a.as_ref())
-                });
+                let sender = self.sender_for(author.as_deref(), cx);
                 // Attachment thumbnails ride ABOVE the bubble, right-aligned
                 // (chat-view.tsx RowView: UserAttachmentStrip then the text
                 // HStack); image-only sends show no bubble at all.
-                let mut column = div().w_full().flex().flex_col();
-                if let Some(author) = author_chip {
+                let mut column = div().flex_1().min_w_0().flex().flex_col();
+                // Author chip (Organization-shared sessions): the resolved
+                // sender name — another member or an agent send. The local
+                // user's own messages carry no chip.
+                if let Some(display) = sender.display.clone() {
                     column = column.child(
                         div().w_full().flex().justify_end().pb(px(2.0)).child(
                             div()
                                 .text_size(px(11.0))
                                 .text_color(theme.text_muted)
-                                .child(author),
+                                .child(display),
                         ),
                     );
                 }
@@ -3147,8 +3233,22 @@ impl Transcript {
                                 .max_w(px(MAX_CONTENT_WIDTH * 0.8))
                                 .bg(crate::theme::user_bubble_bg())
                                 .rounded(px(Theme::BUBBLE_RADIUS))
-                                .px(px(16.0))
-                                .py(px(10.0))
+                                // Sender theme-color ring + inner glow. INSET
+                                // shadow only: a drop shadow paints BEHIND the
+                                // translucent plate and reads as a grey slab
+                                // (see theme::card_selected_shadows).
+                                .border_1()
+                                .border_color(sender.glow.opacity(0.55))
+                                .shadow(vec![gpui::BoxShadow {
+                                    color: sender.glow.opacity(0.18),
+                                    offset: gpui::point(px(0.0), px(0.0)),
+                                    blur_radius: px(8.0),
+                                    spread_radius: px(0.0),
+                                    inset: true,
+                                }])
+                                // 16/10 minus the 1px ring, so text keeps its x.
+                                .px(px(15.0))
+                                .py(px(9.0))
                                 .text_size(px(14.0))
                                 .line_height(px(22.0))
                                 .text_color(theme.text)
@@ -3157,7 +3257,39 @@ impl Transcript {
                         ),
                     );
                 }
-                column.into_any_element()
+                // Sender avatar rides OUTSIDE the column, bottom-aligned with
+                // the bubble; the column keeps right-aligning chip/attachments
+                // to the bubble edge.
+                let avatar: AnyElement = match &sender.avatar {
+                    SenderAvatar::Blob(seed) => {
+                        crate::avatar::blob_avatar(seed, 24.0).into_any_element()
+                    }
+                    SenderAvatar::Icon(path, tint) => div()
+                        .size(px(24.0))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(crate::theme::user_bubble_bg())
+                        .border_1()
+                        .border_color(sender.glow.opacity(0.55))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            crate::icons::icon(path)
+                                .size(px(14.0))
+                                .text_color(tint.unwrap_or(theme.text_muted)),
+                        )
+                        .into_any_element(),
+                };
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .gap(px(8.0))
+                    .child(column)
+                    .child(avatar)
+                    .into_any_element()
             }
             RowKind::Markdown { tree, block_ix } => {
                 let opts = RenderOptions {
@@ -3282,8 +3414,10 @@ impl Transcript {
                 // markdown text / user bubble sit AT the content column edges,
                 // so the label must too — assistant label's left edge on the
                 // text's first-character x, user label's right edge on the
-                // bubble's right edge (user-reported 4px drift).
-                .when(is_user_row, |el| el.justify_end())
+                // bubble's right edge (user-reported 4px drift). User rows pad
+                // right past the 24px sender avatar + 8px gap so the label
+                // still lands on the bubble edge.
+                .when(is_user_row, |el| el.justify_end().pr(px(32.0)))
                 .when(hovered, |el| {
                     el.child(motion::fade_quick(
                         SharedString::from(format!("ts-{}", row.id)),
@@ -3296,6 +3430,36 @@ impl Transcript {
         });
         let entry_id = row.entry_id.clone();
         let row_id = row.id.clone();
+        // Agent identity, once per assistant turn: the session harness's
+        // brand mark on the turn's first row (turn_start is set once per
+        // continuation-joined entry). Chips carry their own framing; subagent
+        // override docs aren't in `chats` and fall back to the bot mark.
+        let turn_icon = (row.turn_start
+            && !is_user_row
+            && !matches!(
+                row.kind,
+                RowKind::ErrorChip { .. } | RowKind::InputChip { .. }
+            ))
+        .then(|| {
+            let (path, tint) = self
+                .chat_id
+                .as_deref()
+                .and_then(|id| {
+                    self.state
+                        .read(cx)
+                        .chats
+                        .iter()
+                        .find(|c| c.id == id)
+                        .and_then(|c| c.config.as_ref())
+                        .map(|config| crate::pickers::harness_brand_icon(config.harness))
+                })
+                .unwrap_or((crate::icons::BOT, None));
+            div().w_full().flex().pb(px(6.0)).child(
+                crate::icons::icon(path)
+                    .size(px(16.0))
+                    .text_color(tint.unwrap_or(theme.text_muted)),
+            )
+        });
         div()
             .id(row.id.clone())
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -3335,6 +3499,7 @@ impl Transcript {
                     .w_full()
                     .max_w(px(MAX_CONTENT_WIDTH))
                     .min_w_0()
+                    .children(turn_icon)
                     .child(inner)
                     .children(strip)
                     .children(trailer),
@@ -3891,6 +4056,23 @@ impl Transcript {
 /// run when there are none), with the same selection machinery as rendered
 /// markdown — the element registers into the frame's document-ordered
 /// registry, so drags select, span into adjacent rows, and Cmd+C copies.
+/// A right-side row's resolved sender (see [`Transcript::sender_for`]).
+struct Sender {
+    /// Chip above the bubble; `None` for the local user.
+    display: Option<SharedString>,
+    /// The sender's theme color — [`crate::avatar::seed_color`], the same hue
+    /// their generated avatar wears.
+    glow: gpui::Hsla,
+    avatar: SenderAvatar,
+}
+
+enum SenderAvatar {
+    /// Generated blob avatar for this seed (org members, the local user).
+    Blob(String),
+    /// Harness brand mark (agent-to-agent sends): icon path + brand tint.
+    Icon(&'static str, Option<gpui::Hsla>),
+}
+
 fn user_bubble_text(
     row_id: &SharedString,
     text: SharedString,
@@ -4499,6 +4681,13 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         Some(MessageStatus::Aborted) => 3,
     });
     acc.push(pending as u8);
+    // Sender attribution renders from `user_id` (an echo's None flips to the
+    // authored id when the doc entry lands, and shared docs may restamp it) —
+    // hash the VALUE, not a length, or the row cache serves the old author.
+    if let Some(user_id) = &entry.user_id {
+        acc.extend_from_slice(user_id.as_bytes());
+        acc.push(0xfe);
+    }
     for part in &entry.parts {
         acc.extend_from_slice(part.id().as_bytes());
         acc.extend_from_slice(&(part.byte_len() as u64).to_le_bytes());
