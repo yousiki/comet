@@ -11,6 +11,14 @@ name: deploy
 on:
   push:
     branches: [main]
+    # Skip entirely on pushes that touch none of the deployable dirs (most
+    # Rust-only pushes) — the per-job detection below still scopes which of
+    # the three dirs actually changed within a matching push.
+    paths:
+      - "edge/**"
+      - "apps/landing/**"
+      - "apps/www-redirect/**"
+      - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
 concurrency:
@@ -25,7 +33,7 @@ jobs:
       # the token through job env and gate on that instead.
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # `github.event.before` may precede several commits in a batched push.
           fetch-depth: 0
@@ -43,7 +51,7 @@ jobs:
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.changed.outputs.changed == 'true'
         with:
           node-version: 22
@@ -74,7 +82,7 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: detect landing changes
@@ -91,7 +99,7 @@ jobs:
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.changed.outputs.changed == 'true'
         with:
           node-version: 22
@@ -108,7 +116,7 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: detect www-redirect changes
@@ -125,7 +133,7 @@ jobs:
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.changed.outputs.changed == 'true'
         with:
           node-version: 22
