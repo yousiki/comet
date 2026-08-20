@@ -2772,8 +2772,7 @@ impl Transcript {
             // (2026-08-19 report). Percent exists only while the UI itself
             // uploads (legacy / local staging); the engine-side relay leg
             // has no percent — indeterminate spinner instead.
-            let sending =
-                att.path.starts_with("pending://") || att.path.starts_with("pending/");
+            let sending = att.path.starts_with("pending://") || att.path.starts_with("pending/");
             let uploading = sending
                 .then(|| self.state.read(cx).upload_progress_percent())
                 .flatten();
@@ -2828,9 +2827,7 @@ impl Transcript {
                                 cx,
                             ));
                             let indicator: AnyElement = match uploading {
-                                Some(pct) => {
-                                    crate::loaders::upload_progress_ring(pct, 34.0)
-                                }
+                                Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
                                 None => crate::loaders::mini_gradient_spinner(
                                     format!("att-sending-{row_id}-{aix}"),
                                     3.0,
@@ -2929,8 +2926,8 @@ impl Transcript {
             }
             let state = self.state.read(cx);
             let last = state.sub_transcript(doc_id).last()?;
-            let live = last.status == Some(MessageStatus::Streaming)
-                || last.role == MessageRole::User;
+            let live =
+                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
             if !live {
                 return None;
             }

@@ -596,8 +596,10 @@ fn delete_device_cascades_and_converges() {
     let mut a = RegistryDoc::new("dev-a");
     a.upsert_device(&device("dev-a", "Mine")).unwrap();
     a.upsert_device(&device("dev-b", "Theirs")).unwrap();
-    a.upsert_space(&space("sp-b", "dev-b", "/tmp/theirs")).unwrap();
-    a.upsert_space(&space("sp-a", "dev-a", "/tmp/mine")).unwrap();
+    a.upsert_space(&space("sp-b", "dev-b", "/tmp/theirs"))
+        .unwrap();
+    a.upsert_space(&space("sp-a", "dev-a", "/tmp/mine"))
+        .unwrap();
     // In dev-b's space, hosted by dev-b — dies with the space.
     let mut spaced = chat("chat-spaced", "dev-b");
     spaced.space_id = Some("sp-b".into());
@@ -626,15 +628,27 @@ fn delete_device_cascades_and_converges() {
     for ws in [&a, &b] {
         let state = ws.read_all().unwrap();
         assert_eq!(
-            state.devices.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            state
+                .devices
+                .iter()
+                .map(|d| d.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["dev-a"]
         );
         assert_eq!(
-            state.spaces.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            state
+                .spaces
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["sp-a"]
         );
         assert_eq!(
-            state.chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            state
+                .chats
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["chat-mine"]
         );
         assert!(state.sessions.is_empty());
@@ -648,7 +662,8 @@ fn delete_device_cascades_and_converges() {
 fn remove_device_row_leaves_spaces_and_chats() {
     let mut a = RegistryDoc::new("dev-a");
     a.upsert_device(&device("dev-a", "Mine")).unwrap();
-    a.upsert_space(&space("sp-a", "dev-a", "/tmp/mine")).unwrap();
+    a.upsert_space(&space("sp-a", "dev-a", "/tmp/mine"))
+        .unwrap();
     let mut mine = chat("chat-mine", "dev-a");
     mine.space_id = Some("sp-a".into());
     a.upsert_chat(&mine).unwrap();

@@ -702,9 +702,8 @@ pub(crate) fn attachment_snapshot(
 fn upload_alias_id8(path: &str) -> Option<String> {
     let base = std::path::Path::new(path).file_name()?.to_str()?;
     let (id8, _) = base.split_at_checked(8)?;
-    (base.as_bytes().get(8) == Some(&b'-')
-        && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
-    .then(|| id8.to_string())
+    (base.as_bytes().get(8) == Some(&b'-') && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| id8.to_string())
 }
 
 fn alias_key(namespace: &ProfileCacheNamespace, device_id: &str, id8: &str) -> CacheKey {

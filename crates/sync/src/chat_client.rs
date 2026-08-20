@@ -2016,7 +2016,11 @@ impl Actor {
             tracing::warn!("chat2: gap repairs exhausted; redialing for a full catch-up");
             return false;
         }
-        tracing::info!(after, attempt = *repairs, "chat2: backfilling over a row gap");
+        tracing::info!(
+            after,
+            attempt = *repairs,
+            "chat2: backfilling over a row gap"
+        );
         let req = wire::encode(
             frame_type::ROWS_REQ,
             &wire::RowsReqHeader {
