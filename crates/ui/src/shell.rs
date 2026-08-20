@@ -5848,7 +5848,48 @@ impl Shell {
         // label and its secondary status line. The avatar is seeded from the
         // stable identity string (email when signed in, scope label
         // otherwise), so the same account wears the same face everywhere.
-        let avatar = crate::avatar::blob_avatar(&menu_identity, 28.0);
+        // This one is the live variant — it blinks every few seconds — and
+        // wears the current Organization's crest on its bottom-right corner,
+        // so which Organization this window works in reads straight off the
+        // avatar. The plate separating crest from blob is the sidebar surface
+        // plus the trigger's own hover/open wash (same key), so hovering the
+        // row never leaves a fixed-color hole around the badge; on frosted
+        // sidebars an opaque plate over glass is a deliberate compromise.
+        let organization_badge = self.current_organization_id(cx).map(|organization_id| {
+            let wash = if open {
+                theme.glass_hover()
+            } else {
+                motion::hover_blend(
+                    "user-menu-trigger",
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover().opacity(0.8),
+                )
+            };
+            div()
+                .absolute()
+                .right(px(-3.0))
+                .bottom(px(-3.0))
+                .rounded(px(3.5))
+                .bg(theme.surface)
+                .child(
+                    div()
+                        .rounded(px(3.5))
+                        .bg(wash)
+                        .p(px(1.5))
+                        .child(crate::avatar::organization_avatar(&organization_id, 10.0)),
+                )
+        });
+        let avatar = div()
+            .relative()
+            .flex_none()
+            .size(px(28.0))
+            .child(crate::avatar::blob_avatar_live(
+                &menu_identity,
+                28.0,
+                cx.entity_id(),
+                cx,
+            ))
+            .children(organization_badge);
         let mut trigger = div()
             .id("user-menu")
             .key_context("OrganizationMenu")

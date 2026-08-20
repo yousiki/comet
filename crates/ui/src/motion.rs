@@ -118,6 +118,109 @@ pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Blink clock — sparse wake-ups for the live avatar
+// ---------------------------------------------------------------------------
+
+/// Nominal milliseconds between blink starts. Where the blink lands inside
+/// each cycle shifts by a per-cycle hash (up to [`BLINK_JITTER_MS`]), so the
+/// cadence never turns metronomic.
+const BLINK_PERIOD_MS: u64 = 7_000;
+/// One blink as a step sequence of (offset ms, eye openness): close, closed,
+/// half reopen; the final entry ends the blink and returns the eyes to rest.
+/// These are the only openness values a live avatar ever renders, so each
+/// seed rasterizes exactly two extra textures beyond its resting frame.
+const BLINK_FRAMES: [(u64, f32); 4] = [(0, 0.5), (70, 0.15), (170, 0.5), (240, 1.0)];
+const BLINK_LEN_MS: u64 = BLINK_FRAMES[BLINK_FRAMES.len() - 1].0;
+/// Largest per-cycle shift of the blink start inside its cycle.
+const BLINK_JITTER_MS: u64 = 2_500;
+// A blink always fits inside its own cycle, wherever the jitter puts it.
+const _: () = assert!(BLINK_JITTER_MS + BLINK_LEN_MS <= BLINK_PERIOD_MS);
+
+/// One pending wake-up per view, as absolute ms on the [`PulseClock`] epoch.
+/// Keyed by view, not avatar: with several live avatars in one view the map
+/// tightens to the earliest pending wake, and a stale later timer firing
+/// costs one redundant notify — bounded, self-healing.
+#[derive(Default)]
+struct BlinkWakes(HashMap<EntityId, u64>);
+
+impl Global for BlinkWakes {}
+
+/// Eye openness `{1.0, 0.5, 0.15}` for a live avatar whose blink cycle is
+/// shifted by `phase_offset` in `[0, 1)`. Renders are driven entirely by
+/// one-shot timers armed at the next frame boundary — a blink is four wakes,
+/// the rest of the cycle is one — so an otherwise idle window repaints ~5
+/// times per cycle and never rides the 30fps pulse clock. Integer-ms math on
+/// the shared epoch keeps the schedule exact at any uptime. Reduced motion
+/// pins the eyes open and schedules nothing.
+pub fn blink_openness(phase_offset: f32, view: EntityId, cx: &mut App) -> f32 {
+    if cx.reduce_motion() {
+        return 1.0;
+    }
+    let now_ms = cx
+        .default_global::<PulseClock>()
+        .epoch
+        .elapsed()
+        .as_millis() as u64;
+    let shifted = now_ms + (f64::from(phase_offset) * BLINK_PERIOD_MS as f64) as u64;
+    let (openness, next_change_in) = blink_state(shifted);
+    schedule_blink_wake(now_ms + next_change_in, view, cx);
+    openness
+}
+
+/// Pure step lookup: openness at shifted-clock ms `t`, and ms until it next
+/// changes. Cycle `k` blinks at `k * BLINK_PERIOD_MS + blink_jitter(k)`.
+fn blink_state(t: u64) -> (f32, u64) {
+    let (cycle, into) = (t / BLINK_PERIOD_MS, t % BLINK_PERIOD_MS);
+    let start = blink_jitter(cycle);
+    if into < start {
+        return (1.0, start - into);
+    }
+    let d = into - start;
+    if d < BLINK_LEN_MS {
+        // Last keyframe at or before `d`; it holds until the next one.
+        let i = BLINK_FRAMES.iter().rposition(|(off, _)| *off <= d).unwrap();
+        return (BLINK_FRAMES[i].1, BLINK_FRAMES[i + 1].0 - d);
+    }
+    // Resting until the next cycle's blink.
+    (1.0, BLINK_PERIOD_MS - into + blink_jitter(cycle + 1))
+}
+
+/// Where cycle `k`'s blink starts inside the cycle — a hash (splitmix64), not
+/// state, so every render derives the same schedule from the wall clock.
+fn blink_jitter(cycle: u64) -> u64 {
+    let mut z = cycle.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (z ^ (z >> 31)) % (BLINK_JITTER_MS + 1)
+}
+
+/// Arm one timer that re-renders `view` at epoch-ms `target`, unless an
+/// at-least-as-early wake is already pending for it. Boundaries are integer
+/// ms on the shared epoch, so re-renders between wakes recompute the same
+/// target and dedup exactly.
+fn schedule_blink_wake(target_ms: u64, view: EntityId, cx: &mut App) {
+    let wakes = cx.default_global::<BlinkWakes>();
+    if wakes.0.get(&view).is_some_and(|at| *at <= target_ms) {
+        return;
+    }
+    wakes.0.insert(view, target_ms);
+    let epoch = cx.default_global::<PulseClock>().epoch;
+    cx.spawn(async move |cx| {
+        let now_ms = epoch.elapsed().as_millis() as u64;
+        cx.background_executor()
+            .timer(Duration::from_millis(
+                target_ms.saturating_sub(now_ms).max(1),
+            ))
+            .await;
+        cx.update(|cx| {
+            cx.default_global::<BlinkWakes>().0.remove(&view);
+            cx.notify(view);
+        });
+    })
+    .detach();
+}
+
+// ---------------------------------------------------------------------------
 // Cubic bezier
 // ---------------------------------------------------------------------------
 
@@ -939,5 +1042,44 @@ mod tests {
         assert!(mid_fall > 0.1 && mid_fall < 1.0, "eases down");
         let mid_rise = gspin_opacity(0.96, 0.1);
         assert!(mid_rise > 0.1 && mid_rise < 1.0, "eases up");
+    }
+
+    #[test]
+    fn blink_steps_through_frames_and_rests_between() {
+        // Walk cycle 0 from its blink start by the advertised next-change
+        // intervals: exactly the keyframe openness sequence, then rest.
+        let start = blink_jitter(0);
+        let mut t = start;
+        let mut seen = Vec::new();
+        while t < BLINK_PERIOD_MS {
+            let (openness, next) = blink_state(t);
+            seen.push(openness);
+            assert!(next > 0, "zero-length step at {t}");
+            t += next;
+        }
+        assert_eq!(seen, vec![0.5, 0.15, 0.5, 1.0]);
+        // The rest step lands exactly on cycle 1's blink start, mid-close.
+        assert_eq!(t, BLINK_PERIOD_MS + blink_jitter(1));
+        assert_eq!(blink_state(t).0, 0.5);
+
+        // Mid-keyframe: openness holds, wake lands on the next boundary.
+        assert_eq!(blink_state(start + 30), (0.5, 40));
+        // Before the blink: resting, waking exactly at the blink start.
+        let late_start = blink_jitter(3);
+        if late_start > 0 {
+            assert_eq!(
+                blink_state(3 * BLINK_PERIOD_MS),
+                (1.0, late_start),
+                "cycle 3 pre-blink"
+            );
+        }
+    }
+
+    #[test]
+    fn blink_jitter_varies_within_bounds() {
+        let values: std::collections::HashSet<u64> = (0..200).map(blink_jitter).collect();
+        assert!(values.iter().all(|j| *j <= BLINK_JITTER_MS));
+        // A metronome was the bug; the hash must actually spread.
+        assert!(values.len() > 50, "only {} distinct offsets", values.len());
     }
 }
