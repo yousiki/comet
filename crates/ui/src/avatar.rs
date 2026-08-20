@@ -3,18 +3,34 @@
 //! in-memory SVG and drawn through gpui's image pipeline. `Image` is keyed by
 //! a content hash, so each distinct avatar rasterizes once per session.
 
-use gpui::{Image, ImageFormat, Img, Styled, img, px};
+use gpui::{App, EntityId, Image, ImageFormat, Img, Styled, img, px};
 use std::sync::Arc;
 
 /// Square avatar for `seed`, `size` logical pixels on a side. Same seed,
 /// same face — across frames, restarts, and devices.
 pub fn blob_avatar(seed: &str, size: f32) -> Img {
+    blob_frame(seed, size, 1.0)
+}
+
+/// [`blob_avatar`] that blinks every few seconds. Renders are timer-driven —
+/// one wake per blink keyframe, one across the rest of the cycle — and the
+/// openness values come from a fixed three-level table, so each seed only
+/// ever rasterizes two frames beyond the resting one it shares with the
+/// static avatar. Honors reduced motion.
+pub fn blob_avatar_live(seed: &str, size: f32, view: EntityId, cx: &mut App) -> Img {
+    // The phase offset reuses the seed's first trait draw: any stable value
+    // in [0, 1) works, and a fresh Traits stream leaves the face untouched.
+    let openness = crate::motion::blink_openness(Traits::new(seed).unit(), view, cx);
+    blob_frame(seed, size, openness)
+}
+
+fn blob_frame(seed: &str, size: f32, openness: f32) -> Img {
     // gpui rasterizes SVGs at their intrinsic size; author at 2× the logical
     // size so 1x and 2x displays both sample down, never up.
     let dim = (size * 2.0).round() as u32;
     img(Arc::new(Image::from_bytes(
         ImageFormat::Svg,
-        svg(seed, dim).into_bytes(),
+        svg_frame(seed, dim, openness).into_bytes(),
     )))
     .size(px(size))
     .flex_none()
@@ -91,7 +107,9 @@ fn gradient(t: &mut Traits) -> (String, String) {
     )
 }
 
-fn svg(seed: &str, dim: u32) -> String {
+/// One frame of the blob face. `openness` scales the eyes' vertical radius:
+/// 1.0 is the resting face (round eyes), lower values are mid-blink lids.
+fn svg_frame(seed: &str, dim: u32, openness: f32) -> String {
     let mut t = Traits::new(seed);
     let (top, bottom) = gradient(&mut t);
 
@@ -131,10 +149,23 @@ fn svg(seed: &str, dim: u32) -> String {
     let eye_y = t.range(52.0, 60.0);
     let eye_r = t.range(4.2, 5.8);
 
+    // Blinking squashes the eye vertically; the resting face keeps the exact
+    // circle markup it has always had, so its content hash — and cached
+    // rasterization — never changes.
+    let eye = |x: f32| {
+        if openness >= 1.0 {
+            format!(r##"<circle cx="{x:.1}" cy="{eye_y:.1}" r="{eye_r:.1}" fill="#22242a"/>"##)
+        } else {
+            let ry = (eye_r * openness).max(0.8);
+            format!(
+                r##"<ellipse cx="{x:.1}" cy="{eye_y:.1}" rx="{eye_r:.1}" ry="{ry:.1}" fill="#22242a"/>"##
+            )
+        }
+    };
+    let eyes = format!("{}{}", eye(64.0 - eye_dx), eye(64.0 + eye_dx));
+
     format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{dim}" height="{dim}" viewBox="0 0 128 128"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{top}"/><stop offset="1" stop-color="{bottom}"/></linearGradient></defs><path d="{d}" fill="url(#g)"/><circle cx="{lx:.1}" cy="{eye_y:.1}" r="{eye_r:.1}" fill="#22242a"/><circle cx="{rx:.1}" cy="{eye_y:.1}" r="{eye_r:.1}" fill="#22242a"/></svg>"##,
-        lx = 64.0 - eye_dx,
-        rx = 64.0 + eye_dx,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{dim}" height="{dim}" viewBox="0 0 128 128"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{top}"/><stop offset="1" stop-color="{bottom}"/></linearGradient></defs><path d="{d}" fill="url(#g)"/>{eyes}</svg>"##
     )
 }
 
@@ -173,7 +204,11 @@ fn organization_svg(seed: &str, dim: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{hex, organization_svg, seed_color, svg};
+    use super::{hex, organization_svg, seed_color, svg_frame};
+
+    fn svg(seed: &str, dim: u32) -> String {
+        svg_frame(seed, dim, 1.0)
+    }
 
     #[test]
     fn seed_color_matches_avatar_gradient_top_stop() {
@@ -196,6 +231,25 @@ mod tests {
             let s = svg(seed, 56);
             assert!(s.starts_with("<svg"), "not an svg: {s}");
             assert!(!s.contains("NaN") && !s.contains("inf"), "bad number: {s}");
+        }
+    }
+
+    #[test]
+    fn blink_frames_share_the_face_and_only_squash_the_eyes() {
+        for openness in [0.5, 0.15] {
+            let open = svg("a@b.c", 56);
+            let lidded = svg_frame("a@b.c", 56, openness);
+            assert_ne!(open, lidded);
+            assert!(lidded.contains("<ellipse"), "no lids: {lidded}");
+            assert!(!lidded.contains("NaN") && !lidded.contains("inf"));
+            // Same silhouette: only the eye markup differs.
+            let silhouette = |s: &str| {
+                s.split(" d=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .map(String::from)
+            };
+            assert_eq!(silhouette(&open), silhouette(&lidded), "silhouette moved");
         }
     }
 
