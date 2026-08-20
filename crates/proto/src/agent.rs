@@ -361,6 +361,17 @@ pub enum AgentEvent {
         error: Option<String>,
         session_id: Option<String>,
     },
+    /// A USER-role message injected into a running session — today only seen
+    /// wrapped in [`AgentEvent::Subagent`]: the PARENT agent steering its
+    /// subagent mid-run (claude: a tagged user frame's text blocks). The
+    /// engine writes it to the subagent doc as its own user entry, closing
+    /// the streaming assistant segment above it — the subagent transcript
+    /// then reads like any steered chat. Never emitted untagged (the parent
+    /// chat's user messages come from doc commands, not the wire).
+    #[serde(rename_all = "camelCase")]
+    UserMessage {
+        text: String,
+    },
     /// An event belonging to a SUBAGENT's nested transcript, attributed to
     /// the spawning tool call (`parent_tool_use_id` = the parent-feed
     /// `ToolCall::id` that launched it). Never folded into the parent chat

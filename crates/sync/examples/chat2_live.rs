@@ -30,14 +30,16 @@ fn import_materialized(doc: &LoroDoc, bytes: &[u8]) -> Result<bool, String> {
 }
 
 impl ChatDocSink for DocSink {
-    fn apply_row(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
+    fn apply_row(&self, bytes: &[u8], cursor: u64) {
         let doc = self.doc.lock().unwrap();
-        if !import_materialized(&doc, bytes)? {
-            return Err("row import has unresolved dependencies".into());
+        // Parked deps are safe: the client's contiguity rule holds the cursor
+        // at the gap and backfills. Only malformed bytes cost the row.
+        if let Err(err) = doc.import(bytes) {
+            eprintln!("row import failed; skipping row: {err}");
+            return;
         }
         self.cursor.store(cursor, Relaxed);
         self.rows_applied.fetch_add(1, Relaxed);
-        Ok(())
     }
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
         let doc = self.doc.lock().unwrap();

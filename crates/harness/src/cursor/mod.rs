@@ -787,10 +787,34 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
             let name = frame.get("name").and_then(Value::as_str).unwrap_or("tool");
             let args = frame.get("args").cloned().unwrap_or(Value::Null);
             match frame.get("phase").and_then(Value::as_str) {
-                Some("start") => vec![tag(AgentEvent::ToolCall {
-                    id,
-                    call: decode_tool(name, &args),
-                })],
+                Some("start") => {
+                    let mut events = vec![tag(AgentEvent::ToolCall {
+                        id: id.clone(),
+                        call: decode_tool(name, &args),
+                    })];
+                    // A spawn's prompt is the subagent's opening user
+                    // message — the SDK's nested stream never carries it
+                    // (only the child's own updates), so seed it at the
+                    // spawn and the subagent transcript starts the way
+                    // every chat does. Top-level spawns only: nested
+                    // spawns' interiors share their parent's doc.
+                    if name == "task" && parent.is_none() {
+                        if let Some(prompt) = args
+                            .get("prompt")
+                            .or_else(|| args.get("description"))
+                            .and_then(Value::as_str)
+                            .filter(|p| !p.trim().is_empty())
+                        {
+                            events.push(AgentEvent::Subagent {
+                                parent_tool_use_id: id,
+                                event: Box::new(AgentEvent::UserMessage {
+                                    text: prompt.to_owned(),
+                                }),
+                            });
+                        }
+                    }
+                    events
+                }
                 Some("end") => {
                     let is_error = frame.get("error").and_then(Value::as_bool) == Some(true);
                     let mut events = vec![
@@ -899,6 +923,30 @@ mod tests {
             decode_tool("somethingNew", &json!({})),
             ToolCall::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn task_start_seeds_the_subagent_opening_user_message() {
+        let frame: Value = serde_json::from_str(
+            r#"{"ev":"tool","phase":"start","id":"call_task_1","name":"task","args":{"description":"probe","prompt":"scan the fold path"}}"#,
+        )
+        .unwrap();
+        let events = map_shim_frame(&frame, false);
+        assert!(matches!(
+            &events[..],
+            [
+                AgentEvent::ToolCall { id, .. },
+                AgentEvent::Subagent { parent_tool_use_id, event },
+            ] if id == "call_task_1"
+                && parent_tool_use_id == "call_task_1"
+                && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "scan the fold path")
+        ));
+        // A NESTED spawn's interior shares its parent's doc: no seeding.
+        let nested: Value = serde_json::from_str(
+            r#"{"ev":"tool","phase":"start","id":"call_task_2","name":"task","args":{"prompt":"inner"},"parent":"call_task_1"}"#,
+        )
+        .unwrap();
+        assert_eq!(map_shim_frame(&nested, false).len(), 1);
     }
 
     #[test]

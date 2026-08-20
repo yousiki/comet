@@ -558,12 +558,34 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
             _ => None,
         })
         .expect("Agent spawn tool call in the parent feed");
+    // The synthesized opening user message rides WITH the spawn (before the
+    // eager done); the child's own interior streams between the two dones.
+    let opening: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if *parent_tool_use_id == spawn_id
+                        && matches!(event.as_ref(), AgentEvent::UserMessage { .. })
+            )
+            .then_some(i)
+        })
+        .collect();
+    assert_eq!(opening.len(), 1, "one seeded opening prompt: {events:?}");
+    assert!(opening[0] < dones[0], "opening rides with the spawn");
     let tagged: Vec<usize> = events
         .iter()
         .enumerate()
         .filter_map(|(i, e)| {
-            matches!(e, AgentEvent::Subagent { parent_tool_use_id, .. } if *parent_tool_use_id == spawn_id)
-                .then_some(i)
+            matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if *parent_tool_use_id == spawn_id
+                        && !matches!(event.as_ref(), AgentEvent::UserMessage { .. })
+            )
+            .then_some(i)
         })
         .collect();
     assert!(!tagged.is_empty(), "tagged subagent traffic: {events:?}");

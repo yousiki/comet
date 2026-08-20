@@ -2347,14 +2347,17 @@ impl Pickers {
         // right after send mints it) still renders the DRAFT footer — the
         // values are identical, so the toolbar never blinks through a
         // half-empty locked state.
-        let (space, session) = {
+        let (space, session, change_request) = {
             let state = self.state.read(cx);
             let space = state.selected_space_row().cloned();
             let session = state
                 .selected_chat
                 .as_ref()
                 .and_then(|_| state.selected_chat_row().cloned());
-            (space, session)
+            let change_request = session
+                .as_ref()
+                .and_then(|chat| state.change_request_for_chat(chat).cloned());
+            (space, session, change_request)
         };
         let row = || {
             // Symmetric: the container's 8px gap sits above the toolbar;
@@ -2404,7 +2407,16 @@ impl Pickers {
                 .flex()
                 .flex_row()
                 .items_center()
+                .gap(px(4.0))
                 .min_w_0()
+                .when_some(change_request, |el, summary| {
+                    el.child(crate::change_requests::pull_request_badge(
+                        "composer-pull-request".into(),
+                        summary,
+                        crate::change_requests::ChangeRequestBadgeSurface::Composer,
+                        &theme,
+                    ))
+                })
                 .child(Self::footer_label(
                     crate::icons::GIT_BRANCH,
                     chat.branch

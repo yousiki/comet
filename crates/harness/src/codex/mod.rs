@@ -62,7 +62,7 @@ use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
     ChildRoute, Phase, delta_text, item_id, item_type, map_item, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event,
+    route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -797,6 +797,25 @@ async fn run_session(session: Session) {
                                             vec![AgentEvent::TextDelta {
                                                 text: "\n\n".into(),
                                             }]
+                                        } else if matches!(
+                                            item_type(&item),
+                                            "userMessage" | "user_message"
+                                        ) {
+                                            // A CHILD thread's user message
+                                            // is the parent steering it (the
+                                            // collab send_message path) —
+                                            // its own entry in the subagent
+                                            // doc. Completed only: both
+                                            // lifecycle events carry the
+                                            // full item.
+                                            if phase == Phase::Completed {
+                                                user_message_text(&item)
+                                                    .map(|text| AgentEvent::UserMessage { text })
+                                                    .into_iter()
+                                                    .collect()
+                                            } else {
+                                                Vec::new()
+                                            }
                                         } else {
                                             map_item(phase, &item)
                                         }

@@ -125,6 +125,10 @@ case "$turnline" in
   emit '{"method":"item/agentMessage/delta","params":{"threadId":"child-1","itemId":"cm1","delta":"child says hi"}}'
   emit '{"method":"item/started","params":{"threadId":"child-1","item":{"id":"cs1","type":"commandExecution","command":"echo hi"}}}'
   emit '{"method":"item/completed","params":{"threadId":"child-1","item":{"id":"cs1","type":"commandExecution","command":"echo hi","status":"completed","exitCode":0}}}'
+  # The parent steering the child (collab send_message): a userMessage item
+  # on the CHILD thread — tagged UserMessage, emitted once (completed only).
+  emit '{"method":"item/started","params":{"threadId":"child-1","item":{"id":"cu1","type":"userMessage","text":"also check the rebuild"}}}'
+  emit '{"method":"item/completed","params":{"threadId":"child-1","item":{"id":"cu1","type":"userMessage","text":"also check the rebuild"}}}'
   # The child settles ITS turn — the parent turn must keep running.
   emit '{"method":"turn/completed","params":{"threadId":"child-1","turn":{"id":"ct-1"}}}'
   emit '{"method":"item/agentMessage/delta","params":{"threadId":"th-1","itemId":"m1","delta":"parent still going"}}'

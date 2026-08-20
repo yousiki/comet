@@ -703,6 +703,28 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
             diff: None,
         }),
     }));
+    // The parent's steer (a userMessage item on the CHILD thread) arrives as
+    // exactly one tagged UserMessage — completed only, never doubled by the
+    // started lifecycle event, never leaked untagged.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if parent_tool_use_id == "call_alpha"
+                        && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "also check the rebuild")
+            ))
+            .count(),
+        1,
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserMessage { .. })),
+        "steer leaked into the parent feed: {events:?}"
+    );
     assert!(
         !events
             .iter()

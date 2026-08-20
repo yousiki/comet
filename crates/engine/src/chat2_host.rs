@@ -204,19 +204,24 @@ fn import_blob_materialized(doc: &loro::LoroDoc, bytes: &[u8]) -> Result<bool, S
 }
 
 impl ChatDocSink for EngineChatSink {
-    fn apply_row(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
+    fn apply_row(&self, bytes: &[u8], cursor: u64) {
         let Some(_lifecycle) = self.active_lifecycle() else {
-            return Err("chat handle retired during row import".into());
+            return;
         };
         let Some(doc) = self.doc.upgrade() else {
-            return Err("doc evicted during row import".into());
+            return;
         };
-        match import_blob_materialized(doc.doc(), bytes) {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!(chat = %self.chat_id,
-                    "chat2 sink: row import parked on missing dependencies");
-                return Err("row import has unresolved dependencies".into());
+        match doc.doc().import(bytes) {
+            Ok(status) => {
+                if status.pending.is_some() {
+                    // Missing causal deps: loro parked these ops invisibly.
+                    // The client's cursor contiguity rule keeps `cursor`
+                    // honest (it never jumps a gap), so persisting is safe —
+                    // this warn is the tripwire that the 2026-08-19
+                    // empty-doc/advanced-cursor wedge shape was seen live.
+                    tracing::warn!(chat = %self.chat_id, cursor,
+                        "chat2 sink: row parked on missing deps (gap repair should follow)");
+                }
             }
             Err(err) => {
                 // Malformed remote bytes cost the row, never the doc (the same
@@ -227,7 +232,6 @@ impl ChatDocSink for EngineChatSink {
             }
         }
         self.persist_with_cursor(cursor, false, false);
-        Ok(())
     }
 
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
@@ -646,7 +650,7 @@ mod frontier_tests {
         doc.doc().commit();
         let sink = EngineChatSink::new(&doc, store.clone(), "gen3-chat", 3, 0, 2);
 
-        sink.apply_row(&doc.export_snapshot().unwrap(), 5).unwrap();
+        sink.apply_row(&doc.export_snapshot().unwrap(), 5);
         let (_, cursor, epoch) = store
             .load_snapshot_with_cursor("gen3-chat")
             .unwrap()
@@ -687,7 +691,7 @@ mod frontier_tests {
             .doc()
             .export(loro::ExportMode::updates(&loro::VersionVector::default()))
             .unwrap();
-        sink.apply_row(&update, 1).unwrap();
+        sink.apply_row(&update, 1);
         sink.advance_cursor(1);
         let (_, cursor, epoch) = store
             .load_snapshot_with_cursor("reset-chat")
@@ -700,8 +704,12 @@ mod frontier_tests {
         );
     }
 
+    /// A parked row persists the cursor its CALLER computed (the client's
+    /// contiguity rule already held it back at the gap) but must not make the
+    /// parked content readable. A checkpoint is the stricter contract: it
+    /// claims to be a complete frontier, so missing deps still fail it.
     #[test]
-    fn missing_dependency_imports_never_advance_the_durable_cursor() {
+    fn parked_row_keeps_content_invisible_while_a_parked_checkpoint_fails() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let receiver = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
@@ -741,20 +749,19 @@ mod frontier_tests {
             .export(loro::ExportMode::updates(&after_founding))
             .unwrap();
 
-        let row_error = sink
-            .apply_row(&dependent_only, 9)
-            .expect_err("a parked row must be reported to ChatClient");
-        assert!(row_error.contains("unresolved dependencies"));
-        let replay_error = sink
-            .apply_row(&dependent_only, 9)
-            .expect_err("replaying a parked row must still report its missing deps");
-        assert!(replay_error.contains("unresolved dependencies"));
+        // The caller passes the cursor it deemed honest; the sink persists
+        // exactly that, and a replay of the same parked row is a no-op.
+        sink.apply_row(&dependent_only, 9);
+        sink.apply_row(&dependent_only, 9);
         let (_, cursor, epoch) = store
             .load_snapshot_with_cursor("pending-row")
             .unwrap()
             .unwrap();
-        assert_eq!((cursor, epoch), (0, CHAT2_DOC_EPOCH));
-        assert!(receiver.doc().get_map("meta").get("dependent").is_none());
+        assert_eq!((cursor, epoch), (9, CHAT2_DOC_EPOCH));
+        assert!(
+            receiver.doc().get_map("meta").get("dependent").is_none(),
+            "parked ops must stay invisible until their dependency lands"
+        );
 
         // Checkpoint validation gets an independent empty peer: repeating a
         // row already parked in this receiver could be classified as a no-op
@@ -787,7 +794,7 @@ mod frontier_tests {
         assert_eq!(cursor, 0, "failed checkpoint must not advance cursor");
 
         // Importing the complete checkpoint supplies the dependency and
-        // materializes the parked row before establishing its cursor.
+        // materializes the parked row.
         sink.apply_checkpoint(&source.export(loro::ExportMode::Snapshot).unwrap(), 8)
             .unwrap();
         assert!(receiver.doc().get_map("meta").get("dependent").is_some());
@@ -796,8 +803,8 @@ mod frontier_tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            cursor, 8,
-            "complete checkpoint establishes the safe frontier"
+            cursor, 9,
+            "an older checkpoint repairs parked content without rewinding the cursor"
         );
     }
 
@@ -890,8 +897,7 @@ mod frontier_tests {
                 .export(loro::ExportMode::updates(&loro::VersionVector::default()))
                 .unwrap(),
             10,
-        )
-        .unwrap();
+        );
         sink.advance_cursor(11);
 
         let (bytes, cursor, epoch) = store

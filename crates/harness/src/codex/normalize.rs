@@ -234,9 +234,32 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 matches!(str_field(item, &["kind"]).as_str(), "failed" | "errored"),
             )
         }
-        // userMessage / reasoning / agentMessage flow through delta channels.
+        // reasoning / agentMessage flow through delta channels; the PARENT
+        // feed's userMessage items are echoes of prompts we sent (already in
+        // the doc). A CHILD thread's userMessage is different — the parent
+        // steering its subagent — and is mapped where child items route
+        // (mod.rs child branch), not here.
         _ => Vec::new(),
     }
+}
+
+/// The text of a `userMessage` thread item. Codex builds have carried both
+/// shapes: a plain `text` field and a `content` array of text blocks.
+pub(crate) fn user_message_text(item: &Value) -> Option<String> {
+    let text = str_field(item, &["text"]);
+    if !text.trim().is_empty() {
+        return Some(text);
+    }
+    let joined: String = item
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!joined.trim().is_empty()).then_some(joined)
 }
 
 /// The thread a notification is addressed to: `thread/started` carries it at
@@ -329,6 +352,23 @@ pub(crate) fn route_child_notification(method: &str) -> ChildRoute {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn user_message_text_accepts_both_shapes() {
+        assert_eq!(
+            user_message_text(&json!({"text": "steer"})),
+            Some("steer".into())
+        );
+        assert_eq!(
+            user_message_text(&json!({"content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+            ]})),
+            Some("a\n\nb".into())
+        );
+        assert_eq!(user_message_text(&json!({"text": "  "})), None);
+        assert_eq!(user_message_text(&json!({})), None);
+    }
 
     #[test]
     fn delta_accepts_both_spellings() {

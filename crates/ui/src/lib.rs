@@ -17,6 +17,7 @@ pub mod appearance;
 pub mod attachments;
 pub mod avatar;
 pub mod badges;
+pub mod change_requests;
 pub mod changes;
 pub mod comments;
 pub mod composer;

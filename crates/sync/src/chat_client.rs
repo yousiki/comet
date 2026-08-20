@@ -37,7 +37,16 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(15);
 const BACKFILL_DEADLINE: Duration = Duration::from_secs(120);
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
-const BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// Worst-case dark window after the network returns (event wakes usually
+/// beat this; the cap only matters when every event path missed).
+const BACKOFF_CAP: Duration = Duration::from_secs(16);
+/// A joined session must survive this long before a disconnect resets the
+/// backoff to base (see registry.rs STABLE_RESET — same connect-and-die
+/// hot-loop rationale).
+const STABLE_RESET: Duration = Duration::from_secs(30);
+/// Safety re-check cadence while parked on "OS says offline" — a stuck or
+/// wrong path monitor degrades to slow polling, never to silence.
+const OFFLINE_PARK_RECHECK: Duration = Duration::from_secs(30);
 /// Quiet-room probe cadence default (matches the registry's fleet math).
 const PROBE_QUIET_DEFAULT: Duration = Duration::from_secs(900);
 /// A checkpoint fetch that hasn't finished by now is treated as a dead link
@@ -106,11 +115,12 @@ pub enum ChatEvent {
 /// every method persists doc content AND the room cursor in one transaction
 /// (`DocsStore::save_snapshot_with_cursor`) so they can never diverge.
 pub trait ChatDocSink: Send + Sync + 'static {
-    /// Import one remote update row; `cursor` is the row's seq. `Ok` is the
-    /// protocol-level acknowledgement that every dependency materialized and
-    /// the cursor may advance. A sink must return `Err` for an import parked on
-    /// missing CRDT dependencies (or when its lifecycle is no longer active).
-    fn apply_row(&self, bytes: &[u8], cursor: u64) -> Result<(), String>;
+    /// Import one remote update row. `cursor` is the caller's HONEST cursor
+    /// after the contiguity rule ran — not necessarily the row's own seq: a
+    /// row arriving across a gap is applied (loro parks dependents harmlessly)
+    /// while the cursor holds back until `maybe_repair_gap` backfills the
+    /// missing span. Persisting a parked import is therefore safe.
+    fn apply_row(&self, bytes: &[u8], cursor: u64);
     /// Replace/merge from a checkpoint blob; `cursor` is its checkpointSeq.
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String>;
     /// Client-side precision (replaces the server VV diff): is the server
@@ -122,26 +132,6 @@ pub trait ChatDocSink: Send + Sync + 'static {
     /// Persist `cursor` exactly (including a backwards move) without treating
     /// it as an own-write ack or promoting a generation handoff epoch.
     fn reset_cursor(&self, cursor: u64);
-}
-
-/// Re-anchor after the sink could not materialize a row. A present checkpoint
-/// is the only safe non-zero boundary; without one the complete row log must be
-/// replayed. The reset generation advances even when the numeric cursor is
-/// unchanged so every in-flight HTTP/WS response from the failed lineage is
-/// rejected before it can move the cursor forward again.
-fn reanchor_after_row_import_failure(shared: &mut Shared, sink: &dyn ChatDocSink) -> (u64, u64) {
-    let previous = shared.cursor;
-    let recovery_cursor = shared
-        .server
-        .filter(|state| state.checkpoint_size > 0)
-        // Recovery may move backwards, never forwards: a checkpoint newer
-        // than the last materialized row is not yet a safe local boundary.
-        .map(|state| state.checkpoint_seq.min(previous))
-        .unwrap_or(0);
-    shared.cursor = recovery_cursor;
-    shared.reset_version = shared.reset_version.wrapping_add(1);
-    sink.reset_cursor(recovery_cursor);
-    (previous, recovery_cursor)
 }
 
 /// `GET /chat2/{chatId}/checkpoint` over HTTP. Implementations should resume
@@ -454,6 +444,14 @@ struct Shared {
     /// past N≈25), and each ack immediately re-arms the clock until the
     /// queue empties.
     quota_blocked: bool,
+    /// A row/ack arrived with `seq > cursor + 1`: rows exist that this
+    /// client never received (live broadcast outran the backfill — the
+    /// mid-join race). The cursor must NOT skip the hole (skipped rows'
+    /// dependents park invisibly in loro's pending buffer and the doc
+    /// reads empty forever — the 2026-08-19 empty-doc/advanced-cursor
+    /// wedge); instead this flag asks the session loop for a rowsReq
+    /// backfill from the honest cursor.
+    gap_repair: bool,
 }
 
 /// `zeron sync` surface (plan: cursor / headSeq / floorLag / pendingPushes).
@@ -516,6 +514,9 @@ struct Flags {
     disconnects: std::sync::atomic::AtomicU64,
     rejected: std::sync::atomic::AtomicU64,
     server_resets: std::sync::atomic::AtomicU64,
+    /// Monotonic dial-attempt counter; each attempt's number is its trace id
+    /// in logs, so an incident reads as one numbered sequence.
+    dial_seq: std::sync::atomic::AtomicU64,
 }
 
 fn signal_access_denied(flags: &Flags, events: &broadcast::Sender<ChatEvent>) {
@@ -1377,23 +1378,22 @@ async fn offline_sync_once(
         applied = true;
     }
     for (row, payload) in response.rows {
-        if let Err(err) = sink.apply_row(&payload, row.seq) {
-            let (previous, recovery_cursor) =
-                reanchor_after_row_import_failure(&mut shared, sink.as_ref());
-            let restored = round_guard.finish_locked(&mut shared);
-            drop(shared);
+        // CONTIGUITY RULE (same as the WS ROW path): pulls request
+        // `after = pull_since` so rows arrive contiguous — but hold the rule
+        // anyway. A jump (trimmed log, server surprise) must not stamp the
+        // cursor over rows the doc never saw; apply the bytes and let
+        // `maybe_repair_gap` walk the missing span.
+        if row.seq <= shared.cursor + 1 {
+            shared.cursor = shared.cursor.max(row.seq);
+        } else {
+            shared.gap_repair = true;
             tracing::warn!(
-                error = %err,
-                row_seq = row.seq,
-                previous_cursor = previous,
-                recovery_cursor,
-                restored,
-                "chat2: http row was not materialized; re-anchoring"
+                seq = row.seq,
+                cursor = shared.cursor,
+                "chat2: http pull row gap; holding cursor and requesting backfill"
             );
-            let _ = nudge.try_send(());
-            return;
         }
-        shared.cursor = shared.cursor.max(row.seq);
+        sink.apply_row(&payload, shared.cursor);
         applied = true;
     }
     let verified_frontier = verified_frontier.expect("normal response validated a frontier");
@@ -1442,6 +1442,11 @@ impl Actor {
             if *self.shutdown.borrow() {
                 return;
             }
+            let attempt = self
+                .flags
+                .dial_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
             let dial = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()).await;
             let pipe = match dial {
                 Ok(Ok(pipe)) => pipe,
@@ -1451,7 +1456,7 @@ impl Actor {
                         let _ = ready.send(Err(err));
                         return; // first join failed: caller owns the retry
                     }
-                    tracing::warn!(error = %err, "chat2 dial failed; backing off");
+                    tracing::warn!(error = %err, attempt, "chat2 dial failed; backing off");
                     self.spawn_offline_sync();
                     match self.wait_backoff(&mut wake, &mut online, backoff).await {
                         Waited::Shutdown => return,
@@ -1465,7 +1470,7 @@ impl Actor {
                         let _ = ready.send(Err(SyncError::WebSocket("connect timeout".into())));
                         return;
                     }
-                    tracing::warn!("chat2 dial timed out; backing off");
+                    tracing::warn!(attempt, "chat2 dial timed out; backing off");
                     self.spawn_offline_sync();
                     match self.wait_backoff(&mut wake, &mut online, backoff).await {
                         Waited::Shutdown => return,
@@ -1476,13 +1481,16 @@ impl Actor {
                 }
             };
 
+            let session_started = tokio::time::Instant::now();
             match self.run_session(pipe, &mut ready).await {
                 SessionEnd::Stop => return,
                 SessionEnd::Reconnect => {
                     use std::sync::atomic::Ordering::Relaxed;
-                    // A session that had joined resets the backoff — without
-                    // this, ~7 flaps pinned every future reconnect at the cap
-                    // for the life of the client.
+                    // Only a session that joined AND stayed healthy for a
+                    // while earns a fresh backoff. Reset-on-join alone let a
+                    // connect-and-die socket hot-loop at 250ms forever;
+                    // without any reset, ~7 flaps pinned every future
+                    // reconnect at the cap for the life of the client.
                     let joined = self.flags.connected.swap(false, Relaxed);
                     self.flags.disconnects.fetch_add(1, Relaxed);
                     let _ = self.events.send(ChatEvent::Disconnected);
@@ -1493,7 +1501,7 @@ impl Actor {
                         }
                         return;
                     }
-                    if joined {
+                    if joined && session_started.elapsed() >= STABLE_RESET {
                         backoff = BACKOFF_BASE;
                     }
                     self.spawn_offline_sync();
@@ -1508,7 +1516,9 @@ impl Actor {
     }
 
     /// Sleep out one backoff, cut short by system wake, a sibling dial
-    /// success, or shutdown.
+    /// success, or shutdown. While the OS reports no network path, the wait
+    /// parks on the event buses (with a coarse safety timer) instead of
+    /// burning dial attempts that cannot succeed.
     async fn wait_backoff(
         &mut self,
         wake: &mut tokio::sync::broadcast::Receiver<()>,
@@ -1519,6 +1529,11 @@ impl Actor {
         // or our own last dial would cut every wait to zero.
         while wake.try_recv().is_ok() {}
         while online.try_recv().is_ok() {}
+        let wait = if crate::wake::path_is_offline() {
+            wait.max(OFFLINE_PARK_RECHECK)
+        } else {
+            wait
+        };
         tokio::select! {
             _ = tokio::time::sleep(wait) => Waited::Elapsed,
             _ = wake.recv() => Waited::Woke,
@@ -1592,6 +1607,22 @@ impl Actor {
             }
         }
         lock(&self.shared).server = Some(state);
+        // Server behind our cursor = the room was reset/wiped. Detect on the
+        // RAW persisted cursor, BEFORE the amnesty below rewrites it —
+        // plan_catch_up treats the cursor as fresh; SURFACE the signal too:
+        // the host's re-seed recovery (chat-room.ts /reset) hangs off this
+        // event, and masking it was exactly how the s2 wedge class stayed
+        // invisible.
+        if lock(&self.shared).cursor > state.head_seq {
+            self.flags.server_resets.fetch_add(1, Relaxed);
+            tracing::warn!(
+                cursor = lock(&self.shared).cursor,
+                head_seq = state.head_seq,
+                "chat2: server lost state (headSeq < cursor) — treating as \
+                 fresh; host should re-seed via checkpoint"
+            );
+            let _ = self.events.send(ChatEvent::ServerReset);
+        }
         // Cursor amnesty, once per client: a cursor above the checkpoint seq
         // claims history the doc may have silently parked and dropped —
         // parked imports vanish on export while the cursor advances, and
@@ -1599,17 +1630,32 @@ impl Actor {
         // cursor 75 over a checkpoint-only doc, 2026-08-18). Clamp and
         // refetch: re-imports are no-ops and the trim policy bounds the
         // cost to the rows since the last checkpoint.
-        if state.checkpoint_size > 0 && !self.cursor_amnesty_done.swap(true, Relaxed) {
+        if !self.cursor_amnesty_done.swap(true, Relaxed) {
+            // Checkpoint-less rooms amnesty to ZERO: the same parked-import
+            // wedge (empty doc under an advanced cursor — 2026-08-19: a live
+            // broadcast mid-join outran the backfill and the cursor skipped
+            // the hole) with no checkpoint to clamp to. Refetching the whole
+            // log is bounded by the checkpoint threshold policy (a room
+            // past ~200 rows/512KB HAS a checkpoint) and re-imports are
+            // no-ops, so this is the cheap universal heal.
+            let clamp_to = if state.checkpoint_size > 0 {
+                state.checkpoint_seq
+            } else {
+                0
+            };
             let mut shared = lock(&self.shared);
-            if shared.cursor > state.checkpoint_seq {
+            if shared.cursor > clamp_to {
                 tracing::info!(
                     from = shared.cursor,
-                    to = state.checkpoint_seq,
-                    "chat2: cursor amnesty — refetching rows above the checkpoint"
+                    to = clamp_to,
+                    "chat2: cursor amnesty — refetching rows the doc may have parked"
                 );
-                shared.cursor = state.checkpoint_seq;
+                // `clamp_to`, not `checkpoint_seq`: with no checkpoint at all
+                // the honest floor is 0 — anchoring at a seq no checkpoint
+                // covers leaves the skipped prefix unreachable.
+                shared.cursor = clamp_to;
                 shared.reset_version = shared.reset_version.wrapping_add(1);
-                self.sink.reset_cursor(state.checkpoint_seq);
+                self.sink.reset_cursor(clamp_to);
             }
         }
         let cursor = lock(&self.shared).cursor;
@@ -1618,21 +1664,6 @@ impl Actor {
             self.flags.rejoins.fetch_add(1, Relaxed);
         }
         let _ = self.events.send(ChatEvent::Connected);
-
-        // Server behind our cursor = the room was reset/wiped. plan_catch_up
-        // treats the cursor as fresh; SURFACE the signal too — the host's
-        // re-seed recovery (chat-room.ts /reset) hangs off this event, and
-        // masking it was exactly how the s2 wedge class stayed invisible.
-        if cursor > state.head_seq {
-            self.flags.server_resets.fetch_add(1, Relaxed);
-            tracing::warn!(
-                cursor,
-                head_seq = state.head_seq,
-                "chat2: server lost state (headSeq < cursor) — treating as \
-                 fresh; host should re-seed via checkpoint"
-            );
-            let _ = self.events.send(ChatEvent::ServerReset);
-        }
 
         // ── catch-up: checkpoint precision + row backfill ───────────────────
         // Same presence rule as `plan_catch_up`: SIZE, not seq — a seeded
@@ -1644,9 +1675,14 @@ impl Actor {
             CatchUpPlan::RowsOnly { after } => after,
             CatchUpPlan::CheckpointThenRows { after } => after,
         };
-        // Clamp the persisted cursor into the room's honest range (server
-        // reset detection happened in plan_catch_up via after==0).
-        if after < cursor {
+        // The plan's `after` IS the cursor now — down (server reset / amnesty
+        // already applied) or UP (a contained checkpoint covers the skipped
+        // span). Without the raise, the backfill's first row (`after + 1`)
+        // reads as a contiguity gap against a stale lower cursor. Either
+        // direction is a non-monotonic jump, so it fences the in-flight HTTP
+        // sibling via `reset_version`; an unchanged cursor must NOT bump, or
+        // every ordinary rejoin would discard a healthy sibling round.
+        if after != cursor {
             let mut shared = lock(&self.shared);
             // No await occurred since `cursor` was read, but the HTTP sibling
             // may still have overtaken this handshake on another task.
@@ -1810,6 +1846,12 @@ impl Actor {
         // ── steady state ────────────────────────────────────────────────────
         let mut last_frame = tokio::time::Instant::now();
         let mut probe_deadline: Option<tokio::time::Instant> = None;
+        // Row-gap repairs this session (see `Shared::gap_repair`): a live
+        // frame during the backfill above may already have flagged one.
+        let mut gap_repairs = 0u32;
+        if !self.maybe_repair_gap(&mut pipe, &mut gap_repairs).await {
+            return SessionEnd::Reconnect;
+        }
         loop {
             let quiet_probe_at = last_frame + self.tuning.probe_quiet;
             let deadline_at = probe_deadline
@@ -1829,6 +1871,9 @@ impl Actor {
                         return SessionEnd::Reconnect;
                     };
                     if !self.handle_frame(frame, session_reset_version) {
+                        return SessionEnd::Reconnect;
+                    }
+                    if !self.maybe_repair_gap(&mut pipe, &mut gap_repairs).await {
                         return SessionEnd::Reconnect;
                     }
                 }
@@ -1953,6 +1998,36 @@ impl Actor {
         *lock(&self.offline_task) = Some(task);
     }
 
+    /// If a row/ack gap was flagged, request a backfill from the honest
+    /// cursor. Bounded per session: a gap the server can't fill (should be
+    /// impossible below the checkpoint floor) forces a redial, whose full
+    /// catch-up is the stronger repair.
+    async fn maybe_repair_gap(&self, pipe: &mut BinPipe, repairs: &mut u32) -> bool {
+        const MAX_GAP_REPAIRS_PER_SESSION: u32 = 3;
+        let (repair, after) = {
+            let mut shared = lock(&self.shared);
+            (std::mem::take(&mut shared.gap_repair), shared.cursor)
+        };
+        if !repair {
+            return true;
+        }
+        *repairs += 1;
+        if *repairs > MAX_GAP_REPAIRS_PER_SESSION {
+            tracing::warn!("chat2: gap repairs exhausted; redialing for a full catch-up");
+            return false;
+        }
+        tracing::info!(after, attempt = *repairs, "chat2: backfilling over a row gap");
+        let req = wire::encode(
+            frame_type::ROWS_REQ,
+            &wire::RowsReqHeader {
+                after,
+                exclude_own: false,
+            },
+            &[],
+        );
+        pipe.tx.send(req).await.is_ok()
+    }
+
     async fn push_pending(&self, pipe: &mut BinPipe) -> bool {
         // Clone rather than drain: batches stay queued until their ack.
         let frames: Vec<Vec<u8>> = lock(&self.shared)
@@ -1991,25 +2066,32 @@ impl Actor {
                 // Own-device rows can still arrive (live relay of a racing
                 // second socket, or a server that ignored excludeOwn) — Loro
                 // re-import is a no-op; the cursor advance is what matters.
-                let mut shared = lock(&self.shared);
-                if shared.reset_version != session_reset_version {
+                // CONTIGUITY RULE: the cursor claims "every row ≤ cursor is
+                // reflected in the doc", so it may only walk, never jump. A
+                // gap means rows we never received (live broadcast mid-join)
+                // — apply the bytes (loro parks dependents harmlessly), keep
+                // the honest cursor, and ask for a backfill repair.
+                let Some(effective) = ({
+                    let mut shared = lock(&self.shared);
+                    if shared.reset_version != session_reset_version {
+                        None
+                    } else {
+                        if row.seq > shared.cursor + 1 {
+                            shared.gap_repair = true;
+                            tracing::warn!(
+                                seq = row.seq,
+                                cursor = shared.cursor,
+                                "chat2: row gap detected; holding cursor and requesting backfill"
+                            );
+                        } else {
+                            shared.cursor = shared.cursor.max(row.seq);
+                        }
+                        Some(shared.cursor)
+                    }
+                }) else {
                     return false;
-                }
-                if let Err(err) = self.sink.apply_row(&frame.payload, row.seq) {
-                    let (previous, recovery_cursor) =
-                        reanchor_after_row_import_failure(&mut shared, self.sink.as_ref());
-                    drop(shared);
-                    tracing::warn!(
-                        error = %err,
-                        row_seq = row.seq,
-                        previous_cursor = previous,
-                        recovery_cursor,
-                        "chat2: websocket row was not materialized; redialing"
-                    );
-                    return false;
-                }
-                shared.cursor = shared.cursor.max(row.seq);
-                drop(shared);
+                };
+                self.sink.apply_row(&frame.payload, effective);
                 let _ = self.events.send(ChatEvent::Applied);
             }
             frame_type::ACK => {
@@ -2041,7 +2123,19 @@ impl Actor {
                     // new cursor namespace after its replay copy is gone.
                     return true;
                 }
-                shared.cursor = shared.cursor.max(ack.seq);
+                // Same contiguity rule as ROW: our own batch landing at
+                // `seq` proves rows up to seq exist server-side, not that we
+                // HAVE the interleaved ones from other devices.
+                if ack.seq > shared.cursor + 1 {
+                    shared.gap_repair = true;
+                    tracing::warn!(
+                        seq = ack.seq,
+                        cursor = shared.cursor,
+                        "chat2: ack gap detected; holding cursor and requesting backfill"
+                    );
+                } else {
+                    shared.cursor = shared.cursor.max(ack.seq);
+                }
                 let cursor = shared.cursor;
                 // Quota drain: each grant immediately probes the next head
                 // batch (one-per-grant, never a full-queue burst).

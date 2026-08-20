@@ -299,6 +299,11 @@ final class AppModel {
         return workspace?.indicator(for: chat) ?? .idle
     }
 
+    func changeRequest(for chat: Chat) -> ChangeRequestSummary? {
+        if let demo { return demo.changeRequests[chat.id] }
+        return workspace?.changeRequest(for: chat)
+    }
+
     func spaceIndicator(_ spaceId: String) -> ChatIndicator? {
         chats(in: spaceId).map { indicator(for: $0) }.min { $0.rawValue < $1.rawValue }
     }

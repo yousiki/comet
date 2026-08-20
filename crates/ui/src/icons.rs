@@ -59,6 +59,8 @@ icon_assets![
     // Hand-drawn git-branch glyph in the Solar Linear style (like the
     // terminal/plus/return ports) — the set has no branch icon.
     (GIT_BRANCH, "git-branch"),
+    // Provider-neutral pull-request glyph, drawn in the same linear family.
+    (PULL_REQUEST, "pull-request"),
     // Compact history-ref glyphs, drawn in the same linear style.
     (CLOUD, "cloud"),
     (TAG, "tag"),
@@ -75,6 +77,9 @@ icon_assets![
     // arrow-up mirrored (like the sidebar flip) — the Solar Linear set here
     // has no plain arrow-down.
     (ARROW_DOWN, "arrow-down"),
+    // arrow-up rotated 45° — the "opens elsewhere" glyph on spawn chips;
+    // the set has no diagonal arrow.
+    (ARROW_UP_RIGHT, "arrow-up-right"),
     // Hand-drawn return/enter arrow in the Solar Linear style (like the
     // terminal/plus/close ports) — the set has no return glyph.
     (RETURN, "return"),

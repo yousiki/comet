@@ -448,7 +448,23 @@ fn entry_events(entry: &Value) -> Vec<AgentEvent> {
                 });
             }
         }
-        // system prompt / user prompt / synthetic reminders: not transcript.
+        Some("user") => {
+            // The message INTO the subagent — its spawn prompt (and any
+            // future steer): its own user entry in the subagent doc, like
+            // the chat it is. Synthetic context injections (reminder-style
+            // tagged blocks) are not conversation.
+            if let Some(text) = entry
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty() && !t.starts_with('<'))
+            {
+                events.push(AgentEvent::UserMessage {
+                    text: text.to_owned(),
+                });
+            }
+        }
+        // system prompt / synthetic reminders: not transcript.
         _ => {}
     }
     events
@@ -680,10 +696,17 @@ mod tests {
             [AgentEvent::TextDelta { text }] if text == "finished\n\n"
         ));
 
-        // Non-transcript entries are skipped.
-        for t in ["system", "user"] {
-            assert!(entry_events(&json!({"type": t, "content": "x"})).is_empty());
-        }
+        // The message INTO the subagent is its own user entry; system
+        // entries and reminder-style synthetic injections are skipped.
+        assert!(matches!(
+            entry_events(&json!({"type": "user", "content": "scan the fold path"})).as_slice(),
+            [AgentEvent::UserMessage { text }] if text == "scan the fold path"
+        ));
+        assert!(entry_events(&json!({"type": "system", "content": "x"})).is_empty());
+        assert!(
+            entry_events(&json!({"type": "user", "content": "<system-reminder>tick</system-reminder>"}))
+                .is_empty()
+        );
     }
 
     #[test]
