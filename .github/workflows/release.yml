@@ -10,14 +10,29 @@ name: release
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
 # workflow_dispatch (builds + uploads artifacts, no release/R2 publish).
+#
+# Pushes to main also run the build jobs — not to publish anything, but because
+# Actions cache is scoped per ref: a run on `refs/tags/vX` can only read its own
+# cache and the default branch's. Tag-only builds therefore never hit warm
+# cache (every release recompiled gpui + loro from scratch, ~10min) while
+# piling up a 1GB dead cache entry per tag. Building on main puts the cache
+# where tag runs can read it, and `save-if` keeps tags from writing at all.
+# The main build doubles as the compile smoke test main otherwise lacks.
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  # Per-ref: tags never cancel each other. On main only the newest cache-warming
+  # build matters, so supersede in-flight ones.
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 
 jobs:
   linux:
@@ -41,9 +56,17 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only main writes: a tag's 1GB entry lives in a scope nothing can
+          # ever read, and 10 of them exhaust the repo's 10GB cache quota,
+          # evicting the main entries that tag runs actually restore from.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: package
         run: scripts/package-linux.sh
       - uses: actions/upload-artifact@v4
+        # main builds exist only to warm the cache — nothing consumes their
+        # artifacts, so don't retain a tarball per push.
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         with:
           name: linux-${{ runner.arch }}
           path: target/package/*.tar.gz
@@ -74,6 +97,11 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only main writes: a tag's 1GB entry lives in a scope nothing can
+          # ever read, and 10 of them exhaust the repo's 10GB cache quota,
+          # evicting the main entries that tag runs actually restore from.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: import Developer ID certificate
         if: env.MACOS_CERT_P12 != ''
         run: |
@@ -106,6 +134,7 @@ jobs:
       - name: package dmg
         run: scripts/package-macos.sh
       - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         with:
           name: macos-${{ runner.arch }}
           path: |
