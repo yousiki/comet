@@ -18,7 +18,7 @@ command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 EDGE_PORT="${ZERON_E2E_EDGE_PORT:-27640}"
 EDGE_URL="http://localhost:${EDGE_PORT}"
 TOKEN="alice@org1"
-ORG="org1"
+ORGANIZATION_ID="org1"
 A_PORT=27801
 B_PORT=27802
 A_DIR=/tmp/e2e-a
@@ -71,7 +71,7 @@ wait_for() { # wait_for <description> <timeout_s> <command...>
   done
 }
 
-# ── 1. Edge worker (wrangler dev, dev auth: bearer == user@org) ────────────────
+# ── 1. Edge worker (wrangler dev, dev auth: bearer == user@organization) ───────
 if curl -sf -m 3 "$EDGE_URL/health" | grep -q '"auth":"dev"'; then
   echo "edge: reusing healthy dev-mode worker on :$EDGE_PORT"
 else
@@ -102,7 +102,7 @@ mkdir -p "$A_DIR" "$B_DIR"
 
 start_engine() { # start_engine <data_dir> <ipc_port> <name> <log>
   ZERON_DATA_DIR="$1" ZERON_IPC_PORT="$2" ZERON_DEVICE_NAME="$3" \
-    ZERON_EDGE_URL="$EDGE_URL" ZERON_EDGE_TOKEN="$TOKEN" ZERON_ORG_ID="$ORG" \
+    ZERON_EDGE_URL="$EDGE_URL" ZERON_EDGE_TOKEN="$TOKEN" ZERON_ORGANIZATION_ID="$ORGANIZATION_ID" \
     ZERON_HARNESS=mock RUST_LOG=info \
     "$ZERON" headless >"$4" 2>&1 &
 }

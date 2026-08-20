@@ -145,7 +145,7 @@ pub fn clear_if_owner(key: &str) -> bool {
 /// Unconditionally release the process-global markdown selection. Runtime
 /// profile replacement must call this before the old transcript disappears:
 /// settled spans snapshot their full source text so Cmd+C can otherwise copy
-/// content from an unmounted Team.
+/// content from an unmounted Organization.
 pub fn clear() {
     *state().lock().unwrap() = None;
 }
@@ -287,14 +287,14 @@ mod tests {
     #[test]
     fn profile_clear_drops_the_snapshotted_copy_text() {
         let _state = state_lock();
-        begin_with_span("old-team-row", "secret transcript", 0..17);
-        end_drag("old-team-row");
+        begin_with_span("old-organization-row", "secret transcript", 0..17);
+        end_drag("old-organization-row");
         assert_eq!(selected_text().as_deref(), Some("secret transcript"));
 
         clear();
 
         assert_eq!(selected_text(), None);
-        assert_eq!(drag_anchor("old-team-row"), None);
+        assert_eq!(drag_anchor("old-organization-row"), None);
     }
 
     #[test]

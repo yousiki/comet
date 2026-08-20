@@ -83,7 +83,7 @@ fn tool_specs() -> Value {
     json!([
         {
             "name": "list_sessions",
-            "description": "List the other agent sessions in this workspace (id, title, working directory, harness). Use it to find a session to message.",
+            "description": "List the other agent sessions in this organization (id, title, working directory, harness). Use it to find a session to message.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {

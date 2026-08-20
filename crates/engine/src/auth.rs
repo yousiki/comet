@@ -15,8 +15,9 @@
 //!   dir; access tokens are cached with dual-clock expiry (monotonic AND wall, whichever
 //!   aged more — see [`AccessEntry`]) and refreshed on demand plus by a background loop,
 //!   so the device-room relay and room clients always dial with a live `?token=`, even
-//!   on the first redial after a laptop wakes from sleep. Org onboarding: an org-less session is `NeedsOrganization`; `SelectOrg`
-//!   runs an org-scoped refresh and the state follows the returned token's `org_id`.
+//!   on the first redial after a laptop wakes from sleep. Organization onboarding:
+//!   a session without one is `NeedsOrganization`; `SelectOrganization` runs an
+//!   Organization-scoped refresh and the state follows the provider token claim.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -58,11 +59,11 @@ pub struct AuthUser {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OrgMembership {
+pub struct OrganizationMembership {
     pub id: String,
     pub organization_id: String,
     pub name: String,
-    /// The caller's role in this org ("admin" | "member"). Additive: absent
+    /// The caller's role in this Organization ("admin" | "member"). Additive: absent
     /// from pre-role edges defaults to member.
     #[serde(default = "default_role")]
     pub role: String,
@@ -72,10 +73,10 @@ fn default_role() -> String {
     "member".into()
 }
 
-/// One member of an organization (the Team settings roster).
+/// One member of an Organization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OrgMember {
+pub struct OrganizationMember {
     pub membership_id: String,
     pub user_id: String,
     pub email: String,
@@ -84,12 +85,12 @@ pub struct OrgMember {
     pub role: String,
 }
 
-/// The stable auth state after deleting a workspace. Callers must replace any
+/// The stable auth state after deleting an organization. Callers must replace any
 /// identity-scoped runtime after either outcome: it now belongs to the selected
-/// fallback workspace, or the WorkOS session has been cleared completely.
+/// fallback organization, or the WorkOS session has been cleared completely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase")]
-pub enum DeleteOrgOutcome {
+pub enum DeleteOrganizationOutcome {
     Switched {
         #[serde(rename = "organizationId")]
         organization_id: String,
@@ -98,7 +99,7 @@ pub enum DeleteOrgOutcome {
 }
 
 /// AuthStatus stream payload (`SignedOut | NeedsOrganization{user} |
-/// SignedIn{user, orgId?}`). Serializes as the canonical [`zeron_proto::AuthState`]
+/// SignedIn{user, organizationId?}`). Serializes as the canonical [`zeron_proto::AuthState`]
 /// wire shape (`{"state": "signedIn", …}`) so every client parses one form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthState {
@@ -108,7 +109,7 @@ pub enum AuthState {
     },
     SignedIn {
         user: AuthUser,
-        org_id: Option<String>,
+        organization_id: Option<String>,
     },
 }
 
@@ -117,9 +118,11 @@ impl AuthState {
         matches!(self, AuthState::SignedIn { .. })
     }
 
-    pub fn org_id(&self) -> Option<&str> {
+    pub fn organization_id(&self) -> Option<&str> {
         match self {
-            AuthState::SignedIn { org_id, .. } => org_id.as_deref(),
+            AuthState::SignedIn {
+                organization_id, ..
+            } => organization_id.as_deref(),
             _ => None,
         }
     }
@@ -143,9 +146,12 @@ impl AuthState {
             AuthState::NeedsOrganization { user } => zeron_proto::AuthState::NeedsOrganization {
                 user: profile(user),
             },
-            AuthState::SignedIn { user, org_id } => zeron_proto::AuthState::SignedIn {
+            AuthState::SignedIn {
+                user,
+                organization_id,
+            } => zeron_proto::AuthState::SignedIn {
                 user: profile(user),
-                org_id: org_id.clone(),
+                organization_id: organization_id.clone(),
             },
         }
     }
@@ -190,14 +196,14 @@ impl AuthConfig {
     }
 }
 
-/// The persisted session (refresh token + user + last org scope).
+/// The persisted session (refresh token + user + last Organization scope).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredSession {
     refresh_token: String,
     user: AuthUser,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    org_id: Option<String>,
+    #[serde(default, alias = "orgId", skip_serializing_if = "Option::is_none")]
+    organization_id: Option<String>,
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -239,7 +245,7 @@ enum RefreshFailurePolicy {
     /// A complete Edge rejection proves the refresh token was not rotated, so
     /// the pre-request session may be republished.
     RestoreOnDefiniteRejection,
-    /// The caller already completed an irreversible operation (workspace delete),
+    /// The caller already completed an irreversible operation (organization delete),
     /// so the old profile must remain fenced even after a definite rejection.
     KeepInvalidated,
 }
@@ -315,9 +321,9 @@ struct AuthInner {
     /// exchange); two concurrent refreshes would race and could revoke the session.
     refresh_gate: tokio::sync::Mutex<()>,
     /// Serialize organization changes. In particular, deleting the selected
-    /// workspace and choosing its fallback must appear as one operation to other
-    /// org switches; otherwise a concurrent switch can persist a deleted org again.
-    org_gate: tokio::sync::Mutex<()>,
+    /// organization and choosing its fallback must appear as one operation to other
+    /// Organization switches; otherwise a concurrent switch can persist a deleted Organization again.
+    organization_gate: tokio::sync::Mutex<()>,
     /// Serialize disk persistence with the corresponding in-memory commit.
     /// This is synchronous and is never held across an `.await`.
     session_gate: Mutex<()>,
@@ -384,9 +390,11 @@ impl Auth {
                     email: config.dev_user_id.clone(),
                     name: None,
                 },
-                org_id: None,
+                organization_id: None,
             },
-            (Some(_), Some(session)) => state_for(session.user.clone(), session.org_id.clone()),
+            (Some(_), Some(session)) => {
+                state_for(session.user.clone(), session.organization_id.clone())
+            }
             (Some(_), None) => AuthState::SignedOut,
         };
         let loaded_workos_session = workos.is_some() && stored.is_some();
@@ -408,7 +416,7 @@ impl Auth {
                 access: Mutex::new(None),
                 sign_in: Mutex::new(SignInLifecycle::default()),
                 refresh_gate: tokio::sync::Mutex::new(()),
-                org_gate: tokio::sync::Mutex::new(()),
+                organization_gate: tokio::sync::Mutex::new(()),
                 session_gate: Mutex::new(()),
                 loopback: tokio::sync::Mutex::new(None),
             }),
@@ -465,9 +473,9 @@ impl Auth {
         self.inner.state_tx.borrow().clone()
     }
 
-    /// The signed-in user id — the identity that scopes workspace rooms
-    /// (`ws3/{orgId}/{userId}`) and local storage (`orgs/{org}/{user}/`).
-    /// Dev mode mirrors the edge's dev-bearer parsing (`user@org` → `user`,
+    /// The signed-in user id — the identity that scopes the legacy `ws3` rooms
+    /// and the historical `orgs/{organizationId}/{userId}` storage layout.
+    /// Dev mode mirrors the edge's dev-bearer parsing (`user@organization` → `user`,
     /// a bare token IS the user id). `None` = signed out (WorkOS only).
     pub fn user_id(&self) -> Option<String> {
         if self.inner.workos.is_none() {
@@ -695,28 +703,28 @@ impl Auth {
 
     // -- organizations ------------------------------------------------------
 
-    pub async fn list_orgs(&self) -> Result<Vec<OrgMembership>, EngineError> {
+    pub async fn list_organizations(&self) -> Result<Vec<OrganizationMembership>, EngineError> {
         if self.inner.workos.is_none() {
             return Ok(Vec::new());
         }
         #[derive(Deserialize)]
-        struct Orgs {
+        struct Organizations {
             #[serde(default)]
-            orgs: Vec<OrgMembership>,
+            organizations: Vec<OrganizationMembership>,
         }
-        let body: Orgs = self
-            .authed_json(reqwest::Method::GET, "/auth/orgs", None)
+        let body: Organizations = self
+            .authed_json(reqwest::Method::GET, "/auth/organizations", None)
             .await?;
-        Ok(body.orgs)
+        Ok(body.organizations)
     }
 
-    /// Create an org (the edge makes us its first admin member), durably scope to
+    /// Create an Organization (the edge makes us its first admin member), durably scope to
     /// it, and return the minted id as proof for runtime replacement.
-    pub async fn create_org(&self, name: &str) -> Result<String, EngineError> {
+    pub async fn create_organization(&self, name: &str) -> Result<String, EngineError> {
         if self.inner.workos.is_none() {
             return Ok(String::new());
         }
-        let _org_gate = self.inner.org_gate.lock().await;
+        let _organization_gate = self.inner.organization_gate.lock().await;
         let _transition = self.begin_profile_transition();
         let token = self
             .access_token()
@@ -731,29 +739,29 @@ impl Auth {
             .authed_json_with_token(
                 &token,
                 reqwest::Method::POST,
-                "/auth/orgs",
+                "/auth/organizations",
                 Some(serde_json::json!({ "name": name })),
             )
             .await?;
         if let Err(select_error) = self
-            .select_org_profile_inner(&created.organization_id)
+            .select_organization_profile_inner(&created.organization_id)
             .await
         {
             let rollback: Result<serde_json::Value, EngineError> = self
                 .authed_json_with_token(
                     &token,
                     reqwest::Method::DELETE,
-                    &format!("/auth/orgs/{}", created.organization_id),
+                    &format!("/auth/organizations/{}", created.organization_id),
                     None,
                 )
                 .await;
             return match rollback {
                 Ok(_) => Err(EngineError::Other(format!(
-                    "workspace {} was created but could not be selected: {select_error}; the new workspace was rolled back and creation may be retried",
+                    "organization {} was created but could not be selected: {select_error}; the new organization was rolled back and creation may be retried",
                     created.organization_id
                 ))),
                 Err(rollback_error) => Err(EngineError::Other(format!(
-                    "workspace {} was created but could not be selected: {select_error}; rollback also failed: {rollback_error}. Refresh the workspace list and select organizationId={} if it exists; do not retry creation blindly",
+                    "organization {} was created but could not be selected: {select_error}; rollback also failed: {rollback_error}. Refresh the organization list and select organizationId={} if it exists; do not retry creation blindly",
                     created.organization_id, created.organization_id
                 ))),
             };
@@ -761,19 +769,19 @@ impl Auth {
         Ok(created.organization_id)
     }
 
-    /// First-sign-in default workspace: a user with ZERO memberships gets a
-    /// personal org minted automatically ("{name}'s Space") and is scoped to
-    /// it — the org gate then never appears for the solo path. Idempotent:
+    /// First-sign-in default organization: a user with ZERO memberships gets a
+    /// personal Organization minted automatically ("{name}'s Organization") and is scoped to
+    /// it — the Organization gate then never appears for the solo path. Idempotent:
     /// any existing membership short-circuits. Errors are soft (the gate UI
     /// remains the fallback).
-    pub async fn ensure_default_org(&self) -> Result<(), EngineError> {
+    pub async fn ensure_default_organization(&self) -> Result<(), EngineError> {
         if self.inner.workos.is_none() {
             return Ok(());
         }
         if !matches!(self.state(), AuthState::NeedsOrganization { .. }) {
             return Ok(());
         }
-        if !self.list_orgs().await?.is_empty() {
+        if !self.list_organizations().await?.is_empty() {
             return Ok(());
         }
         let name = match self.state() {
@@ -781,28 +789,31 @@ impl Auth {
                 .name
                 .clone()
                 .filter(|n| !n.trim().is_empty())
-                .map(|n| format!("{n}'s Space"))
+                .map(|n| format!("{n}'s Organization"))
                 .unwrap_or_else(|| {
                     let stem = user.email.split('@').next().unwrap_or("My");
-                    format!("{stem}'s Space")
+                    format!("{stem}'s Organization")
                 }),
             _ => return Ok(()),
         };
-        tracing::info!(org = %name, "first sign-in: creating default personal workspace");
-        self.create_org(&name).await.map(|_| ())
+        tracing::info!(organization = %name, "first sign-in: creating default personal organization");
+        self.create_organization(&name).await.map(|_| ())
     }
 
-    /// The current org's team roster.
-    pub async fn list_members(&self, org_id: &str) -> Result<Vec<OrgMember>, EngineError> {
+    /// The current Organization's member roster.
+    pub async fn list_members(
+        &self,
+        organization_id: &str,
+    ) -> Result<Vec<OrganizationMember>, EngineError> {
         #[derive(Deserialize)]
         struct Members {
             #[serde(default)]
-            members: Vec<OrgMember>,
+            members: Vec<OrganizationMember>,
         }
         let body: Members = self
             .authed_json(
                 reqwest::Method::GET,
-                &format!("/auth/orgs/{org_id}/members"),
+                &format!("/auth/organizations/{organization_id}/members"),
                 None,
             )
             .await?;
@@ -814,7 +825,7 @@ impl Auth {
     /// immediately; an unknown email gets a WorkOS invitation.
     pub async fn invite_member(
         &self,
-        org_id: &str,
+        organization_id: &str,
         email: &str,
         role: &str,
     ) -> Result<(bool, bool), EngineError> {
@@ -828,7 +839,7 @@ impl Auth {
         let body: Outcome = self
             .authed_json(
                 reqwest::Method::POST,
-                &format!("/auth/orgs/{org_id}/members"),
+                &format!("/auth/organizations/{organization_id}/members"),
                 Some(serde_json::json!({ "email": email, "role": role })),
             )
             .await?;
@@ -839,14 +850,14 @@ impl Auth {
     /// last-admin protected.
     pub async fn set_member_role(
         &self,
-        org_id: &str,
+        organization_id: &str,
         membership_id: &str,
         role: &str,
     ) -> Result<(), EngineError> {
         let _: serde_json::Value = self
             .authed_json(
                 reqwest::Method::POST,
-                &format!("/auth/orgs/{org_id}/members/{membership_id}"),
+                &format!("/auth/organizations/{organization_id}/members/{membership_id}"),
                 Some(serde_json::json!({ "role": role })),
             )
             .await?;
@@ -856,28 +867,32 @@ impl Auth {
     /// Remove a member (admin only, edge-enforced, last-admin protected).
     pub async fn remove_member(
         &self,
-        org_id: &str,
+        organization_id: &str,
         membership_id: &str,
     ) -> Result<(), EngineError> {
         let _: serde_json::Value = self
             .authed_json(
                 reqwest::Method::DELETE,
-                &format!("/auth/orgs/{org_id}/members/{membership_id}"),
+                &format!("/auth/organizations/{organization_id}/members/{membership_id}"),
                 None,
             )
             .await?;
         Ok(())
     }
 
-    /// Delete the org (admin only, edge-enforced), then leave auth in a stable
+    /// Delete the Organization (admin only, edge-enforced), then leave auth in a stable
     /// state before returning. A surviving membership is selected and persisted;
-    /// otherwise the stale org-scoped session is cleared completely.
+    /// otherwise the stale Organization-scoped session is cleared completely.
     ///
     /// Once Edge accepts the delete, every recovery failure degrades safely to
-    /// [`DeleteOrgOutcome::SignedOut`]. It must never leave the deleted `org_id`
+    /// [`DeleteOrganizationOutcome::SignedOut`]. It must never leave the deleted `organization_id`
     /// in memory or on disk for the next runtime bootstrap to reuse.
-    pub async fn delete_org(&self, org_id: &str) -> Result<DeleteOrgOutcome, EngineError> {
-        let _org_gate = self.inner.org_gate.lock().await;
+    pub async fn delete_organization(
+        &self,
+        organization_id: &str,
+    ) -> Result<DeleteOrganizationOutcome, EngineError> {
+        let deleted_organization_id = organization_id.to_owned();
+        let _organization_gate = self.inner.organization_gate.lock().await;
         let _transition = self.begin_profile_transition();
         let token = self
             .access_token()
@@ -891,7 +906,7 @@ impl Auth {
             .authed_json_with_token_classified(
                 &token,
                 reqwest::Method::DELETE,
-                &format!("/auth/orgs/{org_id}"),
+                &format!("/auth/organizations/{organization_id}"),
                 None,
             )
             .await;
@@ -908,38 +923,38 @@ impl Auth {
                 // possibly-deleted profile.
                 self.finish_invalidated_prior(&prior);
                 return Err(EngineError::Other(format!(
-                    "{error}; workspace deletion outcome is uncertain, so auth was safely signed out"
+                    "{error}; organization deletion outcome is uncertain, so auth was safely signed out"
                 )));
             }
         }
 
-        let current_org = self.state().org_id().map(str::to_owned);
+        let current_organization = self.state().organization_id().map(str::to_owned);
         #[derive(Deserialize)]
-        struct Orgs {
+        struct Organizations {
             #[serde(default)]
-            orgs: Vec<OrgMembership>,
+            organizations: Vec<OrganizationMembership>,
         }
-        let listed: Result<Orgs, EngineError> = self
-            .authed_json_with_token(&token, reqwest::Method::GET, "/auth/orgs", None)
+        let listed: Result<Organizations, EngineError> = self
+            .authed_json_with_token(&token, reqwest::Method::GET, "/auth/organizations", None)
             .await;
         let mut remaining = match listed {
-            Ok(body) => body.orgs,
+            Ok(body) => body.organizations,
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    deleted_org = org_id,
-                    "auth: workspace deleted but fallback discovery failed; signing out"
+                    deleted_organization = organization_id,
+                    "auth: organization deleted but fallback discovery failed; signing out"
                 );
                 self.finish_invalidated_prior(&prior);
-                return Ok(DeleteOrgOutcome::SignedOut);
+                return Ok(DeleteOrganizationOutcome::SignedOut);
             }
         };
         // WorkOS deletion can be briefly eventually consistent. Never pick the
         // deleted membership even if it is still present in the first list response.
-        remaining.retain(|membership| membership.organization_id != org_id);
-        let fallback = current_org
+        remaining.retain(|membership| membership.organization_id != organization_id);
+        let fallback = current_organization
             .as_deref()
-            .filter(|current| *current != org_id)
+            .filter(|current| *current != organization_id)
             .and_then(|current| {
                 remaining
                     .iter()
@@ -948,13 +963,13 @@ impl Auth {
             .or_else(|| remaining.first())
             .map(|membership| membership.organization_id.clone());
 
-        let Some(organization_id) = fallback else {
+        let Some(fallback_organization_id) = fallback else {
             self.finish_invalidated_prior(&prior);
-            return Ok(DeleteOrgOutcome::SignedOut);
+            return Ok(DeleteOrganizationOutcome::SignedOut);
         };
         match self
             .refresh_inner(
-                Some(&organization_id),
+                Some(&fallback_organization_id),
                 RefreshFailurePolicy::KeepInvalidated,
             )
             .await
@@ -962,36 +977,42 @@ impl Auth {
             Ok(Some(_)) => {}
             Ok(None) => {
                 tracing::warn!(
-                    deleted_org = org_id,
-                    fallback_org = %organization_id,
-                    "auth: workspace deleted but auth changed before fallback selection; signing out"
+                    deleted_organization = %deleted_organization_id,
+                    fallback_organization = %fallback_organization_id,
+                    "auth: organization deleted but auth changed before fallback selection; signing out"
                 );
                 self.finish_invalidated_prior(&prior);
-                return Ok(DeleteOrgOutcome::SignedOut);
+                return Ok(DeleteOrganizationOutcome::SignedOut);
             }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    deleted_org = org_id,
-                    fallback_org = %organization_id,
-                    "auth: workspace deleted but fallback selection failed; signing out"
+                    deleted_organization = %deleted_organization_id,
+                    fallback_organization = %fallback_organization_id,
+                    "auth: organization deleted but fallback selection failed; signing out"
                 );
                 self.finish_invalidated_prior(&prior);
-                return Ok(DeleteOrgOutcome::SignedOut);
+                return Ok(DeleteOrganizationOutcome::SignedOut);
             }
         }
-        Ok(DeleteOrgOutcome::Switched { organization_id })
+        Ok(DeleteOrganizationOutcome::Switched {
+            organization_id: fallback_organization_id,
+        })
     }
 
-    /// Scope the session to an org: one refresh with `organizationId`; the state follows
-    /// the returned token's `org_id` claim.
-    pub async fn select_org(&self, organization_id: &str) -> Result<(), EngineError> {
-        let _org_gate = self.inner.org_gate.lock().await;
+    /// Scope the session to an Organization: one refresh with `organizationId`;
+    /// the state follows the provider token's native `org_id` claim.
+    pub async fn select_organization(&self, organization_id: &str) -> Result<(), EngineError> {
+        let _organization_gate = self.inner.organization_gate.lock().await;
         let _transition = self.begin_profile_transition();
-        self.select_org_profile_inner(organization_id).await
+        self.select_organization_profile_inner(organization_id)
+            .await
     }
 
-    async fn select_org_profile_inner(&self, organization_id: &str) -> Result<(), EngineError> {
+    async fn select_organization_profile_inner(
+        &self,
+        organization_id: &str,
+    ) -> Result<(), EngineError> {
         if self.inner.workos.is_none() {
             return Ok(());
         }
@@ -1005,7 +1026,7 @@ impl Auth {
         {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(EngineError::Other(
-                "could not switch workspace because auth was signed out".into(),
+                "could not switch organization because auth was signed out".into(),
             )),
             Err(err) => Err(err),
         }
@@ -1112,12 +1133,12 @@ impl Auth {
                 "sign-in was canceled — start again from Zeron".into(),
             ));
         }
-        let org_id = jwt_claims(&result.access_token).and_then(|c| c.org_id);
+        let organization_id = jwt_claims(&result.access_token).and_then(|c| c.organization_id);
         let access = AccessEntry::fresh(result.access_token);
         let session = StoredSession {
             refresh_token: result.refresh_token,
             user: result.user.clone(),
-            org_id: org_id.clone(),
+            organization_id: organization_id.clone(),
         };
         let _session_gate = lock(&self.inner.session_gate);
         self.persist_invalidation()?;
@@ -1127,11 +1148,11 @@ impl Auth {
         }
         *lock(&self.inner.stored) = Some(session);
         *lock(&self.inner.access) = Some(access);
-        tracing::info!(email = %result.user.email, org = org_id.as_deref().unwrap_or("<none>"),
+        tracing::info!(email = %result.user.email, organization = organization_id.as_deref().unwrap_or("<none>"),
             "auth: signed in");
         self.inner
             .state_tx
-            .send_replace(state_for(result.user, org_id));
+            .send_replace(state_for(result.user, organization_id));
         self.inner
             .token_tx
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
@@ -1139,7 +1160,7 @@ impl Auth {
     }
 
     /// Refresh the session (single-flight). `organization_id` migrates the WorkOS
-    /// session to that org; routine refreshes keep the current scope. Returns the new
+    /// session to that Organization; routine refreshes keep the current scope. Returns the new
     /// access token, `None` when signed out / the refresh could not run.
     async fn refresh(&self, organization_id: Option<&str>) -> Result<Option<String>, EngineError> {
         let _gate = self.inner.refresh_gate.lock().await;
@@ -1158,11 +1179,11 @@ impl Auth {
     /// committed before access/state become visible in memory.
     async fn refresh_inner(
         &self,
-        organization_id: Option<&str>,
+        requested_organization_id: Option<&str>,
         failure_policy: RefreshFailurePolicy,
     ) -> Result<Option<String>, EngineError> {
         // Re-check under the gate: the refresh we queued behind may have done the work.
-        if organization_id.is_none()
+        if requested_organization_id.is_none()
             && let Some(entry) = &*lock(&self.inner.access)
             && entry.remaining() > TOKEN_SLACK
         {
@@ -1183,7 +1204,7 @@ impl Auth {
                     });
                 if !fenced {
                     return Err(EngineError::Other(
-                        "auth session changed while completing workspace deletion".into(),
+                        "auth session changed while completing organization deletion".into(),
                     ));
                 }
                 lock(&self.inner.stored).clone()
@@ -1208,7 +1229,7 @@ impl Auth {
             .post(&url)
             .json(&RefreshBody {
                 refresh_token: &refresh_token,
-                organization_id,
+                organization_id: requested_organization_id,
             })
             .send()
             .await;
@@ -1261,10 +1282,10 @@ impl Auth {
                 }
             };
         }
-        if status.is_client_error() && organization_id.is_none() {
+        if status.is_client_error() && requested_organization_id.is_none() {
             // A definitive 4xx means the refresh token itself is dead (revoked session,
             // deleted user) — it can NEVER succeed again. Degrade to SignedOut so every
-            // downstream retry loop quiets down. (Org-switch refreshes are exempt: a 4xx
+            // downstream retry loop quiets down. (Organization-switch refreshes are exempt: a 4xx
             // there means "not a member", not a dead session.)
             tracing::warn!(
                 status = status.as_u16(),
@@ -1310,13 +1331,13 @@ impl Auth {
                 )));
             }
         };
-        let org_id = jwt_claims(&tokens.access_token).and_then(|c| c.org_id);
-        if let Some(expected) = organization_id
-            && org_id.as_deref() != Some(expected)
+        let organization_id = jwt_claims(&tokens.access_token).and_then(|c| c.organization_id);
+        if let Some(expected) = requested_organization_id
+            && organization_id.as_deref() != Some(expected)
         {
             let error = EngineError::Other(format!(
-                "could not switch to workspace {expected}: the refreshed token was scoped to {}",
-                org_id.as_deref().unwrap_or("no workspace")
+                "could not switch to organization {expected}: the refreshed token was scoped to {}",
+                organization_id.as_deref().unwrap_or("no organization")
             ));
             self.finish_invalidated_prior(&prior);
             return Err(EngineError::Other(format!(
@@ -1333,24 +1354,27 @@ impl Auth {
             if current.refresh_token != refresh_token {
                 // A sign-in committed a different session while this request was in
                 // flight. Never overwrite it with credentials derived from the old one.
-                if let Some(expected) = organization_id
-                    && current.org_id.as_deref() != Some(expected)
+                if let Some(expected) = requested_organization_id
+                    && current.organization_id.as_deref() != Some(expected)
                 {
                     return Err(EngineError::Other(format!(
-                        "could not switch to workspace {expected}: another sign-in selected {} while the switch was in flight",
-                        current.org_id.as_deref().unwrap_or("no workspace")
+                        "could not switch to organization {expected}: another sign-in selected {} while the switch was in flight",
+                        current
+                            .organization_id
+                            .as_deref()
+                            .unwrap_or("no organization")
                     )));
                 }
                 return Ok(lock(&self.inner.access)
                     .as_ref()
                     .map(|entry| entry.token.clone()));
             }
-            let org_changed = current.org_id != org_id;
+            let organization_changed = current.organization_id != organization_id;
             let user = current.user.clone();
             let candidate = StoredSession {
                 refresh_token: tokens.refresh_token,
                 user: user.clone(),
-                org_id: org_id.clone(),
+                organization_id: organization_id.clone(),
             };
             let fence_error = matches!(failure_policy, RefreshFailurePolicy::Routine)
                 .then(|| self.persist_invalidation().err())
@@ -1362,8 +1386,10 @@ impl Auth {
                     Ok(()) => {
                         *lock(&self.inner.stored) = Some(candidate);
                         *lock(&self.inner.access) = Some(entry);
-                        if org_changed {
-                            self.inner.state_tx.send_replace(state_for(user, org_id));
+                        if organization_changed {
+                            self.inner
+                                .state_tx
+                                .send_replace(state_for(user, organization_id));
                         }
                         self.inner
                             .token_tx
@@ -1519,12 +1545,12 @@ impl Auth {
         let status = res.status();
         let bytes = res.bytes().await.map_err(|e| {
             AuthedRequestError::Ambiguous(EngineError::Other(format!(
-                "workspace request failed ({}): could not read the response: {e}",
+                "organization request failed ({}): could not read the response: {e}",
                 status.as_u16()
             )))
         })?;
         if !status.is_success() {
-            let error = EngineError::Other(workspace_error_message(status.as_u16(), &bytes));
+            let error = EngineError::Other(organization_error_message(status.as_u16(), &bytes));
             return Err(if edge_response_outcome_unknown(&bytes) {
                 AuthedRequestError::Ambiguous(error)
             } else {
@@ -1561,10 +1587,10 @@ impl Auth {
 }
 
 /// Preserve Edge's actionable JSON errors instead of collapsing every rejected
-/// team operation to a status code. Bodies are untrusted and can be unexpectedly
+/// Organization operation to a status code. Bodies are untrusted and can be unexpectedly
 /// large, so the UI-facing detail is whitespace-normalized and bounded.
-fn workspace_error_message(status: u16, body: &[u8]) -> String {
-    edge_response_error_message("workspace request failed", status, body)
+fn organization_error_message(status: u16, body: &[u8]) -> String {
+    edge_response_error_message("organization request failed", status, body)
 }
 
 fn edge_response_error_message(prefix: &str, status: u16, body: &[u8]) -> String {
@@ -1649,13 +1675,13 @@ struct SignInResult {
     refresh_token: String,
 }
 
-fn state_for(user: AuthUser, org_id: Option<String>) -> AuthState {
-    // Every user must belong to an organization before the product opens up; an org-less
+fn state_for(user: AuthUser, organization_id: Option<String>) -> AuthState {
+    // Every user must belong to an Organization before the product opens up; a session without one
     // session is `NeedsOrganization`, which the UI gates on.
-    match org_id {
-        Some(org_id) => AuthState::SignedIn {
+    match organization_id {
+        Some(organization_id) => AuthState::SignedIn {
             user,
-            org_id: Some(org_id),
+            organization_id: Some(organization_id),
         },
         None => AuthState::NeedsOrganization { user },
     }
@@ -1788,8 +1814,8 @@ struct JwtClaims {
     exp: Option<i64>,
     #[serde(default)]
     iat: Option<i64>,
-    #[serde(default)]
-    org_id: Option<String>,
+    #[serde(default, rename = "org_id")]
+    organization_id: Option<String>,
 }
 
 /// Decode (without verifying — the edge verifies) the JWT payload claims. Total: a
@@ -2164,9 +2190,12 @@ mod tests {
                 .await
                 .expect("close delete response");
 
-            let (mut list_stream, _) = listener.accept().await.expect("accept org list request");
+            let (mut list_stream, _) = listener
+                .accept()
+                .await
+                .expect("accept organization list request");
             let list_request = read_mock_request(&mut list_stream).await;
-            let list_body = br#"{"orgs":[]}"#;
+            let list_body = br#"{"organizations":[]}"#;
             let list_head = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 list_body.len()
@@ -2174,15 +2203,15 @@ mod tests {
             list_stream
                 .write_all(list_head.as_bytes())
                 .await
-                .expect("write org list head");
+                .expect("write organization list head");
             list_stream
                 .write_all(list_body)
                 .await
-                .expect("write org list body");
+                .expect("write organization list body");
             list_stream
                 .shutdown()
                 .await
-                .expect("close org list response");
+                .expect("close organization list response");
 
             [delete_request, list_request]
                 .into_iter()
@@ -2192,11 +2221,11 @@ mod tests {
         (format!("http://{addr}"), received_rx, release, handle)
     }
 
-    fn jwt_for_org(org_id: &str) -> String {
+    fn jwt_for_organization(organization_id: &str) -> String {
         let payload = serde_json::to_vec(&serde_json::json!({
             "iat": 1_700_000_000_i64,
             "exp": 4_100_000_000_i64,
-            "org_id": org_id,
+            "org_id": organization_id,
         }))
         .expect("jwt payload");
         format!(
@@ -2211,7 +2240,7 @@ mod tests {
         config
     }
 
-    fn workos_auth(edge_url: String, data_dir: PathBuf, org_id: &str) -> Auth {
+    fn workos_auth(edge_url: String, data_dir: PathBuf, organization_id: &str) -> Auth {
         let auth = Auth::new(workos_test_config(edge_url, data_dir));
         let user = AuthUser {
             id: "user_1".into(),
@@ -2221,15 +2250,15 @@ mod tests {
         let session = StoredSession {
             refresh_token: "refresh_old".into(),
             user: user.clone(),
-            org_id: Some(org_id.into()),
+            organization_id: Some(organization_id.into()),
         };
         auth.persist_active_session(&session)
             .expect("persist test session");
         *lock(&auth.inner.stored) = Some(session);
-        *lock(&auth.inner.access) = Some(AccessEntry::fresh(jwt_for_org(org_id)));
+        *lock(&auth.inner.access) = Some(AccessEntry::fresh(jwt_for_organization(organization_id)));
         auth.inner.state_tx.send_replace(AuthState::SignedIn {
             user,
-            org_id: Some(org_id.into()),
+            organization_id: Some(organization_id.into()),
         });
         auth
     }
@@ -2268,7 +2297,7 @@ mod tests {
         let claims = jwt_claims(&token).expect("claims decode");
         assert_eq!(claims.exp, Some(100));
         assert_eq!(claims.iat, Some(40));
-        assert_eq!(claims.org_id.as_deref(), Some("org_1"));
+        assert_eq!(claims.organization_id.as_deref(), Some("org_1"));
     }
 
     #[test]
@@ -2287,7 +2316,7 @@ mod tests {
         };
         let signed_in = AuthState::SignedIn {
             user: user.clone(),
-            org_id: Some("org_1".into()),
+            organization_id: Some("org_1".into()),
         };
         let value = serde_json::to_value(&signed_in).expect("json");
         assert_eq!(
@@ -2295,7 +2324,7 @@ mod tests {
             serde_json::json!({
                 "state": "signedIn",
                 "user": {"id": "u1", "email": "u@x", "name": null},
-                "orgId": "org_1",
+                "organizationId": "org_1",
             })
         );
         // The proto type itself round-trips the emitted value.
@@ -2329,7 +2358,7 @@ mod tests {
                 .expect("prior session")
                 .user
                 .clone(),
-            org_id: Some("org_unpublished".into()),
+            organization_id: Some("org_unpublished".into()),
         };
         let mut writes = 0;
         let error = auth
@@ -2447,14 +2476,14 @@ mod tests {
             .expect_err("edge rejection should surface");
         assert_eq!(
             error.to_string(),
-            "workspace request failed (409): operation rejected; member update failed; cannot remove the last admin"
+            "organization request failed (409): operation rejected; member update failed; cannot remove the last admin"
         );
         let requests = server.await.expect("mock edge completed");
-        assert_eq!(requests, ["GET /auth/orgs/org_1/members HTTP/1.1"]);
+        assert_eq!(requests, ["GET /auth/organizations/org_1/members HTTP/1.1"]);
     }
 
     #[tokio::test]
-    async fn create_org_returns_and_durably_selects_the_minted_id() {
+    async fn create_organization_returns_and_durably_selects_the_minted_id() {
         let (edge_url, server) = mock_edge(vec![
             MockResponse {
                 status: 200,
@@ -2463,7 +2492,7 @@ mod tests {
             MockResponse {
                 status: 200,
                 body: serde_json::json!({
-                    "accessToken": jwt_for_org("org_minted"),
+                    "accessToken": jwt_for_organization("org_minted"),
                     "refreshToken": "refresh_minted"
                 }),
             },
@@ -2473,16 +2502,16 @@ mod tests {
         let auth = workos_auth(edge_url, data_dir.path().to_path_buf(), "org_prior");
 
         let organization_id = auth
-            .create_org("Minted Workspace")
+            .create_organization("Minted Organization")
             .await
-            .expect("create and select workspace");
+            .expect("create and select organization");
         assert_eq!(organization_id, "org_minted");
-        assert_eq!(auth.state().org_id(), Some("org_minted"));
+        assert_eq!(auth.state().organization_id(), Some("org_minted"));
         let disk: StoredSession = serde_json::from_slice(
             &std::fs::read(auth.session_file()).expect("minted session persisted"),
         )
         .expect("parse minted session");
-        assert_eq!(disk.org_id.as_deref(), Some("org_minted"));
+        assert_eq!(disk.organization_id.as_deref(), Some("org_minted"));
         assert_eq!(disk.refresh_token, "refresh_minted");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(
@@ -2493,12 +2522,15 @@ mod tests {
         );
         assert_eq!(
             server.await.expect("mock edge completed"),
-            ["POST /auth/orgs HTTP/1.1", "POST /auth/refresh HTTP/1.1"]
+            [
+                "POST /auth/organizations HTTP/1.1",
+                "POST /auth/refresh HTTP/1.1"
+            ]
         );
     }
 
     #[tokio::test]
-    async fn create_org_rolls_back_after_a_definite_select_rejection_without_deadlock() {
+    async fn create_organization_rolls_back_after_a_definite_select_rejection_without_deadlock() {
         let (edge_url, server) = mock_edge(vec![
             MockResponse {
                 status: 200,
@@ -2519,7 +2551,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(2),
-            auth.create_org("Rollback Workspace"),
+            auth.create_organization("Rollback Organization"),
         )
         .await
         .expect("create rollback must not deadlock")
@@ -2533,25 +2565,25 @@ mod tests {
             message.contains("was rolled back and creation may be retried"),
             "unexpected error: {message}"
         );
-        assert_eq!(auth.state().org_id(), Some("org_prior"));
+        assert_eq!(auth.state().organization_id(), Some("org_prior"));
         assert_eq!(
             lock(&auth.inner.stored)
                 .as_ref()
-                .and_then(|session| session.org_id.as_deref()),
+                .and_then(|session| session.organization_id.as_deref()),
             Some("org_prior")
         );
         assert_eq!(
             server.await.expect("mock edge completed"),
             [
-                "POST /auth/orgs HTTP/1.1",
+                "POST /auth/organizations HTTP/1.1",
                 "POST /auth/refresh HTTP/1.1",
-                "DELETE /auth/orgs/org_rolled_back HTTP/1.1",
+                "DELETE /auth/organizations/org_rolled_back HTTP/1.1",
             ]
         );
     }
 
     #[tokio::test]
-    async fn create_org_uses_the_pinned_bearer_to_rollback_an_ambiguous_select() {
+    async fn create_organization_uses_the_pinned_bearer_to_rollback_an_ambiguous_select() {
         let (edge_url, server) = mock_edge(vec![
             MockResponse {
                 status: 200,
@@ -2571,7 +2603,7 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .create_org("Ambiguous Workspace")
+            .create_organization("Ambiguous Organization")
             .await
             .expect_err("ambiguous selection must fail after compensation");
         let message = error.to_string();
@@ -2589,15 +2621,16 @@ mod tests {
         assert_eq!(
             server.await.expect("mock edge completed"),
             [
-                "POST /auth/orgs HTTP/1.1",
+                "POST /auth/organizations HTTP/1.1",
                 "POST /auth/refresh HTTP/1.1",
-                "DELETE /auth/orgs/org_ambiguous HTTP/1.1",
+                "DELETE /auth/organizations/org_ambiguous HTTP/1.1",
             ]
         );
     }
 
     #[tokio::test]
-    async fn create_org_failed_rollback_identifies_the_existing_org_and_forbids_blind_retry() {
+    async fn create_organization_failed_rollback_identifies_the_existing_org_and_forbids_blind_retry()
+     {
         let (edge_url, server) = mock_edge(vec![
             MockResponse {
                 status: 200,
@@ -2617,7 +2650,7 @@ mod tests {
         let auth = workos_auth(edge_url, data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .create_org("Uncertain Workspace")
+            .create_organization("Uncertain Organization")
             .await
             .expect_err("rollback should fail");
         let message = error.to_string();
@@ -2629,24 +2662,24 @@ mod tests {
             message.contains("do not retry creation blindly"),
             "unexpected error: {message}"
         );
-        assert_eq!(auth.state().org_id(), Some("org_prior"));
+        assert_eq!(auth.state().organization_id(), Some("org_prior"));
         assert_eq!(
             server.await.expect("mock edge completed"),
             [
-                "POST /auth/orgs HTTP/1.1",
+                "POST /auth/organizations HTTP/1.1",
                 "POST /auth/refresh HTTP/1.1",
-                "DELETE /auth/orgs/org_maybe_exists HTTP/1.1",
+                "DELETE /auth/organizations/org_maybe_exists HTTP/1.1",
             ]
         );
     }
 
     #[tokio::test]
-    async fn select_org_rejection_restores_the_prior_durable_session() {
+    async fn select_organization_rejection_restores_the_prior_durable_session() {
         let (edge_url, server) = mock_edge(vec![MockResponse {
             status: 403,
             body: serde_json::json!({
                 "error": "forbidden",
-                "message": "workspace selection rejected",
+                "message": "organization selection rejected",
                 "details": {"reason": "membership was removed"},
             }),
         }])
@@ -2655,16 +2688,16 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .select_org("org_denied")
+            .select_organization("org_denied")
             .await
             .expect_err("selection should be rejected");
         assert_eq!(
             error.to_string(),
-            "refresh failed (403): forbidden; workspace selection rejected; membership was removed"
+            "refresh failed (403): forbidden; organization selection rejected; membership was removed"
         );
-        assert_eq!(auth.state().org_id(), Some("org_prior"));
+        assert_eq!(auth.state().organization_id(), Some("org_prior"));
         let stored = lock(&auth.inner.stored).clone().expect("prior session");
-        assert_eq!(stored.org_id.as_deref(), Some("org_prior"));
+        assert_eq!(stored.organization_id.as_deref(), Some("org_prior"));
         assert_eq!(stored.refresh_token, "refresh_old");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(
@@ -2675,7 +2708,7 @@ mod tests {
         );
 
         let restarted = Auth::new(workos_test_config(edge_url, data_dir.path().to_path_buf()));
-        assert_eq!(restarted.state().org_id(), Some("org_prior"));
+        assert_eq!(restarted.state().organization_id(), Some("org_prior"));
         let requests = server.await.expect("mock edge completed");
         assert_eq!(requests, ["POST /auth/refresh HTTP/1.1"]);
     }
@@ -2703,7 +2736,7 @@ mod tests {
             error.to_string(),
             "refresh failed (503): workos rate limited or unavailable"
         );
-        assert_eq!(auth.state().org_id(), Some("org_prior"));
+        assert_eq!(auth.state().organization_id(), Some("org_prior"));
         assert_eq!(
             lock(&auth.inner.stored)
                 .as_ref()
@@ -2711,7 +2744,7 @@ mod tests {
             Some("refresh_old")
         );
         let restarted = Auth::new(workos_test_config(edge_url, data_dir.path().to_path_buf()));
-        assert_eq!(restarted.state().org_id(), Some("org_prior"));
+        assert_eq!(restarted.state().organization_id(), Some("org_prior"));
         assert_eq!(
             server.await.expect("mock edge completed"),
             ["POST /auth/refresh HTTP/1.1"]
@@ -2741,7 +2774,7 @@ mod tests {
             error.to_string(),
             "refresh failed (502): failed after token rotation"
         );
-        assert_eq!(auth.state().org_id(), Some("org_prior"));
+        assert_eq!(auth.state().organization_id(), Some("org_prior"));
         assert_eq!(
             lock(&auth.inner.stored)
                 .as_ref()
@@ -2749,7 +2782,7 @@ mod tests {
             Some("refresh_old")
         );
         let restarted = Auth::new(workos_test_config(edge_url, data_dir.path().to_path_buf()));
-        assert_eq!(restarted.state().org_id(), Some("org_prior"));
+        assert_eq!(restarted.state().organization_id(), Some("org_prior"));
         assert_eq!(
             server.await.expect("mock edge completed"),
             ["POST /auth/refresh HTTP/1.1"]
@@ -2757,7 +2790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_org_transient_rejection_restores_the_prior_session() {
+    async fn select_organization_transient_rejection_restores_the_prior_session() {
         let (edge_url, server) = mock_edge(vec![MockResponse {
             status: 503,
             body: serde_json::json!({
@@ -2772,16 +2805,16 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .select_org("org_target")
+            .select_organization("org_target")
             .await
             .expect_err("rate-limited profile refresh should be rejected");
         assert_eq!(
             error.to_string(),
             "refresh failed (503): workos rate limited"
         );
-        assert_eq!(auth.state().org_id(), Some("org_prior"));
+        assert_eq!(auth.state().organization_id(), Some("org_prior"));
         let restarted = Auth::new(workos_test_config(edge_url, data_dir.path().to_path_buf()));
-        assert_eq!(restarted.state().org_id(), Some("org_prior"));
+        assert_eq!(restarted.state().organization_id(), Some("org_prior"));
         assert_eq!(
             server.await.expect("mock edge completed"),
             ["POST /auth/refresh HTTP/1.1"]
@@ -2789,7 +2822,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_org_unknown_upstream_outcome_keeps_the_signed_out_fence() {
+    async fn select_organization_unknown_upstream_outcome_keeps_the_signed_out_fence() {
         let (edge_url, server) = mock_edge(vec![MockResponse {
             status: 502,
             body: serde_json::json!({
@@ -2803,7 +2836,7 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .select_org("org_target")
+            .select_organization("org_target")
             .await
             .expect_err("unknown profile-refresh outcome must fail closed");
         assert!(
@@ -2824,7 +2857,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn select_org_stops_before_refresh_when_the_durable_fence_cannot_be_written() {
+    async fn select_organization_stops_before_refresh_when_the_durable_fence_cannot_be_written() {
         use std::os::unix::fs::PermissionsExt;
 
         let data_dir = tempfile::tempdir().expect("temp auth dir");
@@ -2835,7 +2868,7 @@ mod tests {
         );
         std::fs::set_permissions(data_dir.path(), std::fs::Permissions::from_mode(0o500))
             .expect("make auth directory read-only");
-        let result = auth.select_org("org_target").await;
+        let result = auth.select_organization("org_target").await;
         std::fs::set_permissions(data_dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("restore auth directory permissions");
 
@@ -2846,7 +2879,7 @@ mod tests {
                 .contains("could not durably invalidate auth session"),
             "unexpected error: {error}"
         );
-        assert_eq!(auth.state().org_id(), Some("org_prior"));
+        assert_eq!(auth.state().organization_id(), Some("org_prior"));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(
                 &std::fs::read(auth.session_state_file()).expect("active session manifest")
@@ -2858,7 +2891,7 @@ mod tests {
             "http://127.0.0.1:9".into(),
             data_dir.path().to_path_buf(),
         ));
-        assert_eq!(restarted.state().org_id(), Some("org_prior"));
+        assert_eq!(restarted.state().organization_id(), Some("org_prior"));
     }
 
     #[tokio::test]
@@ -2872,7 +2905,7 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .select_org("org_target")
+            .select_organization("org_target")
             .await
             .expect_err("malformed success is ambiguous");
         assert!(
@@ -2896,7 +2929,7 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .select_org("org_target")
+            .select_organization("org_target")
             .await
             .expect_err("truncated response leaves profile refresh uncertain");
         assert!(
@@ -2924,7 +2957,7 @@ mod tests {
         let (edge_url, server) = mock_edge(vec![MockResponse {
             status: 200,
             body: serde_json::json!({
-                "accessToken": jwt_for_org("org_wrong"),
+                "accessToken": jwt_for_organization("org_wrong"),
                 "refreshToken": "refresh_rotated"
             }),
         }])
@@ -2933,9 +2966,9 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .select_org("org_target")
+            .select_organization("org_target")
             .await
-            .expect_err("wrong org claim must fail");
+            .expect_err("wrong organization claim must fail");
         assert!(
             error
                 .to_string()
@@ -2952,16 +2985,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_org_does_not_report_success_over_a_concurrent_sign_in() {
+    async fn select_organization_does_not_report_success_over_a_concurrent_sign_in() {
         let (edge_url, received, release, server) = pausing_refresh_edge(serde_json::json!({
-            "accessToken": jwt_for_org("org_target"),
+            "accessToken": jwt_for_organization("org_target"),
             "refreshToken": "refresh_target"
         }))
         .await;
         let data_dir = tempfile::tempdir().expect("temp auth dir");
         let auth = workos_auth(edge_url, data_dir.path().to_path_buf(), "org_prior");
         let switching_auth = auth.clone();
-        let switching = tokio::spawn(async move { switching_auth.select_org("org_target").await });
+        let switching =
+            tokio::spawn(async move { switching_auth.select_organization("org_target").await });
         received.await.expect("refresh request reached edge");
 
         let generation = lock(&auth.inner.sign_in).generation;
@@ -2973,7 +3007,7 @@ mod tests {
                         email: "concurrent@example.com".into(),
                         name: Some("Concurrent User".into()),
                     },
-                    access_token: jwt_for_org("org_concurrent"),
+                    access_token: jwt_for_organization("org_concurrent"),
                     refresh_token: "refresh_concurrent".into(),
                 },
                 generation,
@@ -2989,11 +3023,11 @@ mod tests {
             .await
             .expect("switch task completed")
             .expect("profile transition should commit after the callback is rejected");
-        assert_eq!(auth.state().org_id(), Some("org_target"));
+        assert_eq!(auth.state().organization_id(), Some("org_target"));
         let stored = lock(&auth.inner.stored)
             .clone()
             .expect("selected session preserved");
-        assert_eq!(stored.org_id.as_deref(), Some("org_target"));
+        assert_eq!(stored.organization_id.as_deref(), Some("org_target"));
         assert_eq!(stored.refresh_token, "refresh_target");
         let disk: StoredSession = serde_json::from_slice(
             &std::fs::read(auth.session_file()).expect("selected session persisted"),
@@ -3021,7 +3055,7 @@ mod tests {
     #[tokio::test]
     async fn sign_out_wins_over_an_in_flight_routine_refresh() {
         let (edge_url, received, release, server) = pausing_refresh_edge(serde_json::json!({
-            "accessToken": jwt_for_org("org_prior"),
+            "accessToken": jwt_for_organization("org_prior"),
             "refreshToken": "refresh_rotated"
         }))
         .await;
@@ -3060,7 +3094,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_persistence_failure_keeps_fence_and_clears_memory() {
         let (edge_url, received, release, server) = pausing_refresh_edge(serde_json::json!({
-            "accessToken": jwt_for_org("org_prior"),
+            "accessToken": jwt_for_organization("org_prior"),
             "refreshToken": "refresh_rotated"
         }))
         .await;
@@ -3112,12 +3146,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_org_rejection_restores_the_prior_durable_session() {
+    async fn delete_organization_rejection_restores_the_prior_durable_session() {
         let (edge_url, server) = mock_edge(vec![MockResponse {
             status: 403,
             body: serde_json::json!({
                 "error": "forbidden",
-                "message": "only an admin can delete this workspace",
+                "message": "only an admin can delete this organization",
             }),
         }])
         .await;
@@ -3125,16 +3159,16 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .delete_org("org_prior")
+            .delete_organization("org_prior")
             .await
             .expect_err("delete should be rejected");
         assert_eq!(
             error.to_string(),
-            "workspace request failed (403): forbidden; only an admin can delete this workspace"
+            "organization request failed (403): forbidden; only an admin can delete this organization"
         );
-        assert_eq!(auth.state().org_id(), Some("org_prior"));
+        assert_eq!(auth.state().organization_id(), Some("org_prior"));
         let stored = lock(&auth.inner.stored).clone().expect("prior session");
-        assert_eq!(stored.org_id.as_deref(), Some("org_prior"));
+        assert_eq!(stored.organization_id.as_deref(), Some("org_prior"));
         assert_eq!(stored.refresh_token, "refresh_old");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(
@@ -3145,13 +3179,13 @@ mod tests {
         );
 
         let restarted = Auth::new(workos_test_config(edge_url, data_dir.path().to_path_buf()));
-        assert_eq!(restarted.state().org_id(), Some("org_prior"));
+        assert_eq!(restarted.state().organization_id(), Some("org_prior"));
         let requests = server.await.expect("mock edge completed");
-        assert_eq!(requests, ["DELETE /auth/orgs/org_prior HTTP/1.1"]);
+        assert_eq!(requests, ["DELETE /auth/organizations/org_prior HTTP/1.1"]);
     }
 
     #[tokio::test]
-    async fn delete_org_transient_rejection_restores_the_prior_session() {
+    async fn delete_organization_transient_rejection_restores_the_prior_session() {
         let (edge_url, server) = mock_edge(vec![MockResponse {
             status: 503,
             body: serde_json::json!({
@@ -3166,28 +3200,28 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .delete_org("org_prior")
+            .delete_organization("org_prior")
             .await
             .expect_err("rate-limited delete should be rejected");
         assert_eq!(
             error.to_string(),
-            "workspace request failed (503): workos rate limited"
+            "organization request failed (503): workos rate limited"
         );
-        assert_eq!(auth.state().org_id(), Some("org_prior"));
+        assert_eq!(auth.state().organization_id(), Some("org_prior"));
         let restarted = Auth::new(workos_test_config(edge_url, data_dir.path().to_path_buf()));
-        assert_eq!(restarted.state().org_id(), Some("org_prior"));
+        assert_eq!(restarted.state().organization_id(), Some("org_prior"));
         assert_eq!(
             server.await.expect("mock edge completed"),
-            ["DELETE /auth/orgs/org_prior HTTP/1.1"]
+            ["DELETE /auth/organizations/org_prior HTTP/1.1"]
         );
     }
 
     #[tokio::test]
-    async fn delete_org_unknown_upstream_outcome_keeps_the_signed_out_fence() {
+    async fn delete_organization_unknown_upstream_outcome_keeps_the_signed_out_fence() {
         let (edge_url, server) = mock_edge(vec![MockResponse {
             status: 502,
             body: serde_json::json!({
-                "error": "failed after workspace deletion",
+                "error": "failed after organization deletion",
                 "transient": true,
                 "outcomeUnknown": true,
             }),
@@ -3197,7 +3231,7 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .delete_org("org_prior")
+            .delete_organization("org_prior")
             .await
             .expect_err("unknown delete outcome must fail closed");
         assert!(
@@ -3210,7 +3244,7 @@ mod tests {
         assert_eq!(restarted.state(), AuthState::SignedOut);
         assert_eq!(
             server.await.expect("mock edge completed"),
-            ["DELETE /auth/orgs/org_prior HTTP/1.1"]
+            ["DELETE /auth/organizations/org_prior HTTP/1.1"]
         );
     }
 
@@ -3221,7 +3255,7 @@ mod tests {
         let auth = workos_auth(edge_url.clone(), data_dir.path().to_path_buf(), "org_prior");
 
         let error = auth
-            .delete_org("org_prior")
+            .delete_organization("org_prior")
             .await
             .expect_err("truncated response leaves delete outcome uncertain");
         assert!(
@@ -3242,12 +3276,12 @@ mod tests {
         assert_eq!(restarted.state(), AuthState::SignedOut);
         assert_eq!(
             server.await.expect("truncated mock edge completed"),
-            "DELETE /auth/orgs/org_prior HTTP/1.1"
+            "DELETE /auth/organizations/org_prior HTTP/1.1"
         );
     }
 
     #[tokio::test]
-    async fn delete_org_selects_and_persists_a_remaining_membership() {
+    async fn delete_organization_selects_and_persists_a_remaining_membership() {
         let (edge_url, server) = mock_edge(vec![
             MockResponse {
                 status: 200,
@@ -3255,8 +3289,8 @@ mod tests {
             },
             MockResponse {
                 status: 200,
-                // Include the just-deleted org to cover WorkOS eventual consistency.
-                body: serde_json::json!({"orgs": [
+                // Include the just-deleted Organization to cover WorkOS eventual consistency.
+                body: serde_json::json!({"organizations": [
                     {
                         "id": "membership_deleted",
                         "organizationId": "org_deleted",
@@ -3274,7 +3308,7 @@ mod tests {
             MockResponse {
                 status: 200,
                 body: serde_json::json!({
-                    "accessToken": jwt_for_org("org_fallback"),
+                    "accessToken": jwt_for_organization("org_fallback"),
                     "refreshToken": "refresh_rotated"
                 }),
             },
@@ -3284,12 +3318,12 @@ mod tests {
         let auth = workos_auth(edge_url, data_dir.path().to_path_buf(), "org_deleted");
 
         let outcome = auth
-            .delete_org("org_deleted")
+            .delete_organization("org_deleted")
             .await
             .expect("delete and fallback");
         assert_eq!(
             outcome,
-            DeleteOrgOutcome::Switched {
+            DeleteOrganizationOutcome::Switched {
                 organization_id: "org_fallback".into()
             }
         );
@@ -3300,29 +3334,29 @@ mod tests {
                 "organizationId": "org_fallback"
             })
         );
-        assert_eq!(auth.state().org_id(), Some("org_fallback"));
+        assert_eq!(auth.state().organization_id(), Some("org_fallback"));
         let stored = lock(&auth.inner.stored).clone().expect("stored session");
-        assert_eq!(stored.org_id.as_deref(), Some("org_fallback"));
+        assert_eq!(stored.organization_id.as_deref(), Some("org_fallback"));
         assert_eq!(stored.refresh_token, "refresh_rotated");
         let disk: StoredSession = serde_json::from_slice(
             &std::fs::read(auth.session_file()).expect("persisted fallback session"),
         )
         .expect("parse persisted session");
-        assert_eq!(disk.org_id.as_deref(), Some("org_fallback"));
+        assert_eq!(disk.organization_id.as_deref(), Some("org_fallback"));
 
         let requests = server.await.expect("mock edge completed");
         assert_eq!(
             requests,
             [
-                "DELETE /auth/orgs/org_deleted HTTP/1.1",
-                "GET /auth/orgs HTTP/1.1",
+                "DELETE /auth/organizations/org_deleted HTTP/1.1",
+                "GET /auth/organizations HTTP/1.1",
                 "POST /auth/refresh HTTP/1.1",
             ]
         );
     }
 
     #[tokio::test]
-    async fn delete_last_org_signs_out_and_removes_the_stale_session() {
+    async fn delete_last_organization_signs_out_and_removes_the_stale_session() {
         let (edge_url, server) = mock_edge(vec![
             MockResponse {
                 status: 200,
@@ -3330,7 +3364,7 @@ mod tests {
             },
             MockResponse {
                 status: 200,
-                body: serde_json::json!({"orgs": []}),
+                body: serde_json::json!({"organizations": []}),
             },
         ])
         .await;
@@ -3339,10 +3373,10 @@ mod tests {
         assert!(auth.session_file().exists());
 
         let outcome = auth
-            .delete_org("org_deleted")
+            .delete_organization("org_deleted")
             .await
-            .expect("delete last org");
-        assert_eq!(outcome, DeleteOrgOutcome::SignedOut);
+            .expect("delete last organization");
+        assert_eq!(outcome, DeleteOrganizationOutcome::SignedOut);
         assert_eq!(
             serde_json::to_value(&outcome).expect("serialize delete outcome"),
             serde_json::json!({"action": "signedOut"})
@@ -3356,14 +3390,14 @@ mod tests {
         assert_eq!(
             requests,
             [
-                "DELETE /auth/orgs/org_deleted HTTP/1.1",
-                "GET /auth/orgs HTTP/1.1",
+                "DELETE /auth/organizations/org_deleted HTTP/1.1",
+                "GET /auth/organizations HTTP/1.1",
             ]
         );
     }
 
     #[tokio::test]
-    async fn delete_org_rpc_rejects_an_in_flight_sign_in_and_reports_its_real_state() {
+    async fn delete_organization_rpc_rejects_an_in_flight_sign_in_and_reports_its_real_state() {
         let (edge_url, received, release, server) = pausing_delete_edge().await;
         let data_dir = tempfile::tempdir().expect("temp auth dir");
         let auth = workos_auth(edge_url, data_dir.path().to_path_buf(), "org_deleted");
@@ -3374,7 +3408,7 @@ mod tests {
         let rpc = AuthRpc::new(auth.clone());
         let deleting = tokio::spawn(async move {
             rpc.handle(
-                methods::DELETE_ORG,
+                methods::DELETE_ORGANIZATION,
                 serde_json::json!({"organizationId": "org_deleted"}),
             )
             .await
@@ -3389,7 +3423,7 @@ mod tests {
                         email: "concurrent@example.com".into(),
                         name: Some("Concurrent User".into()),
                     },
-                    access_token: jwt_for_org("org_concurrent"),
+                    access_token: jwt_for_organization("org_concurrent"),
                     refresh_token: "refresh_concurrent".into(),
                 },
                 callback_generation,
@@ -3414,14 +3448,14 @@ mod tests {
         assert_eq!(
             server.await.expect("pausing delete edge completed"),
             [
-                "DELETE /auth/orgs/org_deleted HTTP/1.1",
-                "GET /auth/orgs HTTP/1.1",
+                "DELETE /auth/organizations/org_deleted HTTP/1.1",
+                "GET /auth/organizations HTTP/1.1",
             ]
         );
     }
 
     #[tokio::test]
-    async fn delete_org_clears_stale_session_when_fallback_discovery_fails() {
+    async fn delete_organization_clears_stale_session_when_fallback_discovery_fails() {
         let (edge_url, server) = mock_edge(vec![
             MockResponse {
                 status: 200,
@@ -3437,10 +3471,10 @@ mod tests {
         let auth = workos_auth(edge_url, data_dir.path().to_path_buf(), "org_deleted");
 
         let outcome = auth
-            .delete_org("org_deleted")
+            .delete_organization("org_deleted")
             .await
             .expect("successful delete has a safe outcome");
-        assert_eq!(outcome, DeleteOrgOutcome::SignedOut);
+        assert_eq!(outcome, DeleteOrganizationOutcome::SignedOut);
         assert_eq!(auth.state(), AuthState::SignedOut);
         assert!(!auth.session_file().exists());
 
@@ -3448,8 +3482,8 @@ mod tests {
         assert_eq!(
             requests,
             [
-                "DELETE /auth/orgs/org_deleted HTTP/1.1",
-                "GET /auth/orgs HTTP/1.1",
+                "DELETE /auth/organizations/org_deleted HTTP/1.1",
+                "GET /auth/organizations HTTP/1.1",
             ]
         );
     }

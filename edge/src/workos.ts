@@ -37,11 +37,11 @@ export class WorkOsOutcomeUnknown extends WorkOsTransientFailure {}
 /** A syntactically valid admin request that WorkOS could not honor. This is
  * deliberately distinct from a bad login: silently retrying without the role
  * would report success while creating an ordinary member (and, for a new
- * organization, leave a workspace with nobody able to administer it). */
+ * organization, leave an organization with nobody able to administer it). */
 export class WorkOsRoleAssignmentFailed extends WorkOsAuthFailed {
   constructor(
     message: string,
-    /** Present when createOrg already allocated an organization. */
+    /** Present when createOrganization already allocated an organization. */
     readonly organizationId?: string,
     /** Present when automatic orphan cleanup also failed. */
     readonly rollbackFailure?: string
@@ -66,16 +66,17 @@ export interface RefreshResult {
   readonly refreshToken: string;
 }
 
-export interface OrgMembership {
+/** Comet domain model. WorkOS wire fields are translated at this adapter boundary. */
+export interface OrganizationMembership {
   readonly id: string;
   readonly organizationId: string;
   readonly name: string;
-  /** The caller's role in this org ("admin" | "member"). */
+  /** The caller's role in this organization ("admin" | "member"). */
   readonly role: string;
 }
 
-/** One member of an organization (the team-management surface). */
-export interface OrgMember {
+/** One member of a Comet Organization. */
+export interface OrganizationMember {
   readonly membershipId: string;
   readonly userId: string;
   readonly email: string;
@@ -84,9 +85,9 @@ export interface OrgMember {
 }
 
 /** Active membership data that is sufficient for authorization and mutation
- * guards. Keeping this separate from `OrgMember` avoids an N-user enrichment
+ * guards. Keeping this separate from `OrganizationMember` avoids an N-user enrichment
  * fan-out for operations that only need membership ids and roles. */
-export interface RawOrgMember {
+export interface RawOrganizationMember {
   readonly membershipId: string;
   readonly userId: string;
   readonly role: string;
@@ -243,7 +244,7 @@ export const exchange = async (env: Env, apiKey: string, code: string): Promise<
 };
 
 /** `authenticateWithRefreshToken`; passing `organizationId` scopes the session
- * to that org (the next access token carries `org_id`). */
+ * to that Comet Organization (WorkOS returns the `org_id` wire claim). */
 export const refresh = async (
   env: Env,
   apiKey: string,
@@ -306,8 +307,11 @@ const listActiveMemberships = async (
   }
 };
 
-/** The user's complete set of active organization memberships. */
-export const listOrgs = async (apiKey: string, userId: string): Promise<OrgMembership[]> => {
+/** The user's complete set of active Comet Organization memberships. */
+export const listOrganizations = async (
+  apiKey: string,
+  userId: string
+): Promise<OrganizationMembership[]> => {
   const memberships = await listActiveMemberships(
     apiKey,
     { user_id: userId },
@@ -321,16 +325,16 @@ export const listOrgs = async (apiKey: string, userId: string): Promise<OrgMembe
   }));
 };
 
-/** The caller's active membership in one org — the admin gate's evidence.
+/** The caller's active membership in one Organization — the admin gate's evidence.
  * `undefined` = not a member. */
-export const membershipOf = async (
+export const organizationMembershipOf = async (
   apiKey: string,
-  orgId: string,
+  organizationId: string,
   userId: string
 ): Promise<{ membershipId: string; role: string } | undefined> => {
   const params = new URLSearchParams({
     user_id: userId,
-    organization_id: orgId,
+    organization_id: organizationId,
     statuses: "active",
     limit: "1"
   });
@@ -341,13 +345,16 @@ export const membershipOf = async (
   return m ? { membershipId: m.id, role: m.role?.slug ?? "member" } : undefined;
 };
 
-/** Every active membership in an org without user-profile enrichment. Use
- * this for cross-org and last-admin guards so a mutation is O(pages), not
+/** Every active membership in an Organization without user-profile enrichment. Use
+ * this for cross-Organization and last-admin guards so a mutation is O(pages), not
  * O(pages + members), in WorkOS subrequests. */
-export const listRawMembers = async (apiKey: string, orgId: string): Promise<RawOrgMember[]> => {
+export const listRawOrganizationMembers = async (
+  apiKey: string,
+  organizationId: string
+): Promise<RawOrganizationMember[]> => {
   const memberships = await listActiveMemberships(
     apiKey,
-    { organization_id: orgId },
+    { organization_id: organizationId },
     "WorkOS member list"
   );
   return memberships.map((membership) => ({
@@ -377,12 +384,18 @@ const mapWithConcurrency = async <T, U>(
   return results;
 };
 
-/** Every active member of an org, with user identity resolved for display.
- * WorkOS user lookups are deliberately bounded so a large Team cannot emit a
+/** Every active member of an Organization, with user identity resolved for display.
+ * WorkOS user lookups are deliberately bounded so a large Organization cannot emit a
  * burst of hundreds of simultaneous subrequests. */
-export const listMembers = async (apiKey: string, orgId: string): Promise<OrgMember[]> => {
-  const memberships = await listRawMembers(apiKey, orgId);
-  return mapWithConcurrency(memberships, 8, async (membership): Promise<OrgMember> => {
+export const listOrganizationMembers = async (
+  apiKey: string,
+  organizationId: string
+): Promise<OrganizationMember[]> => {
+  const memberships = await listRawOrganizationMembers(apiKey, organizationId);
+  return mapWithConcurrency(
+    memberships,
+    8,
+    async (membership): Promise<OrganizationMember> => {
     let email = membership.userId;
     let name: string | null = null;
     if (membership.userId) {
@@ -399,24 +412,25 @@ export const listMembers = async (apiKey: string, orgId: string): Promise<OrgMem
         return failed(userRes);
       }
     }
-    return {
-      membershipId: membership.membershipId,
-      userId: membership.userId,
-      email,
-      name,
-      role: membership.role
-    };
-  });
+      return {
+        membershipId: membership.membershipId,
+        userId: membership.userId,
+        email,
+        name,
+        role: membership.role
+      };
+    }
+  );
 };
 
-/** Add a user to an org by EMAIL: an already-registered user gets an active
+/** Add a user to an Organization by email: an already-registered user gets an active
  * membership immediately; an unknown email gets a WorkOS invitation instead.
  * A missing custom "member" slug can safely use WorkOS's default role. An
  * admin request must never take that fallback: success guarantees the role
  * the caller requested. */
-export const addMemberByEmail = async (
+export const addOrganizationMemberByEmail = async (
   apiKey: string,
-  orgId: string,
+  organizationId: string,
   email: string,
   role: string
 ): Promise<{ added: boolean; invited: boolean }> => {
@@ -430,7 +444,7 @@ export const addMemberByEmail = async (
   if (user) {
     const withRole = await post(apiKey, "/user_management/organization_memberships", {
       user_id: user.id,
-      organization_id: orgId,
+      organization_id: organizationId,
       role_slug: role
     });
     if (!withRole.ok) {
@@ -443,7 +457,7 @@ export const addMemberByEmail = async (
       }
       const fallback = await post(apiKey, "/user_management/organization_memberships", {
         user_id: user.id,
-        organization_id: orgId
+        organization_id: organizationId
       });
       if (!fallback.ok) return mutatingFailed(fallback);
     }
@@ -451,7 +465,7 @@ export const addMemberByEmail = async (
   }
   const invite = await post(apiKey, "/user_management/invitations", {
     email,
-    organization_id: orgId,
+    organization_id: organizationId,
     ...(role === "admin" ? { role_slug: "admin" } : {})
   });
   if (!invite.ok) {
@@ -462,7 +476,7 @@ export const addMemberByEmail = async (
 };
 
 /** Change a member's role ("admin" | "member"). */
-export const setMemberRole = async (
+export const setOrganizationMemberRole = async (
   apiKey: string,
   membershipId: string,
   role: string
@@ -479,8 +493,11 @@ export const setMemberRole = async (
   if (!res.ok) return mutatingFailed(res);
 };
 
-/** Remove a member from an org. */
-export const removeMember = async (apiKey: string, membershipId: string): Promise<void> => {
+/** Remove a member from an Organization. */
+export const removeOrganizationMember = async (
+  apiKey: string,
+  membershipId: string
+): Promise<void> => {
   const res = await mutatingFetch(
     `${API}/user_management/organization_memberships/${membershipId}`,
     {
@@ -493,9 +510,12 @@ export const removeMember = async (apiKey: string, membershipId: string): Promis
 };
 
 /** Delete an organization outright. */
-export const deleteOrg = async (apiKey: string, orgId: string): Promise<void> => {
+export const deleteOrganization = async (
+  apiKey: string,
+  organizationId: string
+): Promise<void> => {
   const res = await mutatingFetch(
-    `${API}/organizations/${orgId}`,
+    `${API}/organizations/${organizationId}`,
     {
       method: "DELETE",
       headers: { authorization: `Bearer ${apiKey}` }
@@ -505,16 +525,16 @@ export const deleteOrg = async (apiKey: string, orgId: string): Promise<void> =>
   if (!res.ok) return mutatingFailed(res);
 };
 
-/** Finish a failed createOrg transaction. Always preserves the first-admin
+/** Finish a failed createOrganization transaction. Always preserves the first-admin
  * failure as the primary error; orphan cleanup is attached as recovery context. */
-const rollbackFailedCreate = async (
+const rollbackFailedOrganizationCreation = async (
   apiKey: string,
   organizationId: string,
   assignmentFailure: string
 ): Promise<never> => {
   let rollbackFailure: string | undefined;
   try {
-    await deleteOrg(apiKey, organizationId);
+    await deleteOrganization(apiKey, organizationId);
   } catch (error) {
     rollbackFailure = thrownFailureMessage(error);
   }
@@ -523,7 +543,7 @@ const rollbackFailedCreate = async (
   if (rollbackFailure === undefined) {
     // Deliberately log only the public organization id and outcome. In
     // particular, never include apiKey or request headers in Worker logs.
-    console.warn("workos createOrg admin assignment failed; organization rolled back", {
+    console.warn("workos createOrganization admin assignment failed; organization rolled back", {
       organizationId
     });
     throw new WorkOsRoleAssignmentFailed(
@@ -532,7 +552,7 @@ const rollbackFailedCreate = async (
     );
   }
 
-  console.error("workos createOrg rollback failed after admin assignment failure", {
+  console.error("workos createOrganization rollback failed after admin assignment failure", {
     organizationId,
     rollbackFailure
   });
@@ -544,53 +564,60 @@ const rollbackFailedCreate = async (
 };
 
 /** Create an organization and make the user its first (admin) member. */
-export const createOrg = async (
+export const createOrganization = async (
   apiKey: string,
   userId: string,
   name: string
 ): Promise<{ organizationId: string }> => {
-  const orgRes = await post(apiKey, "/organizations", { name });
-  if (!orgRes.ok) return mutatingFailed(orgRes);
-  const org = await responseJson<{ id: string }>(orgRes, "WorkOS organization creation", true);
-  // The creator must administer their workspace. Never retry without the role:
+  const organizationResponse = await post(apiKey, "/organizations", { name });
+  if (!organizationResponse.ok) return mutatingFailed(organizationResponse);
+  const organization = await responseJson<{ id: string }>(
+    organizationResponse,
+    "WorkOS organization creation",
+    true
+  );
+  // The creator must administer their Organization. Never retry without the role:
   // that would turn an admin-assignment failure into a false 200 while leaving
   // the creator unable to manage the organization.
   let assignmentFailure: string;
   try {
     const withRole = await post(apiKey, "/user_management/organization_memberships", {
       user_id: userId,
-      organization_id: org.id,
+      organization_id: organization.id,
       role_slug: "admin"
     });
-    if (withRole.ok) return { organizationId: org.id };
+    if (withRole.ok) return { organizationId: organization.id };
     if (withRole.status >= 500) await mutatingFailed(withRole);
     assignmentFailure = await failureMessage(withRole);
   } catch (error) {
     // Transport loss and 5xx are ambiguous: WorkOS may have committed the
     // membership before failing. Verify live state before deleting a valid
-    // admin workspace or reporting a false failure.
+    // admin Organization or reporting a false failure.
     assignmentFailure = `membership request outcome is uncertain: ${thrownFailureMessage(error)}`;
     let verification: string;
     try {
-      const membership = await membershipOf(apiKey, org.id, userId);
+      const membership = await organizationMembershipOf(apiKey, organization.id, userId);
       if (membership?.role === "admin") {
-        console.warn("workos createOrg membership request failed; admin membership verified", {
-          organizationId: org.id
+        console.warn("workos createOrganization membership request failed; admin membership verified", {
+          organizationId: organization.id
         });
-        return { organizationId: org.id };
+        return { organizationId: organization.id };
       }
       verification = membership ? `verified role=${membership.role}` : "membership not found";
     } catch (verificationError) {
       verification = `verification failed: ${thrownFailureMessage(verificationError)}`;
     }
-    console.warn("workos createOrg admin membership not verified; rolling back organization", {
-      organizationId: org.id,
-      verification
-    });
+    console.warn(
+      "workos createOrganization admin membership not verified; rolling back organization",
+      {
+        organizationId: organization.id,
+        verification
+      }
+    );
   }
 
   // Organization creation and first-membership assignment are separate WorkOS
   // calls. Treat them transactionally from Comet's perspective: otherwise a
   // Retry allocates another organization while the first one remains orphaned.
-  return rollbackFailedCreate(apiKey, org.id, assignmentFailure);
+  return rollbackFailedOrganizationCreation(apiKey, organization.id, assignmentFailure);
 };

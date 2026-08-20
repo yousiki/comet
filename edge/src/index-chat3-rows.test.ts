@@ -3,7 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("./install.sh", () => ({ default: "#!/bin/sh" }));
 
 import worker from "./index";
-import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import {
+  AUTH_ORGANIZATION_HEADER,
+  AUTH_USER_HEADER,
+  LEGACY_ORGANIZATION_CHAT_ROOM_KIND,
+  ROOM_KIND_HEADER,
+  type Env
+} from "./env";
 
 interface ForwardedRequest {
   room: string;
@@ -39,7 +45,7 @@ const testEnv = (chatRooms: DurableObjectNamespace): Env => ({
 
 describe("chat3 HTTP rows routes", () => {
   for (const method of ["GET", "POST"] as const) {
-    it(`forwards ${method} to the org-scoped chat3 room`, async () => {
+    it(`forwards ${method} to the Organization-scoped chat3 room`, async () => {
       const forwarded: ForwardedRequest[] = [];
       const env = testEnv(fakeNamespace(forwarded));
       const response = await worker.fetch(
@@ -60,12 +66,14 @@ describe("chat3 HTTP rows routes", () => {
       expect(url.pathname).toBe("/rows");
       expect(url.search).toBe("?after=7&batchId=batch-1");
       expect(call.request.headers.get(AUTH_USER_HEADER)).toBe("alice");
-      expect(call.request.headers.get(ROOM_KIND_HEADER)).toBe("org-chat");
-      expect(call.request.headers.get(AUTH_ORG_HEADER)).toBe("org-a");
+      expect(call.request.headers.get(ROOM_KIND_HEADER)).toBe(
+        LEGACY_ORGANIZATION_CHAT_ROOM_KIND
+      );
+      expect(call.request.headers.get(AUTH_ORGANIZATION_HEADER)).toBe("org-a");
     });
   }
 
-  it("rejects chat3 rows without a verified org claim before forwarding", async () => {
+  it("rejects chat3 rows without a verified Organization claim before forwarding", async () => {
     const forwarded: ForwardedRequest[] = [];
     const response = await worker.fetch(
       new Request("https://edge.example/chat3/chat-id/rows", {

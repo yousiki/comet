@@ -1,10 +1,10 @@
 /**
- * Authorization for org-shared chat rooms (`chat3/{orgId}/{chatId}`).
+ * Authorization for Organization-shared rooms in the legacy `chat3` namespace.
  *
  * Pure decision function (the pickLiveHost precedent: extract the branchy
- * decision so it's unit-testable without a DO). Org MEMBERSHIP is already
+ * decision so it's unit-testable without a DO). Organization membership is already
  * proven before this runs — the Worker builds the room name from the verified
- * JWT org claim, so anyone who reaches the DO is a member. What's decided
+ * JWT Organization claim, so anyone who reaches the DO is a member. What's decided
  * here is the HOST-USER discipline layered on top:
  *
  * - Member ops (join, push via ws or HTTP rows, rows/checkpoint/sidecar reads,

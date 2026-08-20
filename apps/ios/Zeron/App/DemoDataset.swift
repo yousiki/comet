@@ -19,7 +19,7 @@ final class DemoDataset {
 
     private static let dummyConfig = AppConfig(
         edgeURL: URL(string: "http://localhost:8787")!, mode: .dev,
-        userId: "demo", orgId: "demo", deviceId: "ios-demo", deviceName: "iPhone")
+        userId: "demo", organizationId: "demo", deviceId: "ios-demo", deviceName: "iPhone")
 
     init(devices: [DeviceRow], spaces: [Space], chats: [Chat], sessions: [String: SessionRow],
          changeRequests: [String: ChangeRequestSummary] = [:]) {
@@ -246,12 +246,12 @@ final class DemoDataset {
                     .text(id: "t0", text: "The model picker shows stale catalogs after switching devices — where should the catalog come from?"),
                 ], createdAt: now - 400_000, deviceId: "ios-demo", status: .complete, continuationOf: nil),
                 MessageEntry(id: "m2", role: .assistant, parts: [
-                    .text(id: "t0", text: "Two viable sources — the local device's harness install, or the space's owning device. The desktop recently moved to the latter (`aa128a6`). Before I wire the RPC, one decision:"),
+                    .text(id: "t0", text: "Two viable sources — the local device's harness install, or the project's owning device. The desktop recently moved to the latter (`aa128a6`). Before I wire the RPC, one decision:"),
                     .input(id: "req-1", requestId: "req-1", questions: [
                         UserInputQuestion(id: "q1", header: "Catalog source",
                                           question: "Which device should serve harness/model catalogs for the picker?",
                                           options: [
-                                            "Space's device (Recommended)",
+                                            "Project's device (Recommended)",
                                             "Local device",
                                             "Union of both",
                                           ], multiSelect: false),

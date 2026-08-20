@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Agent-to-agent send e2e: real edge (wrangler dev), two headless engines as
-# DIFFERENT users of one org, chat X on engine A and chat Y on engine B. The
+# DIFFERENT users of one Organization, chat X on engine A and chat Y on engine B. The
 # e2e_agent_send driver spawns the real `zeron mcp-bridge` (env-wired to A and
 # chat X), drives one MCP send_to_session at Y, and proves Y's transcript
 # gains a user turn attributed `agent:{X}` plus a mock assistant reply on B.
@@ -14,7 +14,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 EDGE_PORT="${ZERON_E2E_EDGE_PORT:-27640}"
 EDGE_URL="http://localhost:${EDGE_PORT}"
-ORG="agorg1"
+ORGANIZATION_ID="agorg1"
 A_PORT=27821
 B_PORT=27822
 A_DIR=/tmp/e2e-agent-a
@@ -88,13 +88,13 @@ mkdir -p "$A_DIR" "$B_DIR"
 
 start_engine() { # start_engine <data_dir> <ipc_port> <name> <token> <user> <log>
   ZERON_DATA_DIR="$1" ZERON_IPC_PORT="$2" ZERON_DEVICE_NAME="$3" \
-    ZERON_EDGE_URL="$EDGE_URL" ZERON_EDGE_TOKEN="$4" ZERON_ORG_ID="$ORG" \
+    ZERON_EDGE_URL="$EDGE_URL" ZERON_EDGE_TOKEN="$4" ZERON_ORGANIZATION_ID="$ORGANIZATION_ID" \
     ZERON_USER_ID="$5" ZERON_HARNESS=mock RUST_LOG=info \
     "$ZERON" headless >"$6" 2>&1 &
 }
 
-start_engine "$A_DIR" "$A_PORT" "agent-device-alice" "alice@${ORG}" alice "$LOG_DIR/engine-a.log"; A_PID=$!
-start_engine "$B_DIR" "$B_PORT" "agent-device-bob" "bob@${ORG}" bob "$LOG_DIR/engine-b.log"; B_PID=$!
+start_engine "$A_DIR" "$A_PORT" "agent-device-alice" "alice@${ORGANIZATION_ID}" alice "$LOG_DIR/engine-a.log"; A_PID=$!
+start_engine "$B_DIR" "$B_PORT" "agent-device-bob" "bob@${ORGANIZATION_ID}" bob "$LOG_DIR/engine-b.log"; B_PID=$!
 
 wait_for "engine A ipc :$A_PORT" 60 bash -c "exec 3<>/dev/tcp/127.0.0.1/$A_PORT"
 wait_for "engine B ipc :$B_PORT" 60 bash -c "exec 3<>/dev/tcp/127.0.0.1/$B_PORT"

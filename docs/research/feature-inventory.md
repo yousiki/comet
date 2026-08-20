@@ -13,7 +13,7 @@ display EXCLUDED. File paths refer to the reference repo.
 - DROP: messages sync over Postgres logical replication, device-addressed run RPCs,
   WatchMessages, WebRTC + signaling.
 - NOTE: chats/sessions/devices/checkout-diffs entity sync is STILL Postgres-based in zeron — the rewrite
-  must re-home it (decision: per-org workspace Loro doc, see ARCHITECTURE.md).
+  must re-home it (current decision: Organization-shared profile registry, see ARCHITECTURE.md).
 
 ## 1. Desktop app
 ### 1.1 Window shell
@@ -22,8 +22,8 @@ display EXCLUDED. File paths refer to the reference repo.
   data dirs (.zeron-dev/.zeron). Fullscreen hides traffic lights -> cluster reflows.
 
 ### 1.2 App phases (App.tsx)
-- Three phases with crossfade: Gate (loading/reconnect/login card over bg-grid), OrgGate ("Create
-  your workspace" + existing org memberships + "Use a different account"), app (router).
+- Three phases with crossfade: Gate (loading/reconnect/login card over bg-grid), OrganizationGate
+  ("Create your organization" + existing Organization memberships + "Use a different account"), app (router).
 - Boot Splash: zeron-wave loader, fades out (splash-out) once connected && authReady (15s cap),
   never returns mid-session.
 
@@ -148,8 +148,9 @@ display EXCLUDED. File paths refer to the reference repo.
 - Mutate: CreateChat, SetChatConfig, SetChatArchived, RenameChat, RenameDevice, DeleteChat,
   MarkChatSeen
 ### AuthRpc (IPC-only)
-- AuthStatus -> stream (SignedOut|NeedsOrganization{user}|SignedIn{user,orgId?})
-- SignIn->{url}; SignInHeadless->{url}; CompleteSignIn{code}; SignOut; ListOrgs; CreateOrg; SelectOrg
+- AuthStatus -> stream (SignedOut|NeedsOrganization{user}|SignedIn{user,organizationId?})
+- SignIn->{url}; SignInHeadless->{url}; CompleteSignIn{code}; SignOut;
+  ListOrganizations; CreateOrganization; SelectOrganization
 ### Wire types
 - AgentEvent: SessionStarted, TextDelta, ReasoningDelta, ToolCall, ToolResult, Usage(kept as event,
   not displayed), Error, InputRequested, InputResolved, Steered, Done
@@ -178,8 +179,8 @@ display EXCLUDED. File paths refer to the reference repo.
   checkoutIdentity; CheckoutDiffSync: fs watchers + 2min repair, git diff (name-status + numstat +
   patch incl untracked), 3MiB cap, sha256; publishes DiffSidecar to chat DOs; GitMetadataSync
   watches HEAD -> chat.branch; folder listing in disposable worker w/ 6s timeout.
-- 3.7 Auth: WorkOS auth-code + loopback callback; headless paste-code; refresh persisted; org
-  gate; dev mode bearer. Uploads: chunked staging -> durable file. Agent accounts: claude-swap
+- 3.7 Auth: WorkOS auth-code + loopback callback; headless paste-code; refresh persisted;
+  Organization membership gate; dev mode bearer. Uploads: chunked staging -> durable file. Agent accounts: claude-swap
   (Keychain "Claude Code-credentials" / ~/.claude/.credentials.json + ~/.claude.json; Codex
   $CODEX_HOME/auth.json); detect live, swap to activate, plan labels, usage probes, OAuth flows.
   Device-room host: one wss to device DO; serves full ControlRpc via virtual sockets over
@@ -235,7 +236,7 @@ display EXCLUDED. File paths refer to the reference repo.
   slots (repos snapshot); /status /nudge.
 
 ## 7. Server -> folded into edge for native
-- Keep: WorkOS code exchange/refresh, org list/create (move to edge Worker routes).
+- Keep: WorkOS code exchange/refresh, Organization list/create (move to edge Worker routes).
 - Drop: entity push/query, Postgres, signaling, Fly deploy of separate server.
 
 ## 8. EXCLUDED (token usage display)

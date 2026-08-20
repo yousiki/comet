@@ -1,7 +1,7 @@
 // New session — a real composer page, not a form. Mirrors the old mobile
 // app's canvas (faded mark + "What are we building?" + glass composer with
 // picker chips) and the desktop's new-session canvas (composer expanded with
-// in-pill pickers). The space already fixes device + folder; the composer
+// in-pill pickers). The project already fixes device + folder; the composer
 // carries the agent/model chip, and sending mints the chat, queues the first
 // run, and swaps straight into the live session.
 
@@ -27,10 +27,10 @@ struct NewSessionView: View {
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPhotoPicker = false
     @State private var attachError: String?
-    /// Live harness list from the space's device (Settings → Agents gate);
+    /// Live harness list from the project's device (Settings → Agents gate);
     /// static pair until it loads.
     @State private var liveHarnesses: [HarnessInfo]?
-    /// Live per-harness catalogs from the space's device (static fallback).
+    /// Live per-harness catalogs from the project's device (static fallback).
     @State private var catalogs: [String: [ModelInfo]] = [:]
     @State private var refs: [RepoRef] = []
     @State private var selectedRef: String?
@@ -144,7 +144,7 @@ struct NewSessionView: View {
             }
         }
         .task(id: spaceId) {
-            // Load refs for the branch chip (git spaces only).
+            // Load refs for the branch chip (git projects only).
             guard let space, space.gitDetected else { return }
             if let loaded = await model.listRefs(space: space) {
                 refs = loaded
@@ -310,7 +310,7 @@ struct NewSessionView: View {
 
     /// pick_ref (draft mode): a worktree'd ref flips to "Current worktree";
     /// base picks just record; a plain non-current ref in Local mode CHECKS
-    /// OUT the space folder (it must never silently flip the mode).
+    /// OUT the project folder (it must never silently flip the mode).
     private func pickRef(_ row: RepoRef) async -> String? {
         if row.worktreePath != nil {
             selectedRef = row.name
@@ -805,7 +805,7 @@ struct RefPickerSheet: View {
 
 // MARK: - Checkout picker sheet
 
-/// Where the session runs (the desktop's checkout popover): the space's
+/// Where the session runs (the desktop's checkout popover): the project's
 /// folder as-is (or the picked ref's existing worktree), or a fresh isolated
 /// worktree created off the base ref on send.
 struct CheckoutPickerSheet: View {
@@ -823,7 +823,7 @@ struct CheckoutPickerSheet: View {
                         title: selectedRefHasWorktree ? "Current worktree" : "Current checkout",
                         subtitle: selectedRefHasWorktree
                             ? "Reuse the picked ref's existing worktree"
-                            : "Run in the space's folder as-is")
+                            : "Run in the project's folder as-is")
                     row(.newWorktree, title: "New worktree",
                         subtitle: "A fresh isolated worktree created off the picked base ref")
                 }

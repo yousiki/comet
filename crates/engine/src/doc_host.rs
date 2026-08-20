@@ -11,7 +11,7 @@
 //!   ledger), mark processed BEFORE execute, execute through the sessions engine, then
 //!   write the outcome status back into the doc as the sole outcome writer.
 //!
-//! Chat ownership is gated on the workspace doc (`chats[chat_id].deviceId`), with
+//! Chat ownership is gated on the registry doc (`chats[chat_id].deviceId`), with
 //! claim-on-first-command for unknown chats. Queueing a command for a chat hosted on
 //! another device POSTs a durable nudge to that device's room (§7 cold-chat delivery);
 //! the host's relay receives it and warm-opens the doc, which drains the queue.
@@ -34,8 +34,8 @@ use zeron_doc::{
 use zeron_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
 use zeron_sync::DocsStore;
 
+use crate::registry_host::RegistryHost;
 use crate::sessions::{SessionsEngine, SteerOutcome};
-use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
 
 /// Debounce window for local snapshot saves after a doc change.
@@ -209,14 +209,14 @@ impl zeron_sync::UrlProvider for EdgeRoomUrl {
 }
 
 /// Room-path prefix for a chat's sync generation: 2 = `chat2` (single-owner),
-/// 3 = `chat3` (org-shared). Gen 1 never dials a room.
+/// 3 = `chat3` (organization-shared). Gen 1 never dials a room.
 fn room_prefix(room_gen: u32) -> &'static str {
     if room_gen >= 3 { "chat3" } else { "chat2" }
 }
 
 /// A 403 is terminal only for a foreign legacy room: chat2 is intentionally
 /// single-owner, so a non-owner can do nothing until the registry flips the
-/// chat to org-shared chat3. A host denial or any chat3 denial may be a token,
+/// chat to organization-shared chat3. A host denial or any chat3 denial may be a token,
 /// claim, or deployment problem and must keep the normal retry path alive.
 fn should_park_access_denied(room_gen: u32, is_host: bool) -> bool {
     room_gen < 3 && !is_host
@@ -229,7 +229,7 @@ pub struct DocHostConfig {
     /// shared sessions can render "who sent this". Empty when unknown (dev
     /// setups without auth); empty stamps nothing.
     pub user_id: String,
-    /// Harness for doc-command runs on chats without a workspace `config` row.
+    /// Harness for doc-command runs on chats without a registry `config` row.
     pub default_harness: HarnessId,
     /// When present, each opened chat joins its edge session room. `None` = fully
     /// offline operation (local snapshots only).
@@ -243,7 +243,7 @@ struct DocHostInner {
     /// doc-host reference each other through Arcs, so a retired runtime's
     /// graph only drops once this back-edge is severed.
     sessions: Mutex<Option<SessionsEngine>>,
-    workspace: OnceLock<WorkspaceHost>,
+    registry: OnceLock<RegistryHost>,
     /// Worktree materialization for Run commands (see `set_repos`).
     repos: OnceLock<crate::repos::Repos>,
     /// Cancels every worker spawned through `spawn_worker` — the loops'
@@ -732,7 +732,7 @@ impl DocHost {
                 store,
                 config,
                 sessions: Mutex::new(None),
-                workspace: OnceLock::new(),
+                registry: OnceLock::new(),
                 repos: OnceLock::new(),
                 shutdown: CancellationToken::new(),
                 tasks: TaskTracker::new(),
@@ -1260,10 +1260,10 @@ impl DocHost {
         }
     }
 
-    /// Wire the workspace host (engine assembly) — the source of chat-ownership rows.
-    pub fn set_workspace(&self, workspace: WorkspaceHost) {
-        let chats = workspace.watch_chats();
-        if self.inner.workspace.set(workspace).is_ok() {
+    /// Wire the registry host (engine assembly) — the source of chat-ownership rows.
+    pub fn set_registry(&self, registry: RegistryHost) {
+        let chats = registry.watch_chats();
+        if self.inner.registry.set(registry).is_ok() {
             self.spawn_cutover_watcher(chats);
             self.spawn_migration_sweep();
         }
@@ -1289,7 +1289,7 @@ impl DocHost {
                 let Some(edge) = host.inner.config.edge.clone() else {
                     return; // edge-less engine: nothing to migrate onto
                 };
-                let Some(ws) = host.workspace() else { continue };
+                let Some(ws) = host.registry() else { continue };
                 let minted = host.minted_room_gen();
                 let chats: Vec<zeron_proto::Chat> = ws.watch_chats().borrow().clone();
                 let device = host.inner.config.device_id.clone();
@@ -1364,13 +1364,13 @@ impl DocHost {
     /// racing writer must never lose its doc out from under it.
     fn spawn_cutover_watcher(&self, mut chats: watch::Receiver<Vec<zeron_proto::Chat>>) {
         // Capture the receiver's baseline before the task is scheduled. A
-        // DeleteChat can otherwise publish between `set_workspace` and the
+        // DeleteChat can otherwise publish between `set_registry` and the
         // watcher's first poll; Tokio watch retains only the latest value, so
         // taking `previous_ids` inside the task would forget the deleted row
         // and the first-cycle suppression would silently miss its tombstone.
         let baseline = self
-            .workspace()
-            .and_then(|workspace| workspace.read_chats().ok())
+            .registry()
+            .and_then(|registry| registry.read_chats().ok())
             .unwrap_or_else(|| chats.borrow().clone());
         let mut previous_ids: HashSet<String> = baseline.into_iter().map(|chat| chat.id).collect();
         let host = self.clone();
@@ -1379,18 +1379,18 @@ impl DocHost {
             let mut ownership_ready_seen = host.inner.config.edge.is_none();
             loop {
                 if !first && chats.changed().await.is_err() {
-                    return; // workspace host gone (shutdown)
+                    return; // registry host gone (shutdown)
                 }
                 let initial = first;
                 first = false;
 
                 // The initial command drain deliberately fails closed while an
-                // org-shared registry has not synced. Registry readiness is a
-                // workspace event, not a doc mutation, so no chat task would
+                // organization-shared registry has not synced. Registry readiness is a
+                // registry event, not a doc mutation, so no chat task would
                 // otherwise revisit those durable pending commands. Re-drain
                 // every warm handle exactly once when that gate opens.
                 if !ownership_ready_seen
-                    && host.workspace().is_some_and(WorkspaceHost::ownership_ready)
+                    && host.registry().is_some_and(RegistryHost::ownership_ready)
                 {
                     ownership_ready_seen = true;
                     let handles: Vec<_> = lock(&host.inner.handles).values().cloned().collect();
@@ -1408,8 +1408,8 @@ impl DocHost {
                 // synchronous baseline with the authoritative overlay. Later
                 // cycles are driven by the watch and use its published value.
                 let published = if initial {
-                    host.workspace()
-                        .and_then(|workspace| workspace.read_chats().ok())
+                    host.registry()
+                        .and_then(|registry| registry.read_chats().ok())
                         .unwrap_or_else(|| chats.borrow_and_update().clone())
                 } else {
                     chats.borrow_and_update().clone()
@@ -1508,7 +1508,7 @@ impl DocHost {
     /// A registry generation can advance while a run still owns the old doc.
     /// Keep that writer alive, then retire/reopen the exact stale handle as
     /// soon as its writer and durable command work quiesce. The per-chat set
-    /// coalesces repeated workspace publishes into one waiter.
+    /// coalesces repeated registry publishes into one waiter.
     fn spawn_cutover_when_quiet(&self, chat_id: &str, handle: &Arc<ChatDocHandle>) {
         if !lock(&self.inner.cutover_waiting).insert(chat_id.to_string()) {
             return;
@@ -1523,7 +1523,7 @@ impl DocHost {
                     tokio::time::sleep(TICK).await;
                     let Some(handle) = weak.upgrade() else { return };
                     let row_gen = match host
-                        .workspace()
+                        .registry()
                         .and_then(|ws| ws.chat(&chat).ok().flatten())
                     {
                         Some(row) => row.room_gen.unwrap_or(1),
@@ -1784,9 +1784,9 @@ impl DocHost {
         self.cutover_handle_with_drain(chat_id, handle, target_gen)
     }
 
-    /// The workspace host, once wired (tests may assemble a DocHost without one).
-    pub fn workspace(&self) -> Option<&WorkspaceHost> {
-        self.inner.workspace.get()
+    /// The registry host, once wired (tests may assemble a DocHost without one).
+    pub fn registry(&self) -> Option<&RegistryHost> {
+        self.inner.registry.get()
     }
 
     pub fn device_id(&self) -> &str {
@@ -1794,8 +1794,8 @@ impl DocHost {
     }
 
     /// The room generation this engine mints for new/migrated chats: 3
-    /// (org-shared chat3) whenever an edge is configured — synced and dev
-    /// profiles always carry an org — else 2 (edge-less chats never dial).
+    /// (organization-shared chat3) whenever an edge is configured — synced and dev
+    /// profiles always carry an Organization — else 2 (edge-less chats never dial).
     fn minted_room_gen(&self) -> u32 {
         if self.inner.config.edge.is_some() {
             3
@@ -1819,9 +1819,7 @@ impl DocHost {
         // device has since cut over to chat2 would otherwise serve its frozen
         // fat lineage forever (the host writes only to the chat2 room now;
         // this device's s2 room has gone permanently silent).
-        let chat_row = self
-            .workspace()
-            .and_then(|w| w.chat(chat_id).ok().flatten());
+        let chat_row = self.registry().and_then(|w| w.chat(chat_id).ok().flatten());
         // A row that EXISTS without `roomGen` is a pre-cutover legacy chat
         // (gen 1). A MISSING row is a chat being born right now: its
         // CreateChat mint (which stamps roomGen 2) is racing this open —
@@ -1847,7 +1845,7 @@ impl DocHost {
                 )));
             }
             // Stale = built for an older room generation than the registry
-            // names (s2→chat2 seed, or the chat2→chat3 org-share flip).
+            // names (s2→chat2 seed, or the chat2→chat3 Organization-share flip).
             let stale = registry_gen >= 2 && handle.room_gen < registry_gen;
             if stale {
                 // A host-side fat source needs a checkpoint-first rebuild;
@@ -1895,7 +1893,7 @@ impl DocHost {
         let room_gen = if stored_epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
             if registry_gen < 2 {
                 let minted = self.minted_room_gen().max(stored_epoch);
-                if let Some(ws) = self.workspace() {
+                if let Some(ws) = self.registry() {
                     let _ = ws.set_chat_room_gen(chat_id, minted);
                     tracing::info!(chat = %chat_id, room_gen = minted, stored_epoch,
                         "completed interrupted room-gen flip (local synced epoch ahead of registry)");
@@ -1906,7 +1904,7 @@ impl DocHost {
                 // Never reconnect a generation-3 cursor to the generation-2
                 // room; repair the row best-effort and stay on the newer
                 // cursor namespace recorded with the snapshot.
-                if let Some(ws) = self.workspace() {
+                if let Some(ws) = self.registry() {
                     let _ = ws.set_chat_room_gen(chat_id, stored_epoch);
                 }
                 stored_epoch
@@ -2099,7 +2097,7 @@ impl DocHost {
         // edge deploy. The LRU made that dice-roll constant (every reopen),
         // and a watched doc is pinned against eviction, so nothing ever
         // retried: the exact "transcript frozen until restart" report.
-        // Retry on the workspace host's capped, jittered backoff; a system
+        // Retry on the registry host's capped, jittered backoff; a system
         // wake redials immediately; eviction/purge ends the loop via `weak`.
         let mut join_edge = None;
         let mut seed_edge = None;
@@ -2273,7 +2271,7 @@ impl DocHost {
             // to new sessions stalled while other chats hummed (2026-08-19
             // user report, reproduced on two networks).
             let mut online = zeron_sync::wake::subscribe_online();
-            let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
+            let mut backoff = crate::registry_host::JOIN_RETRY_BASE;
             loop {
                 if weak.upgrade().is_none() {
                     return; // evicted or purged while dialing
@@ -2436,7 +2434,7 @@ impl DocHost {
                                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                                 },
-                                _ = crate::workspace_host::token_changed(&mut token_changes) => {
+                                _ = crate::registry_host::token_changed(&mut token_changes) => {
                                     if edge.bearer().await.is_none() {
                                         if let Some(handle) = weak.upgrade() {
                                             // Preserve unacknowledged rows and
@@ -2469,17 +2467,17 @@ impl DocHost {
                 // zero (same discipline as chat_client's wait_backoff).
                 while online.try_recv().is_ok() {}
                 tokio::select! {
-                    _ = tokio::time::sleep(backoff + crate::workspace_host::join_retry_jitter()) => {
-                        backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
+                    _ = tokio::time::sleep(backoff + crate::registry_host::join_retry_jitter()) => {
+                        backoff = (backoff * 2).min(crate::registry_host::JOIN_RETRY_CAP);
                     }
                     _ = wake.recv() => {
-                        backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                        backoff = crate::registry_host::JOIN_RETRY_BASE;
                     }
                     _ = online.recv() => {
-                        backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                        backoff = crate::registry_host::JOIN_RETRY_BASE;
                     }
-                    _ = crate::workspace_host::token_changed(&mut token_changes) => {
-                        backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                    _ = crate::registry_host::token_changed(&mut token_changes) => {
+                        backoff = crate::registry_host::JOIN_RETRY_BASE;
                     }
                 }
             }
@@ -2634,16 +2632,16 @@ impl DocHost {
         if Self::chat_was_purged(&self.inner, chat_id) {
             return Err("chat was deleted during room-generation seed".into());
         }
-        let Some(workspace) = self.workspace() else {
-            return Err("no workspace host".into());
+        let Some(registry) = self.registry() else {
+            return Err("no registry host".into());
         };
-        match workspace.chat(chat_id) {
+        match registry.chat(chat_id) {
             Ok(Some(_)) => Ok(()),
             Ok(None) => {
                 self.purge_chat(chat_id);
                 Err("chat row vanished during room-generation seed".into())
             }
-            Err(err) => Err(format!("workspace row check during generation seed: {err}")),
+            Err(err) => Err(format!("registry row check during generation seed: {err}")),
         }
     }
 
@@ -2825,20 +2823,20 @@ impl DocHost {
             let _ = self.inner.store.delete_snapshot(chat_id);
             return;
         }
-        let (row_exists, row_deleted) = match self.workspace() {
-            Some(workspace) => match workspace.chat(chat_id) {
+        let (row_exists, row_deleted) = match self.registry() {
+            Some(registry) => match registry.chat(chat_id) {
                 Ok(Some(_)) => (true, false),
                 Ok(None) => {
                     // A DeleteChat won while the seed was between its target
                     // POST and registry flip. Publish the same terminal fence
-                    // as the workspace watcher now; never synthesize a new
+                    // as the registry watcher now; never synthesize a new
                     // local doc for a vanished row.
                     self.purge_chat(chat_id);
                     (false, true)
                 }
                 Err(err) => {
                     tracing::warn!(chat = %chat_id, error = %err,
-                        "workspace row check failed during frozen generation recovery");
+                        "registry row check failed during frozen generation recovery");
                     (false, false)
                 }
             },
@@ -3086,10 +3084,10 @@ impl DocHost {
                         } else {
                             drop(_save);
                             let flipped = self
-                                .workspace()
-                                .ok_or_else(|| "no workspace host".to_string())
-                                .and_then(|workspace| {
-                                    workspace
+                                .registry()
+                                .ok_or_else(|| "no registry host".to_string())
+                                .and_then(|registry| {
+                                    registry
                                         .set_chat_room_gen(chat_id, target_gen)
                                         .map_err(|e| e.to_string())
                                 });
@@ -3231,10 +3229,10 @@ impl DocHost {
 
             // Registry flip LAST — the cutover signal every device dials by.
             let flipped = self
-                .workspace()
-                .ok_or_else(|| "no workspace host".to_string())
-                .and_then(|workspace| {
-                    workspace
+                .registry()
+                .ok_or_else(|| "no registry host".to_string())
+                .and_then(|registry| {
+                    registry
                         .set_chat_room_gen(chat_id, target_gen)
                         .map_err(|e| e.to_string())
                 });
@@ -3247,7 +3245,7 @@ impl DocHost {
                 // The target epoch is durable and the exact fat handle is no
                 // longer cached. Reopen only when the source row still exists;
                 // a missing row is terminal deletion, not a born-chat race.
-                match self.workspace().map(|workspace| workspace.chat(chat_id)) {
+                match self.registry().map(|registry| registry.chat(chat_id)) {
                     Some(Ok(Some(_))) if !Self::chat_was_purged(&self.inner, chat_id) => {
                         let _ = self.open(chat_id);
                     }
@@ -3281,7 +3279,7 @@ impl DocHost {
         self.spawn_worker(async move {
             // Let boot settle (registry load, room joins) before sweeping.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let Some(ws) = host.workspace() else { return };
+            let Some(ws) = host.registry() else { return };
             let chats: Vec<zeron_proto::Chat> = ws.watch_chats().borrow().clone();
             for chat in chats {
                 if chat.device_id != host.inner.config.device_id {
@@ -3809,9 +3807,9 @@ impl DocHost {
     /// reported; recovery reports instantly.
     fn compute_connectivity(&self) -> zeron_proto::Connectivity {
         use zeron_proto::{ChatConnectivity, Connectivity, ConnectivityState};
-        let workspace = self.workspace();
+        let registry = self.registry();
         let edge_expected = self.inner.config.edge.is_some()
-            || workspace.as_ref().is_some_and(|w| w.edge_expected());
+            || registry.as_ref().is_some_and(|w| w.edge_expected());
         if !edge_expected {
             return Connectivity::default();
         }
@@ -3831,8 +3829,8 @@ impl DocHost {
                 }
             })
             .collect();
-        let reconnect = workspace.as_ref().and_then(|w| w.reconnect_state());
-        let registry_connected = workspace
+        let reconnect = registry.as_ref().and_then(|w| w.reconnect_state());
+        let registry_connected = registry
             .as_ref()
             .and_then(|w| w.sync_status())
             .is_some_and(|s| s.connected);
@@ -4017,10 +4015,10 @@ impl DocHost {
         // again, so the LWW row flips back to active on every device. Best-
         // effort — the command itself is durable regardless.
         if is_message {
-            if let Some(workspace) = self.workspace() {
-                match workspace.chat(chat_id) {
+            if let Some(registry) = self.registry() {
+                match registry.chat(chat_id) {
                     Ok(Some(chat)) if chat.archived => {
-                        if let Err(err) = workspace.set_chat_archived(chat_id, false) {
+                        if let Err(err) = registry.set_chat_archived(chat_id, false) {
                             tracing::warn!(chat = %chat_id, error = %err, "unarchive on send failed");
                         }
                     }
@@ -4103,16 +4101,16 @@ impl DocHost {
         lock(&self.inner.turn_origins).insert(chat_id.to_string(), hops);
     }
 
-    /// POST `{edge}/device/{host}/nudge {chatId}` when the chat's workspace row names
+    /// POST `{edge}/device/{host}/nudge {chatId}` when the chat's registry row names
     /// another device as host. Best-effort: offline/edge-less engines skip silently.
     fn nudge_remote_host(&self, chat_id: &str) {
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
         };
-        let Some(workspace) = self.workspace() else {
+        let Some(registry) = self.registry() else {
             return;
         };
-        let host_device = match workspace.chat(chat_id) {
+        let host_device = match registry.chat(chat_id) {
             Ok(Some(chat)) => chat.device_id,
             // Unclaimed chat: whoever drains first claims it — nobody to nudge.
             _ => return,
@@ -4160,8 +4158,8 @@ impl DocHost {
     /// The chat's host device when it is NOT this engine (mirrors
     /// `nudge_remote_host`'s ownership read).
     fn remote_host_for(&self, chat_id: &str) -> Option<String> {
-        let workspace = self.workspace()?;
-        let host_device = match workspace.chat(chat_id) {
+        let registry = self.registry()?;
+        let host_device = match registry.chat(chat_id) {
             Ok(Some(chat)) => chat.device_id,
             _ => return None,
         };
@@ -4319,7 +4317,7 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<&'static str, String> {
         let supported = self
-            .workspace()
+            .registry()
             .and_then(|ws| ws.read_devices().ok())
             .into_iter()
             .flatten()
@@ -4753,17 +4751,17 @@ impl DocHost {
             .map_err(|e| EngineError::Other(format!("sidecar body read failed: {e}")))
     }
 
-    /// §2.2 writer discipline: we host a chat iff its workspace row's `deviceId` is
+    /// §2.2 writer discipline: we host a chat iff its registry row's `deviceId` is
     /// ours; a chat with no row is claimable (claim-on-first-command). Without a
-    /// wired workspace host (bare-DocHost tests) every open chat is ours — M2's
+    /// wired registry host (bare-DocHost tests) every open chat is ours — M2's
     /// behavior, now the degenerate case.
     fn is_host(&self, chat_id: &str) -> bool {
-        self.workspace().is_none_or(|ws| ws.is_host(chat_id))
+        self.registry().is_none_or(|ws| ws.is_host(chat_id))
     }
 
-    /// Chat-config harness when the workspace row carries one, else the default.
+    /// Chat-config harness when the registry row carries one, else the default.
     pub(crate) fn harness_for(&self, chat_id: &str) -> HarnessId {
-        self.workspace()
+        self.registry()
             .and_then(|ws| ws.chat_config(chat_id))
             .map(|config| config.harness)
             .unwrap_or(self.inner.config.default_harness)
@@ -5128,9 +5126,9 @@ impl DocHost {
                     }
                     None => None,
                 };
-                // Claim-on-first-command: a run for a chat with no workspace row
+                // Claim-on-first-command: a run for a chat with no registry row
                 // creates the row under our device id (we are about to host it).
-                if let Some(ws) = self.workspace() {
+                if let Some(ws) = self.registry() {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
                     // A pre-existing row (the client's createChat raced ahead)
                     // still carries the repo folder — repoint it at the fresh
@@ -5151,7 +5149,7 @@ impl DocHost {
                 // what this run actually executes with. Claimed rows and
                 // catalog-not-loaded createChats both land here; the racing
                 // real createChat carries the same picked values.
-                if let Some(ws) = self.workspace()
+                if let Some(ws) = self.registry()
                     && ws.chat_config(chat_id).is_none()
                 {
                     let config = zeron_proto::ChatConfig {
@@ -5204,7 +5202,7 @@ impl DocHost {
                         // No live steerable run: the durable command still delivers —
                         // run it as the next turn (zeron's fallback, executor-side).
                         // After an engine restart `last_request` is empty too, so
-                        // rebuild the run config from the chat's workspace row
+                        // rebuild the run config from the chat's registry row
                         // (zeron derived dispatch config from the chat row the
                         // same way — sessions.ts:601-620); dispatch's engine-owned
                         // resume then reattaches the prior harness conversation.
@@ -5317,11 +5315,11 @@ impl DocHost {
         chat_id: &str,
         spec: &zeron_proto::WorktreeSpec,
     ) -> Result<(String, Option<zeron_proto::Worktree>), EngineError> {
-        if let Some(ws) = self.workspace()
+        if let Some(ws) = self.registry()
             && let Ok(Some(chat)) = ws.chat(chat_id)
             && let Some(cwd) = chat.cwd
             && cwd != spec.repo_path
-            && crate::workspace_host::linked_worktree_root(std::path::Path::new(&cwd)).as_deref()
+            && crate::registry_host::linked_worktree_root(std::path::Path::new(&cwd)).as_deref()
                 == Some(spec.repo_path.as_str())
         {
             tracing::info!(chat = %chat_id, cwd = %cwd, "worktree spec: reusing the chat's existing worktree");
@@ -5345,20 +5343,20 @@ impl DocHost {
     }
 
     /// A steer-turned-run with no in-process `last_request` (engine restarted
-    /// since the last turn): rebuild the run config from the chat's workspace
+    /// since the last turn): rebuild the run config from the chat's registry
     /// row — cwd from the row, model/reasoning/options/sandbox from its config
-    /// (composer defaults otherwise). `None` without a workspace host or row.
+    /// (composer defaults otherwise). `None` without a registry host or row.
     // (Also the RespondInput dead-run fallback's config source.)
     pub(crate) fn request_from_chat_row(
         &self,
         chat_id: &str,
         prompt: &str,
     ) -> Option<zeron_proto::RunRequest> {
-        let workspace = self.workspace()?;
-        let chat = match workspace.chat(chat_id) {
+        let registry = self.registry()?;
+        let chat = match registry.chat(chat_id) {
             Ok(chat) => chat?,
             Err(err) => {
-                tracing::warn!(chat = %chat_id, error = %err, "workspace chat read failed");
+                tracing::warn!(chat = %chat_id, error = %err, "registry chat read failed");
                 return None;
             }
         };
@@ -5576,7 +5574,7 @@ mod agent_send_tests {
     use zeron_proto::HarnessId;
     use zeron_sync::chat_client::{ChatDocSink, ChatTransport, CheckpointFetcher};
 
-    use crate::workspace_host::WorkspaceHostConfig;
+    use crate::registry_host::RegistryHostConfig;
 
     struct NoopChatSink;
 
@@ -5895,22 +5893,22 @@ mod agent_send_tests {
     #[tokio::test]
     async fn parked_updates_requeue_after_chat2_to_chat3_handle_replacement() {
         let (_dir, host) = host();
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             host.inner.store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("carry-chat", None, Some("dev-b"), None, None)
             .unwrap();
-        host.set_workspace(workspace.clone());
+        host.set_registry(registry.clone());
 
         let old = host.open("carry-chat").unwrap();
         assert_eq!(old.room_gen, 2);
@@ -5934,7 +5932,7 @@ mod agent_send_tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(Arc::strong_count(&old.doc), 1);
-        workspace.set_chat_room_gen("carry-chat", 3).unwrap();
+        registry.set_chat_room_gen("carry-chat", 3).unwrap();
         for _ in 0..64 {
             if !lock(&host.inner.handles).contains_key("carry-chat") {
                 break;
@@ -5965,22 +5963,22 @@ mod agent_send_tests {
     #[tokio::test]
     async fn active_command_drain_finishes_before_registry_cutover_replaces_handle() {
         let (_dir, host) = host();
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             host.inner.store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("drain-cutover", None, Some("dev-a"), None, None)
             .unwrap();
-        host.set_workspace(workspace.clone());
+        host.set_registry(registry.clone());
         let old = host.open("drain-cutover").unwrap();
         for _ in 0..64 {
             if Arc::strong_count(&old.doc) == 1 {
@@ -5990,7 +5988,7 @@ mod agent_send_tests {
         }
 
         let drain = old.command_drain.lock().await;
-        assert!(workspace.set_chat_room_gen("drain-cutover", 3).unwrap());
+        assert!(registry.set_chat_room_gen("drain-cutover", 3).unwrap());
         tokio::time::sleep(std::time::Duration::from_millis(350)).await;
         assert!(
             lock(&host.inner.handles)
@@ -6037,24 +6035,24 @@ mod agent_send_tests {
     #[tokio::test]
     async fn immediate_stale_open_parks_pending_and_persists_tail_at_target_cursor_zero() {
         let (_dir, host) = host();
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             host.inner.store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("stale-open", None, Some("dev-b"), None, None)
             .unwrap();
-        // Install the workspace without its watcher so this test deterministically
+        // Install the registry without its watcher so this test deterministically
         // exercises open()'s synchronous stale-cache coordinator.
-        assert!(host.inner.workspace.set(workspace.clone()).is_ok());
+        assert!(host.inner.registry.set(registry.clone()).is_ok());
         let old = host.open("stale-open").unwrap();
         for _ in 0..64 {
             if Arc::strong_count(&old.doc) == 1 {
@@ -6078,7 +6076,7 @@ mod agent_send_tests {
             old.doc.doc().commit();
         }
 
-        assert!(workspace.set_chat_room_gen("stale-open", 3).unwrap());
+        assert!(registry.set_chat_room_gen("stale-open", 3).unwrap());
         let replacement = host
             .open("stale-open")
             .expect("stale cached open must synchronously hand off and reopen");
@@ -6111,19 +6109,19 @@ mod agent_send_tests {
     async fn cancelled_frozen_seed_persists_source_tail_for_restart() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("cancelled-seed", None, Some("dev-a"), None, None)
             .unwrap();
         let first_host = DocHost::new(
@@ -6135,7 +6133,7 @@ mod agent_send_tests {
                 edge: None,
             },
         );
-        assert!(first_host.inner.workspace.set(workspace.clone()).is_ok());
+        assert!(first_host.inner.registry.set(registry.clone()).is_ok());
         let source = first_host.open("cancelled-seed").unwrap();
         source
             .doc
@@ -6198,7 +6196,7 @@ mod agent_send_tests {
                 edge: None,
             },
         );
-        assert!(second_host.inner.workspace.set(workspace).is_ok());
+        assert!(second_host.inner.registry.set(registry).is_ok());
         let reopened = second_host.open("cancelled-seed").unwrap();
         assert!(matches!(
             reopened.doc.doc().get_map("meta").get("tail-before-cancel"),
@@ -6212,19 +6210,19 @@ mod agent_send_tests {
     async fn frozen_recovery_store_failure_restores_writer_sync_and_cursor_zero_retry() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("recovery-save-failure", None, Some("dev-a"), None, None)
             .unwrap();
         let edge = EdgeConfig::with_static_token("http://127.0.0.1:9", "token");
@@ -6237,7 +6235,7 @@ mod agent_send_tests {
                 edge: Some(edge),
             },
         );
-        host.set_workspace(workspace);
+        host.set_registry(registry);
         let handle = host.open("recovery-save-failure").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while lock(&handle.chat2).is_none() {
@@ -6396,19 +6394,19 @@ mod agent_send_tests {
     async fn cursor_nonzero_disconnect_persists_full_replay_for_same_generation_restart() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("disconnect-replay", None, Some("dev-a"), None, None)
             .unwrap();
         let initial = SessionDoc::init("disconnect-replay").unwrap();
@@ -6430,7 +6428,7 @@ mod agent_send_tests {
                 edge: Some(edge.clone()),
             },
         );
-        first_host.set_workspace(workspace.clone());
+        first_host.set_registry(registry.clone());
         let first = first_host.open("disconnect-replay").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while lock(&first.chat2).is_none() {
@@ -6482,7 +6480,7 @@ mod agent_send_tests {
                 edge: Some(edge),
             },
         );
-        second_host.set_workspace(workspace);
+        second_host.set_registry(registry);
         let reopened = second_host.open("disconnect-replay").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
@@ -6553,22 +6551,22 @@ mod agent_send_tests {
     async fn checkpoint_only_replay_clear_preserves_the_sink_owned_epoch() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("checkpoint-epoch", None, Some("dev-a"), None, None)
             .unwrap();
-        workspace.set_chat_room_gen("checkpoint-epoch", 3).unwrap();
+        registry.set_chat_room_gen("checkpoint-epoch", 3).unwrap();
         let source = SessionDoc::init("checkpoint-epoch").unwrap();
         store
             .save_snapshot_with_cursor("checkpoint-epoch", &source.export_snapshot().unwrap(), 0, 2)
@@ -6582,7 +6580,7 @@ mod agent_send_tests {
                 edge: None,
             },
         );
-        host.set_workspace(workspace);
+        host.set_registry(registry);
         let handle = host.open("checkpoint-epoch").unwrap();
         assert_eq!(handle.room_gen, 3);
         host.install_chat2_client(&handle, local_first_chat_client_at(5).await);
@@ -6645,19 +6643,19 @@ mod agent_send_tests {
     async fn local_callback_dirty_mark_cannot_be_overwritten_while_waiting_for_chat_slot() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("replay-fence", None, Some("dev-a"), None, None)
             .unwrap();
         let initial = SessionDoc::init("replay-fence").unwrap();
@@ -6673,7 +6671,7 @@ mod agent_send_tests {
                 edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:9", "token")),
             },
         );
-        host.set_workspace(workspace);
+        host.set_registry(registry);
         let handle = host.open("replay-fence").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while lock(&handle.chat2).is_none() {
@@ -6721,22 +6719,22 @@ mod agent_send_tests {
     #[tokio::test]
     async fn purge_fences_a_removed_handle_recovery_and_late_sink() {
         let (_dir, host) = host();
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             host.inner.store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("purge-race", None, Some("dev-a"), None, None)
             .unwrap();
-        host.set_workspace(workspace);
+        host.set_registry(registry);
         let handle = host.open("purge-race").unwrap();
         let sink = crate::chat2_host::EngineChatSink::new_with_lifecycle(
             &handle.doc,
@@ -6801,19 +6799,19 @@ mod agent_send_tests {
     async fn checkpoint_request_survives_a_temporarily_empty_client_slot() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("checkpoint-retry", None, Some("dev-a"), None, None)
             .unwrap();
         let edge_server = ChatMigrationEdge::start().await;
@@ -6826,7 +6824,7 @@ mod agent_send_tests {
                 edge: Some(EdgeConfig::with_static_token(&edge_server.url, "token")),
             },
         );
-        host.set_workspace(workspace);
+        host.set_registry(registry);
         let handle = host.open("checkpoint-retry").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while lock(&handle.chat2).is_none() {
@@ -6855,27 +6853,27 @@ mod agent_send_tests {
     #[tokio::test]
     async fn registry_row_removal_purges_warm_handle_pending_and_snapshot() {
         let (_dir, host) = host();
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             host.inner.store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("remote-delete", None, Some("dev-a"), None, None)
             .unwrap();
-        host.set_workspace(workspace.clone());
+        host.set_registry(registry.clone());
         let handle = host.open("remote-delete").unwrap();
         host.save_snapshot(&handle);
         DocHost::buffer_chat2_update(&host.inner, "remote-delete", vec![1, 2, 3]);
 
-        workspace.delete_chat("remote-delete").unwrap();
+        registry.delete_chat("remote-delete").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 if DocHost::chat_was_purged(&host.inner, "remote-delete")
@@ -6904,22 +6902,22 @@ mod agent_send_tests {
     async fn gen1_seed_does_not_reopen_after_row_is_deleted_mid_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("deleted-seed", None, Some("dev-a"), None, None)
             .unwrap();
-        workspace.set_chat_room_gen("deleted-seed", 1).unwrap();
+        registry.set_chat_room_gen("deleted-seed", 1).unwrap();
         let edge_server = ChatMigrationEdge::start_gated().await;
         let edge = EdgeConfig::with_static_token(&edge_server.url, "token");
         let host = DocHost::new(
@@ -6931,7 +6929,7 @@ mod agent_send_tests {
                 edge: Some(edge.clone()),
             },
         );
-        host.set_workspace(workspace.clone());
+        host.set_registry(registry.clone());
         let handle = host.open("deleted-seed").unwrap();
         let seed_host = host.clone();
         let seed_handle = handle.clone();
@@ -6941,7 +6939,7 @@ mod agent_send_tests {
                 .await
         });
         edge_server.wait_for_first_checkpoint().await;
-        workspace.delete_chat("deleted-seed").unwrap();
+        registry.delete_chat("deleted-seed").unwrap();
         edge_server.release_first_checkpoint();
 
         let err = seed
@@ -6965,22 +6963,22 @@ mod agent_send_tests {
     #[tokio::test]
     async fn live_writer_cutover_retries_automatically_after_quiesce() {
         let (_dir, host) = host();
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             host.inner.store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("live-cutover", None, Some("dev-a"), None, None)
             .unwrap();
-        host.set_workspace(workspace.clone());
+        host.set_registry(registry.clone());
 
         let old = host.open("live-cutover").unwrap();
         assert_eq!(old.room_gen, 2);
@@ -6991,7 +6989,7 @@ mod agent_send_tests {
             .insert("last-live-write", "must survive")
             .unwrap();
         live_writer.doc().commit();
-        assert!(workspace.set_chat_room_gen("live-cutover", 3).unwrap());
+        assert!(registry.set_chat_room_gen("live-cutover", 3).unwrap());
 
         tokio::time::sleep(std::time::Duration::from_millis(350)).await;
         assert!(
@@ -7030,19 +7028,19 @@ mod agent_send_tests {
     async fn cold_chat2_migration_seeds_chat3_before_registry_flip() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("cold-migration", None, Some("dev-a"), None, None)
             .unwrap();
 
@@ -7077,14 +7075,14 @@ mod agent_send_tests {
                 edge: Some(edge.clone()),
             },
         );
-        host.set_workspace(workspace.clone());
+        host.set_registry(registry.clone());
         let old = host.open("cold-migration").unwrap();
         assert_eq!(old.room_gen, 2);
         host.spawn_room_seed_when_quiet(edge, "cold-migration", &old);
 
         tokio::time::timeout(std::time::Duration::from_secs(8), async {
             loop {
-                if workspace
+                if registry
                     .chat("cold-migration")
                     .unwrap()
                     .is_some_and(|chat| chat.room_gen == Some(3))
@@ -7129,19 +7127,19 @@ mod agent_send_tests {
     async fn cold_chat2_migration_reseals_tail_and_carries_pending_push() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("reseal-migration", None, Some("dev-a"), None, None)
             .unwrap();
 
@@ -7167,7 +7165,7 @@ mod agent_send_tests {
                 edge: Some(edge.clone()),
             },
         );
-        host.set_workspace(workspace.clone());
+        host.set_registry(registry.clone());
         let old = host.open("reseal-migration").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !DocHost::source_room_converged(&old) {
@@ -7301,22 +7299,22 @@ mod agent_send_tests {
     async fn gen1_seed_rejects_a_replacement_handle_before_local_cutover() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("gen1-exact", None, Some("dev-a"), None, None)
             .unwrap();
-        assert!(workspace.set_chat_room_gen("gen1-exact", 1).unwrap());
+        assert!(registry.set_chat_room_gen("gen1-exact", 1).unwrap());
         let source = SessionDoc::init("gen1-exact").unwrap();
         source
             .doc()
@@ -7339,7 +7337,7 @@ mod agent_send_tests {
                 edge: Some(edge.clone()),
             },
         );
-        host.set_workspace(workspace.clone());
+        host.set_registry(registry.clone());
         let original = host.open("gen1-exact").unwrap();
         assert_eq!(original.room_gen, 1);
 
@@ -7374,7 +7372,7 @@ mod agent_send_tests {
             .expect_err("a different current handle must abort the seed");
         assert!(err.contains("source handle changed"), "{err}");
         assert_eq!(
-            workspace.chat("gen1-exact").unwrap().unwrap().room_gen,
+            registry.chat("gen1-exact").unwrap().unwrap().room_gen,
             Some(1)
         );
         let (_, _, epoch) = store
@@ -7389,19 +7387,19 @@ mod agent_send_tests {
     async fn restart_after_foreign_chat2_park_requeues_full_doc_into_chat3() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("restart-carry", None, Some("dev-b"), None, None)
             .unwrap();
 
@@ -7417,7 +7415,7 @@ mod agent_send_tests {
                 edge: None,
             },
         );
-        first_host.set_workspace(workspace.clone());
+        first_host.set_registry(registry.clone());
         let first = first_host.open("restart-carry").unwrap();
         assert_eq!(first.room_gen, 2);
         first
@@ -7436,8 +7434,8 @@ mod agent_send_tests {
         drop(first_host);
 
         // While this device is down, the registry moves the chat to the new
-        // org-shared room. Process two has no in-memory carry-over map.
-        assert!(workspace.set_chat_room_gen("restart-carry", 3).unwrap());
+        // organization-shared room. Process two has no in-memory carry-over map.
+        assert!(registry.set_chat_room_gen("restart-carry", 3).unwrap());
         let second_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -7447,7 +7445,7 @@ mod agent_send_tests {
                 edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:9", "token")),
             },
         );
-        second_host.set_workspace(workspace);
+        second_host.set_registry(registry);
         let replacement = second_host.open("restart-carry").unwrap();
         assert_eq!(replacement.room_gen, 3);
 
@@ -7494,23 +7492,23 @@ mod agent_send_tests {
         store
             .save_snapshot_with_cursor("epoch-ahead", &doc.export_snapshot().unwrap(), 23, 3)
             .unwrap();
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store.clone(),
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: "dev-a".into(),
                 device_name: "Device A".into(),
                 platform: "test".into(),
-                org_id: "org-a".into(),
+                organization_id: "org-a".into(),
                 user_id: "alice".into(),
                 edge: None,
             },
         )
         .unwrap();
-        workspace
+        registry
             .create_chat("epoch-ahead", None, Some("dev-b"), None, None)
             .unwrap();
         assert_eq!(
-            workspace.chat("epoch-ahead").unwrap().unwrap().room_gen,
+            registry.chat("epoch-ahead").unwrap().unwrap().room_gen,
             Some(2)
         );
         let host = DocHost::new(
@@ -7522,13 +7520,13 @@ mod agent_send_tests {
                 edge: None,
             },
         );
-        host.set_workspace(workspace.clone());
+        host.set_registry(registry.clone());
 
         let handle = host.open("epoch-ahead").unwrap();
 
         assert_eq!(handle.room_gen, 3);
         assert_eq!(
-            workspace.chat("epoch-ahead").unwrap().unwrap().room_gen,
+            registry.chat("epoch-ahead").unwrap().unwrap().room_gen,
             Some(3)
         );
         host.shutdown_workers().await;

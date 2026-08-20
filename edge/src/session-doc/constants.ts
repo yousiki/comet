@@ -20,7 +20,7 @@ export const MSG_INLINE_MAX = 256 * 1024;
  * 30 days proved fatal in practice (2026-08-04): the ws3-era rooms were ~12
  * days old, so no frontier checkpoint was ever past retention and HISTORY
  * TRIM had never run ANYWHERE — every doc carried full op history from birth.
- * A high-churn workspace room (6 devices flipping session rows all day) plus
+ * A high-churn legacy workspace room (6 devices flipping session rows all day) plus
  * a dozen chat docs co-materialized in one isolate's loro-wasm heap (which
  * only ever grows) hit the DO memory limit, poisoning every byte-exporting
  * wasm call and silently wedging joins fleet-wide. Presence/status rows do
@@ -33,7 +33,7 @@ export const RETAIN_DAYS = 3;
  * Cold-start cost (`ensureDoc` after a hibernation or a CPU-limit reset)
  * replays the snapshot plus every logged update, so this cap is really a
  * cold-start budget. 8 MiB was too generous for a high-churn room like the
- * per-user workspace doc (3 devices writing device/session rows continuously):
+ * per-user legacy workspace document (3 devices writing device/session rows continuously):
  * the log grew large enough that a cold replay exceeded the DO's per-invocation
  * CPU limit, the runtime reset the DO, every client reconnected into another
  * cold start, and the memory-only presence store was wiped each time — so
@@ -42,11 +42,11 @@ export const COMPACT_LOG_BYTES = 2 * 1024 * 1024;
 
 /** Update-log ROW count that also triggers a compaction pass. Cold-start cost
  * scales with the NUMBER of `doc.import()` calls (one WASM boundary crossing
- * each), not just their total bytes — a workspace room accumulates thousands
+ * each), not just their total bytes — a legacy workspace room accumulates thousands
  * of tiny row/presence-adjacent updates well under {@link COMPACT_LOG_BYTES}.
  * Fold on row count too so many-small-updates can't blow the cold-start
  * budget the byte cap alone would miss. 1500 proved too generous: a per-user
- * workspace room wedged its cold replay at ~1400 rows (Jul 2026), under the
+ * legacy workspace room wedged its cold replay at ~1400 rows (Jul 2026), under the
  * trigger — folding is cheap while the doc is hot (one snapshot export), so
  * fold early and keep cold replays trivially affordable. */
 export const COMPACT_LOG_ROWS = 400;

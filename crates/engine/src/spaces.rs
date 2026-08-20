@@ -2,7 +2,7 @@
 //! orphan-chat repair sweep.
 //!
 //! A space is a synced (device, folder) pair; the folder need NOT be a git
-//! repo. This service watches the workspace `spaces` rows owned by THIS device
+//! repo. This service watches the registry `spaces` rows owned by THIS device
 //! and keeps their `gitDetected`/`checkoutId` stamps truthful:
 //!
 //! - recheck on boot / when a space row is first observed;
@@ -29,8 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 use zeron_proto::Space;
 
+use crate::registry_host::RegistryHost;
 use crate::repos::Repos;
-use crate::workspace_host::WorkspaceHost;
 
 /// Trailing debounce after a filesystem event burst.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -46,7 +46,7 @@ struct SpaceEntry {
 
 struct SpacesSyncInner {
     repos: Repos,
-    workspace: WorkspaceHost,
+    registry: RegistryHost,
     device_id: String,
     entries: Mutex<HashMap<String, Arc<SpaceEntry>>>,
     /// Ends the supervisor loop eagerly on shutdown (weak refs alone only end
@@ -65,13 +65,13 @@ pub struct SpacesSync {
 }
 
 impl SpacesSync {
-    /// Build and start the sync loop: follows the workspace spaces watch and
+    /// Build and start the sync loop: follows the registry spaces watch and
     /// runs the repair tick. Requires a tokio runtime.
-    pub fn start(repos: Repos, workspace: WorkspaceHost, device_id: &str) -> Self {
+    pub fn start(repos: Repos, registry: RegistryHost, device_id: &str) -> Self {
         let sync = Self {
             inner: Arc::new(SpacesSyncInner {
                 repos,
-                workspace: workspace.clone(),
+                registry: registry.clone(),
                 device_id: device_id.to_string(),
                 entries: Mutex::new(HashMap::new()),
                 cancel: CancellationToken::new(),
@@ -80,7 +80,7 @@ impl SpacesSync {
         };
         let task = tokio::spawn(spaces_task(
             Arc::downgrade(&sync.inner),
-            workspace.watch_spaces(),
+            registry.watch_spaces(),
             sync.inner.cancel.clone(),
         ));
         *lock(&sync.inner.supervisor) = Some(task);
@@ -99,7 +99,7 @@ impl SpacesSync {
 
     /// Reconcile + recheck now (tests / opportunistic callers).
     pub async fn reconcile_now(&self) {
-        let spaces = self.inner.workspace.watch_spaces().borrow().clone();
+        let spaces = self.inner.registry.watch_spaces().borrow().clone();
         reconcile(&self.inner, &spaces);
         for entry in lock(&self.inner.entries).values() {
             let _ = entry.kick_tx.send(());
@@ -208,7 +208,7 @@ async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) 
     } else {
         None
     };
-    let current = match inner.workspace.read_spaces() {
+    let current = match inner.registry.read_spaces() {
         Ok(spaces) => spaces.into_iter().find(|s| s.id == space_id),
         Err(err) => {
             tracing::warn!(space = %space_id, error = %err, "spaces: row read failed");
@@ -222,7 +222,7 @@ async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) 
         return; // unchanged — no oplog growth
     }
     match inner
-        .workspace
+        .registry
         .set_space_git(space_id, detected, checkout_id.as_deref())
     {
         Ok(_) => {
@@ -237,9 +237,9 @@ async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) 
 /// Host-side repair: delete OUR chats whose `spaceId` dangles (create-vs-delete
 /// race). Chats hosted by other devices are left alone.
 fn sweep_orphans(inner: &Arc<SpacesSyncInner>) {
-    let spaces = inner.workspace.watch_spaces().borrow().clone();
+    let spaces = inner.registry.watch_spaces().borrow().clone();
     let live: std::collections::HashSet<&str> = spaces.iter().map(|s| s.id.as_str()).collect();
-    let chats = inner.workspace.watch_chats().borrow().clone();
+    let chats = inner.registry.watch_chats().borrow().clone();
     for chat in chats {
         if chat.device_id != inner.device_id {
             continue;
@@ -251,7 +251,7 @@ fn sweep_orphans(inner: &Arc<SpacesSyncInner>) {
             continue;
         }
         tracing::info!(chat = %chat.id, space = %space_id, "deleting orphaned chat (space gone)");
-        if let Err(err) = inner.workspace.delete_chat(&chat.id) {
+        if let Err(err) = inner.registry.delete_chat(&chat.id) {
             tracing::warn!(chat = %chat.id, error = %err, "spaces: orphan delete failed");
         }
     }

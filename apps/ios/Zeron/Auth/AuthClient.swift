@@ -1,9 +1,9 @@
-// Edge auth client — /auth/exchange, /auth/refresh, /auth/orgs
+// Edge auth client — /auth/exchange, /auth/refresh, /auth/organizations
 // (edge/src/auth-routes.ts). Two modes, mirroring the engine:
 // - WorkOS: paste-code exchange → access/refresh tokens; refresh scoped to an
-//   org adds the org_id claim the workspace room requires.
-// - Dev (AUTH_MODE=dev edge): the bearer string IS the user id; "user@org"
-//   supplies a fake org claim.
+//   Organization adds the WorkOS `org_id` wire claim required by legacy rooms.
+// - Dev (AUTH_MODE=dev edge): the bearer string IS the user id; the legacy
+//   `user@organization` test-token shape supplies a fake Organization claim.
 
 import Foundation
 
@@ -14,7 +14,7 @@ struct AuthUser: Codable, Equatable {
     var lastName: String?
 }
 
-struct AuthOrg: Codable, Identifiable, Equatable {
+struct AuthOrganization: Codable, Identifiable, Equatable {
     var id: String
     var organizationId: String
     var name: String
@@ -56,13 +56,13 @@ struct AuthClient {
         return try await post("auth/refresh", body: body)
     }
 
-    func orgs(accessToken: String) async throws -> [AuthOrg] {
-        struct Response: Codable { var orgs: [AuthOrg] }
-        var request = URLRequest(url: baseURL.appending(path: "auth/orgs"))
+    func organizations(accessToken: String) async throws -> [AuthOrganization] {
+        struct Response: Codable { var organizations: [AuthOrganization] }
+        var request = URLRequest(url: baseURL.appending(path: "auth/organizations"))
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await URLSession.shared.data(for: request)
         try Self.check(data: data, response: response)
-        return try JSONDecoder().decode(Response.self, from: data).orgs
+        return try JSONDecoder().decode(Response.self, from: data).organizations
     }
 
     private func post<T: Decodable>(_ path: String, body: [String: String]) async throws -> T {

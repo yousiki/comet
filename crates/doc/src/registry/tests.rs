@@ -1,6 +1,6 @@
 //! RegistryDoc unit tests. The merge cases mirror
 //! `edge/src/registry-core.test.ts` — shared vectors; change both together.
-//! The typed-API cases mirror `workspace.rs`'s tests so the drop-in claim is
+//! The typed-API cases mirror `legacy_workspace.rs`'s tests so the migration claim is
 //! tested, not asserted.
 
 use super::*;
@@ -842,7 +842,7 @@ fn reconnect_replay_is_idempotent() {
 #[test]
 fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
     // Build a legacy loro workspace doc, materialize, seed.
-    let legacy = crate::workspace::WorkspaceDoc::new();
+    let legacy = crate::legacy_workspace::LegacyWorkspaceDoc::new();
     legacy.upsert_device(&device("dev-a", "laptop")).unwrap();
     legacy
         .upsert_space(&space("sp-1", "dev-a", "/tmp/one"))
@@ -858,7 +858,7 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
 
     let mut doc = RegistryDoc::new("dev-a");
     let seeded = doc
-        .seed_from_workspace(&legacy.read_all().unwrap())
+        .seed_from_legacy_workspace(&legacy.read_all().unwrap())
         .unwrap();
     assert_eq!(seeded, 4);
     // Instant: the overlay serves the full state before any server contact.
@@ -868,7 +868,7 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
     // Two devices seeding the same converged doc = identical result.
     let mut other = RegistryDoc::new("dev-b");
     other
-        .seed_from_workspace(&legacy.read_all().unwrap())
+        .seed_from_legacy_workspace(&legacy.read_all().unwrap())
         .unwrap();
     let mut server = HashMap::new();
     let mut seq = 0u64;

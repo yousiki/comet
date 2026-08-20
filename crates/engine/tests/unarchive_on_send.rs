@@ -1,5 +1,5 @@
 //! Sending a message to an archived chat revives it: `queue_command` flips the
-//! workspace row's `archived` flag back off for message-bearing commands (Run,
+//! registry row's `archived` flag back off for message-bearing commands (Run,
 //! Steer) — and only those; an Interrupt leaves the archive state alone.
 
 use std::sync::Arc;
@@ -118,7 +118,7 @@ fn run_payload(message_id: &str) -> SessionCommandPayload {
 }
 
 fn archived(core: &EngineCore) -> bool {
-    core.workspace
+    core.registry
         .chat(CHAT)
         .expect("read chat row")
         .expect("chat row exists")
@@ -151,11 +151,11 @@ async fn sending_a_message_unarchives_the_chat() {
         .await
         .expect("createChat");
     // Pre-title so the auto-titler's harness request stays out of the flow.
-    core.workspace
+    core.registry
         .rename_chat(CHAT, "Pre-titled")
         .expect("rename chat");
 
-    core.workspace
+    core.registry
         .set_chat_archived(CHAT, true)
         .expect("archive chat");
     assert!(archived(&core), "precondition: chat is archived");
@@ -171,7 +171,7 @@ async fn sending_a_message_unarchives_the_chat() {
     wait_for(|| complete_assistant_count(&core) == 1, "turn to complete").await;
 
     // A non-message command must NOT revive it.
-    core.workspace
+    core.registry
         .set_chat_archived(CHAT, true)
         .expect("re-archive chat");
     core.doc_host

@@ -1,5 +1,5 @@
 //! Auth service tests: dev mode, and the WorkOS flows (headless paste-code exchange,
-//! loopback callback, refresh rotation + revocation, org onboarding) against a stub
+//! loopback callback, refresh rotation + revocation, Organization onboarding) against a stub
 //! edge HTTP server on a plain tokio TcpListener.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -38,11 +38,11 @@ fn base64url(bytes: &[u8]) -> String {
     out
 }
 
-/// An unsigned JWT with the claims the engine reads (`exp`/`iat` for TTL, `org_id`).
-fn fake_jwt(ttl_secs: i64, org_id: Option<&str>) -> String {
+/// An unsigned JWT with the claims the engine reads (`exp`/`iat` for TTL, WorkOS `org_id`).
+fn fake_jwt(ttl_secs: i64, organization_id: Option<&str>) -> String {
     let mut claims = serde_json::json!({ "sub": "user_1", "iat": 1_000, "exp": 1_000 + ttl_secs });
-    if let Some(org) = org_id {
-        claims["org_id"] = serde_json::json!(org);
+    if let Some(organization_id) = organization_id {
+        claims["org_id"] = serde_json::json!(organization_id);
     }
     format!("e30.{}.sig", base64url(claims.to_string().as_bytes()))
 }
@@ -63,8 +63,8 @@ struct StubState {
     refresh_tokens: Mutex<Vec<String>>,
     /// TTL (seconds) for minted access tokens.
     token_ttl: AtomicUsize,
-    /// org_id claim for exchange-minted tokens ("" = none).
-    exchange_org: Mutex<String>,
+    /// organization_id claim for exchange-minted tokens ("" = none).
+    exchange_organization: Mutex<String>,
 }
 
 struct StubEdge {
@@ -175,8 +175,11 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
                 state.exchange_started.notify_one();
                 state.release_exchange.notified().await;
             }
-            let org = state.exchange_org.lock().expect("lock").clone();
-            let token = fake_jwt(ttl, (!org.is_empty()).then_some(org.as_str()));
+            let organization_id = state.exchange_organization.lock().expect("lock").clone();
+            let token = fake_jwt(
+                ttl,
+                (!organization_id.is_empty()).then_some(organization_id.as_str()),
+            );
             let response = serde_json::json!({
                 "user": { "id": "user_1", "email": "w@example.com",
                           "firstName": "Wing", "lastName": "Test" },
@@ -205,22 +208,22 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
                 return;
             }
             let n = state.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
-            let org = parsed.get("organizationId").and_then(|v| v.as_str());
+            let organization_id = parsed.get("organizationId").and_then(|v| v.as_str());
             let response = serde_json::json!({
-                "accessToken": fake_jwt(ttl, org),
+                "accessToken": fake_jwt(ttl, organization_id),
                 "refreshToken": format!("rotated-{n}"),
             });
             respond(&mut stream, "200 OK", &response.to_string()).await;
         }
-        ("GET", "/auth/orgs") => {
+        ("GET", "/auth/organizations") => {
             respond(
                 &mut stream,
                 "200 OK",
-                r#"{"orgs":[{"id":"om_1","organizationId":"org_1","name":"Acme"}]}"#,
+                r#"{"organizations":[{"id":"om_1","organizationId":"org_1","name":"Acme"}]}"#,
             )
             .await;
         }
-        ("POST", "/auth/orgs") => {
+        ("POST", "/auth/organizations") => {
             respond(&mut stream, "200 OK", r#"{"organizationId":"org_new"}"#).await;
         }
         _ => respond(&mut stream, "404 Not Found", r#"{"error":"not_found"}"#).await,
@@ -285,7 +288,7 @@ async fn dev_mode_is_signed_in_with_configured_bearer() {
 }
 
 #[tokio::test]
-async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
+async fn headless_flow_exchanges_pasted_code_and_gates_on_organization() {
     let edge = StubEdge::start().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
@@ -310,8 +313,8 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     // A code minted for someone else's flow (unknown state) is rejected — CSRF check.
     assert!(auth.complete_sign_in("bogus-state.code123").await.is_err());
 
-    // The real paste: `state.code`. The exchange-minted token carries no org claim, so
-    // the session lands in NeedsOrganization (the org gate).
+    // The real paste: `state.code`. The exchange-minted token carries no organization claim, so
+    // the session lands in NeedsOrganization (the organization gate).
     auth.complete_sign_in(&format!("{state}.code123"))
         .await
         .expect("paste-code sign-in");
@@ -338,19 +341,21 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
         assert_eq!(mode & 0o777, 0o600, "session file must be private");
     }
 
-    // Org onboarding: list, then select — an org-scoped refresh; state follows the
-    // returned token's org claim.
-    let orgs = auth.list_orgs().await.expect("list orgs");
-    assert_eq!(orgs.len(), 1);
-    assert_eq!(orgs[0].organization_id, "org_1");
+    // Organization onboarding: list, then select — an Organization-scoped refresh; state follows the
+    // returned token's organization claim.
+    let organizations = auth.list_organizations().await.expect("list organizations");
+    assert_eq!(organizations.len(), 1);
+    assert_eq!(organizations[0].organization_id, "org_1");
     let mut token_changes = auth.subscribe().expect("auth token signal");
-    auth.select_org("org_1").await.expect("select org");
+    auth.select_organization("org_1")
+        .await
+        .expect("select organization");
     token_changes
         .changed()
         .await
-        .expect("org-scoped token should wake transport supervisors");
+        .expect("organization-scoped token should wake transport supervisors");
     assert!(
-        matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "org_1")
+        matches!(auth.state(), AuthState::SignedIn { organization_id: Some(organization_id), .. } if organization_id == "org_1")
     );
     assert!(auth.token().await.is_some());
     assert_eq!(
@@ -361,7 +366,7 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
             .first()
             .map(String::as_str),
         Some("refresh-1"),
-        "org refresh presents the stored refresh token"
+        "Organization refresh presents the stored refresh token"
     );
     // Rotation persisted.
     let raw = std::fs::read_to_string(&session_file).expect("session persisted");
@@ -381,7 +386,7 @@ async fn short_lived_tokens_refresh_on_demand() {
     let edge = StubEdge::start().await;
     // Tokens live 20s < the 30s slack → every access_token() call refreshes.
     edge.state.token_ttl.store(20, Ordering::SeqCst);
-    *edge.state.exchange_org.lock().expect("lock") = "org_1".into();
+    *edge.state.exchange_organization.lock().expect("lock") = "org_1".into();
     let dir = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
 
@@ -471,7 +476,7 @@ async fn offline_refresh_loop_backs_off_without_revoking_session() {
 #[tokio::test]
 async fn loopback_callback_completes_headed_sign_in() {
     let edge = StubEdge::start().await;
-    *edge.state.exchange_org.lock().expect("lock") = "org_1".into();
+    *edge.state.exchange_organization.lock().expect("lock") = "org_1".into();
     let dir = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
 
@@ -492,7 +497,7 @@ async fn loopback_callback_completes_headed_sign_in() {
     assert_eq!(edge.state.exchanges.load(Ordering::SeqCst), 0);
 
     // The browser hits the loopback callback → the engine exchanges the code with the
-    // edge and the session lands org-scoped.
+    // edge and the session lands organization-scoped.
     let ok = reqwest::get(format!("{callback}?code=abc&state={state}"))
         .await
         .expect("cb");
@@ -501,14 +506,14 @@ async fn loopback_callback_completes_headed_sign_in() {
     wait_for(&mut state_rx, |s| s.is_signed_in()).await;
     assert_eq!(edge.state.exchanges.load(Ordering::SeqCst), 1);
     assert!(
-        matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), user } if org == "org_1" && user.name.as_deref() == Some("Wing Test"))
+        matches!(auth.state(), AuthState::SignedIn { organization_id: Some(organization_id), user } if organization_id == "org_1" && user.name.as_deref() == Some("Wing Test"))
     );
 }
 
 #[tokio::test]
 async fn sign_out_invalidates_pending_and_in_flight_oauth_callbacks() {
     let edge = StubEdge::start().await;
-    *edge.state.exchange_org.lock().expect("lock") = "org_1".into();
+    *edge.state.exchange_organization.lock().expect("lock") = "org_1".into();
     let dir = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
 

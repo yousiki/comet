@@ -1,4 +1,4 @@
-//! RegistryClient — WebSocket transport for the workspace registry
+//! RegistryClient — WebSocket transport for the profile registry
 //! (docs/registry-sync.md): hello/cursor handshake, push/ack for pending op
 //! batches, merged-row broadcasts, presence beats, probe/redial liveness, and
 //! reconnect with exponential backoff.
@@ -42,7 +42,7 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(15);
 /// deadline, or the session is torn down for a fresh socket.
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 /// Presence entries older than this are treated as expired (mirrors the
-/// EphemeralStore's 30s TTL the old workspace room used).
+/// EphemeralStore's 30s TTL the legacy workspace room used).
 const PRESENCE_TTL: Duration = Duration::from_secs(30);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 /// Worst-case dark window after the network returns (event wakes usually
@@ -56,7 +56,7 @@ const STABLE_RESET: Duration = Duration::from_secs(30);
 /// wrong path monitor degrades to slow polling, never to silence.
 const OFFLINE_PARK_RECHECK: Duration = Duration::from_secs(30);
 
-/// Quiet-room probe cadence default. The workspace registry is one room per
+/// Quiet-room probe cadence default. The profile registry is one room per
 /// engine, so a fixed 15min cadence costs ~100 DO wakes/day total.
 const PROBE_QUIET_DEFAULT: Duration = Duration::from_secs(900);
 
@@ -161,8 +161,8 @@ pub(crate) trait TextConnector: Send + Sync + 'static {
 }
 
 /// Plain-HTTPS pull/push seam — the airplane-wifi transport. `fetch` GETs
-/// `/registry/{org}/rows?since=` (the WS hello's exact delta answer as JSON);
-/// `push` POSTs one op batch to `/registry/{org}/push` and returns the ack
+/// `/registry/{organizationId}/rows?since=` (the WS hello's exact delta answer as JSON);
+/// `push` POSTs one op batch to `/registry/{organizationId}/push` and returns the ack
 /// body. Both are safe at-least-once: LWW clocks make replays apply zero ops.
 pub trait RegistryTransport: Send + Sync + 'static {
     fn fetch(&self, since: u64) -> BoxFuture<'static, Result<String, SyncError>>;

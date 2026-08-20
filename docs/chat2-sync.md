@@ -1,7 +1,7 @@
 # chat2: dumb-relay session sync + thin docs
 
 Status: PLANNED · Author: 2026-08-09 investigation (whale-doc dissection + t3code comparison)
-Prior art: `docs/registry-sync.md` (the same argument, applied to the workspace index).
+Prior art: `docs/registry-sync.md` (the same argument, applied to the profile registry).
 
 ## Why
 

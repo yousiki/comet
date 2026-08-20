@@ -86,7 +86,7 @@ verified 2026-08-03).
 5. **Incremental reads** — `read_entries`/`read_commands` do whole-doc
    `get_deep_value().to_json_value()` per tick (`schema.rs:209,233`); move to
    `doc.subscribe` diff application (the mirror layer's stated design,
-   ARCHITECTURE.md §2.3). Same for `workspace.rs:291` `chat()` linear
+   ARCHITECTURE.md §2.3). Same for the legacy `legacy_workspace.rs:291` `chat()` linear
    whole-container scan on every 120ms `is_host` check.
 
 Expected after phases 1–2: streaming multiplication ~11.6× → ~2–3× raw text;
@@ -119,7 +119,7 @@ work). Shipped: mimalloc in both binaries; attachment-image LRU (64MB encoded
 budget) with gpui asset release on eviction + staged-attachment purge on chat
 delete; doc eviction on DeleteChat/DeleteSpace; doc LRU (12 warm docs / 80MB
 estimate, pinned: watched, live-writer, host-pending-commands) with lazy
-mirror; in-place event fold; container-scoped doc reads + single-row workspace
+mirror; in-place event fold; container-scoped doc reads + single-row registry
 `chat()`; delta `WatchDocMessages` protocol (reset + per-entry upserts + text-append
 ops, desync → resubscribe) across engine/UI — measured on a 1.6MB
 streamed reply: 257MB of watch frames before, 2.3MB after (110×; median

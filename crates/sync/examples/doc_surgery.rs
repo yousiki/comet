@@ -1,4 +1,4 @@
-//! One-off recovery tool (untracked): inspect and repair chat/workspace docs
+//! One-off recovery tool (untracked): inspect and repair chat/legacy-workspace docs.
 //! in a docs.sqlite3 store. Modes:
 //!   dump-workspace    <data_dir>
 //!   inspect-workspace <data_dir> <chat_id>
@@ -119,7 +119,7 @@ fn main() {
             doc.commit();
             let bytes = doc
                 .export(loro::ExportMode::Snapshot)
-                .expect("export workspace");
+                .expect("export legacy workspace");
             store.save_snapshot("workspace2", &bytes).expect("save");
             println!(
                 "workspace2 preview updated for {chat_id} ({} bytes)",

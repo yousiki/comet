@@ -166,7 +166,8 @@ final class SessionStore {
         let gen = gen ?? 1
         if gen > roomGen {
             roomGen = gen
-            // Room generation moved (e.g. chat2 → org-shared chat3): the old
+            // Room generation moved (e.g. `chat2` → Organization-shared legacy
+            // `chat3` namespace): the old
             // room goes permanently silent from the flip on — drop the client
             // so the redial below lands on the new room. The doc lineage is
             // unchanged (2→3 moves the room, not the doc), so the cursor

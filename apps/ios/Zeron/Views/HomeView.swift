@@ -1,5 +1,5 @@
 // Home — the mobile shell. The desktop sidebar collapses into one screen: a
-// space dropdown in the nav bar (default "All") scopes the attention-sorted
+// project dropdown in the nav bar (default "All") scopes the attention-sorted
 // session list below it. Tabs-as-sessions don't fit a phone; close=archive
 // becomes swipe-to-archive.
 
@@ -15,7 +15,7 @@ struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var path: [Route] = []
     @State private var showNewSpace = false
-    // "" = All. Sticky across launches; falls back to All if the space is gone.
+    // "" = All. Sticky across launches; falls back to All if the project is gone.
     @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
 
     private var selectedSpace: Space? {
@@ -27,7 +27,7 @@ struct HomeView: View {
             List {
                 sessionsSection
                 // The desktop's archived shelf sits under the active list,
-                // scoped by the same space filter.
+                // scoped by the same project filter.
                 ArchivedSection(spaceId: selectedSpace?.id, path: $path)
             }
             .listStyle(.plain)
@@ -114,11 +114,11 @@ struct HomeView: View {
         }
     }
 
-    // MARK: Space dropdown
+    // MARK: Project dropdown
 
     /// The nav-bar dropdown that scopes the session list — a NATIVE glass
     /// menu. Rows are Buttons, not a Picker: Picker menu rows drop two-Text
-    /// subtitles, while Button rows map to UIAction subtitles, so each space
+    /// subtitles, while Button rows map to UIAction subtitles, so each project
     /// shows its owning device ("@ mac") on the small second line without the
     /// three-line title wraps. Selection carries a checkmark in the icon slot.
     private var spaceDropdown: some View {
@@ -132,7 +132,7 @@ struct HomeView: View {
             Button {
                 showNewSpace = true
             } label: {
-                Label("New space…", systemImage: "folder.badge.plus")
+                Label("New project…", systemImage: "folder.badge.plus")
             }
         } label: {
             HStack(spacing: 5) {
@@ -144,7 +144,7 @@ struct HomeView: View {
                     .font(.system(size: 9, weight: .bold))
                     .foregroundStyle(Theme.textFaint)
             }
-            // Keep long space names from swallowing the whole bar; the owning
+            // Keep long project names from swallowing the whole bar; the owning
             // device lives on the menu rows ("@ mac"), not up here.
             .frame(maxWidth: 220, alignment: .leading)
             // Its own glass capsule (the item's shared glass is hidden so the
@@ -153,7 +153,7 @@ struct HomeView: View {
             .frame(height: 44)
             .glassEffect(.regular.interactive(), in: Capsule())
         }
-        .accessibilityLabel("Filter by space")
+        .accessibilityLabel("Filter by project")
     }
 
     private func deviceTag(_ space: Space) -> String {
@@ -180,8 +180,8 @@ struct HomeView: View {
         }
     }
 
-    /// "+" starts a session in the scoped space; under All it asks which
-    /// space first. With no spaces yet it falls through to space creation.
+    /// "+" starts a session in the scoped project; under All it asks which
+    /// project first. With no projects yet it falls through to project creation.
     @ViewBuilder private var newButton: some View {
         if let space = selectedSpace {
             Button {
@@ -196,7 +196,7 @@ struct HomeView: View {
             } label: {
                 Image(systemName: "plus")
             }
-            .accessibilityLabel("New space")
+            .accessibilityLabel("New project")
         } else {
             Menu {
                 Section("New session in…") {
@@ -205,7 +205,7 @@ struct HomeView: View {
                             path.append(.newSession(spaceId: space.id))
                         } label: {
                             // Button rows render the second Text as the
-                            // subtitle line (same pattern as the space menu).
+                            // subtitle line (same pattern as the project menu).
                             Text(space.displayName)
                             Text(deviceTag(space))
                         }
@@ -225,7 +225,7 @@ struct HomeView: View {
             let chats = selectedSpace.map { model.chats(in: $0.id) } ?? model.overviewChats
             if chats.isEmpty {
                 Text(model.spaces.isEmpty
-                    ? "No spaces yet — add one from a desktop device"
+                    ? "No projects yet — add one from a desktop device"
                     : "No sessions yet")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
@@ -268,10 +268,10 @@ struct HomeView: View {
 /// instead); the title on its own line; harness mark and branch close it out,
 /// with the mini spinner riding the row's bottom-right while Working.
 ///
-/// The one addition the phone needs: the desktop row names only the space
+/// The one addition the phone needs: the desktop row names only the project
 /// because its sidebar sits on the machine running the work. Here the Sessions
 /// list interleaves every device, and a session whose host has gone offline
-/// can't be driven at all — so the context line reads "space @ device".
+/// can't be driven at all — so the context line reads "project @ device".
 struct ChatRow: View {
     @Environment(AppModel.self) private var model
     let chat: Chat
@@ -299,7 +299,7 @@ struct ChatRow: View {
 
     private func content(indicator: ChatIndicator, reservesPullRequest: Bool) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            // Line 1: space @ device, status corner (time-ago when idle).
+            // Line 1: project @ device, status corner (time-ago when idle).
             HStack(spacing: 8) {
                 if showLocation {
                     Text(location)
@@ -354,9 +354,9 @@ struct ChatRow: View {
         .contentShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    /// "space @ device" (the session header's format). The space name (not
+    /// "project @ device" (the session header's format). The project name (not
     /// the cwd basename) is what the desktop row shows — they differ once a
-    /// space has been renamed, or when the session runs in a worktree off to
+    /// project has been renamed, or when the session runs in a worktree off to
     /// the side. No offline marker: the dropdown carries device liveness.
     private var location: String {
         let space = model.space(for: chat)?.displayName

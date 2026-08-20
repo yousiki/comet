@@ -7,25 +7,25 @@
 
 use std::sync::Arc;
 
-use zeron_engine::{WorkspaceHost, WorkspaceHostConfig};
+use zeron_engine::{RegistryHost, RegistryHostConfig};
 use zeron_sync::DocsStore;
 
-fn open_host(store: Arc<DocsStore>) -> WorkspaceHost {
-    WorkspaceHost::open(
+fn open_host(store: Arc<DocsStore>) -> RegistryHost {
+    RegistryHost::open(
         store,
-        WorkspaceHostConfig {
+        RegistryHostConfig {
             device_id: "dev-me".into(),
             device_name: "test".into(),
             platform: "linux".into(),
-            org_id: "org-test".into(),
+            organization_id: "org-test".into(),
             user_id: "alice".into(),
             edge: None,
         },
     )
-    .expect("workspace host opens")
+    .expect("registry host opens")
 }
 
-fn device_ids(host: &WorkspaceHost) -> Vec<String> {
+fn device_ids(host: &RegistryHost) -> Vec<String> {
     host.read_devices()
         .unwrap()
         .into_iter()
@@ -75,7 +75,7 @@ async fn unshared_device_refuses_every_host_path() {
     assert!(host.is_host("chat-own"));
 
     host.set_device_shared(false).unwrap();
-    // Even chats whose row still names us must not execute here: an org
+    // Even chats whose row still names us must not execute here: an Organization
     // member can point any chat at our device id.
     assert!(!host.is_host("chat-own"));
     // Edgeless hosts normally claim unknown chats — not in guest mode.

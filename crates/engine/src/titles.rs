@@ -4,7 +4,7 @@
 //!
 //! Flow (fire-and-forget from the run task; every failure is a silent skip with
 //! tracing — a title must never fail or delay a run):
-//! 1. skip when the chat already has a title (or has no workspace row);
+//! 1. skip when the chat already has a title (or has no registry row);
 //! 2. pick the run harness's cheapest model (small-tier name heuristic, else the
 //!    last listed model — zeron's `cheapestModel`);
 //! 3. run a one-shot, non-streaming-collected titling prompt through the
@@ -14,7 +14,7 @@
 //! 4. re-check the title (a user rename during generation wins);
 //! 5. when the chat sits in a zeron worktree (`zeron/<name>` branch), rename the
 //!    branch from the title and update the chat's branch row;
-//! 6. `rename_chat` in the workspace doc.
+//! 6. `rename_chat` in the registry doc.
 
 use std::sync::Arc;
 
@@ -28,16 +28,16 @@ use zeron_proto::{
 
 use crate::EngineError;
 use crate::registry::HarnessRegistry;
+use crate::registry_host::RegistryHost;
 use crate::repos::Repos;
-use crate::workspace_host::WorkspaceHost;
 
 /// Throwaway title runs are cheap but still cross a process boundary — retry a
 /// couple of times with a short backoff before falling back (zeron's ladder).
 const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
 struct Inner {
-    workspace: WorkspaceHost,
-    registry: Arc<HarnessRegistry>,
+    registry: RegistryHost,
+    harness_registry: Arc<HarnessRegistry>,
     repos: Repos,
 }
 
@@ -47,11 +47,15 @@ pub struct TitleGenerator {
 }
 
 impl TitleGenerator {
-    pub fn new(workspace: WorkspaceHost, registry: Arc<HarnessRegistry>, repos: Repos) -> Self {
+    pub fn new(
+        registry: RegistryHost,
+        harness_registry: Arc<HarnessRegistry>,
+        repos: Repos,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                workspace,
                 registry,
+                harness_registry,
                 repos,
             }),
         }
@@ -80,9 +84,9 @@ impl TitleGenerator {
     ) -> Result<(), EngineError> {
         let chat = self
             .inner
-            .workspace
+            .registry
             .chat(chat_id)?
-            .ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
+            .ok_or_else(|| EngineError::Other("chat has no registry row".into()))?;
         if chat.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
             return Ok(()); // already named
         }
@@ -104,7 +108,7 @@ impl TitleGenerator {
 
         // Re-read after the model call: a user may have named the chat or checked
         // out another branch while the throwaway generation was live.
-        let latest = self.inner.workspace.chat(chat_id)?.unwrap_or(chat);
+        let latest = self.inner.registry.chat(chat_id)?.unwrap_or(chat);
         if latest
             .title
             .as_deref()
@@ -125,7 +129,7 @@ impl TitleGenerator {
                 .await
             {
                 Ok(renamed) if &renamed != branch => {
-                    if let Err(err) = self.inner.workspace.set_chat_branch(chat_id, &renamed) {
+                    if let Err(err) = self.inner.registry.set_chat_branch(chat_id, &renamed) {
                         tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
                     }
                 }
@@ -136,7 +140,7 @@ impl TitleGenerator {
             }
         }
 
-        self.inner.workspace.rename_chat(chat_id, &title)?;
+        self.inner.registry.rename_chat(chat_id, &title)?;
         tracing::info!(chat = %chat_id, title = %title, "chat auto-titled");
         Ok(())
     }
@@ -148,7 +152,7 @@ impl TitleGenerator {
         prompt: &str,
         cwd: &str,
     ) -> Option<String> {
-        let harness = match self.inner.registry.resolve(harness_id) {
+        let harness = match self.inner.harness_registry.resolve(harness_id) {
             Ok(harness) => harness,
             Err(err) => {
                 tracing::debug!(error = %err, "titling harness unavailable");

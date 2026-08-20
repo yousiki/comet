@@ -136,7 +136,7 @@ impl Shell {
 
     /// Set the sidebar's session filter (`None` = All spaces). On the
     /// new-session canvas the space context follows the filter — the canvas
-    /// default is "the space you're looking at".
+    /// default is "the Project you're looking at".
     pub(super) fn set_space_filter(&mut self, filter: Option<String>, cx: &mut Context<Self>) {
         self.settings.space_filter = filter.clone();
         if let Some(space_id) = filter
@@ -628,7 +628,7 @@ impl Shell {
                     if let Some(device) = state.device_name(&chat.device_id) {
                         folder = format!("{folder} @ {device}");
                     }
-                    // Org-shared registries: a teammate's chat names its
+                    // Organization-shared registries: another member's chat names its
                     // creator (raw user id; display-name resolution is a
                     // follow-up — there is no member-list API yet).
                     if let Some(owner) = chat

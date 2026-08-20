@@ -1,4 +1,4 @@
-// Verifies POST /workspace/:org/reset-log against `wrangler dev` (AUTH_MODE=dev):
+// Verifies the legacy `POST /workspace/:organizationId/reset-log` route:
 // build up a log, reset it, confirm the log is cleared and a fresh join still
 // converges (state re-uploaded from the client's local doc).
 import { LoroWebsocketClient } from "loro-websocket";
@@ -7,18 +7,20 @@ import { randomUUID } from "node:crypto";
 
 const base = process.argv[2] ?? "http://127.0.0.1:27640";
 const wsBase = base.replace(/^http/, "ws");
-const orgId = `org-reset-${randomUUID().slice(0, 8)}`;
-const token = `alice@${orgId}`;
-const room = `ws3/${orgId}/alice`;
+const organizationId = `org-reset-${randomUUID().slice(0, 8)}`;
+const token = `alice@${organizationId}`;
+const room = `ws3/${organizationId}/alice`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const stats = async () =>
-  (await fetch(`${base}/workspace/${orgId}/stats`, { headers: { authorization: `Bearer ${token}` } })).json();
+  (await fetch(`${base}/workspace/${organizationId}/stats`, { headers: { authorization: `Bearer ${token}` } })).json();
 
 let failures = 0;
 const check = (n, c, d = "") => { console.log(`${c ? "PASS" : "FAIL"}  ${n}${d ? " — " + d : ""}`); if (!c) failures++; };
 
 // 1. First device joins and writes a bunch of rows.
-const c1 = new LoroWebsocketClient({ url: `${wsBase}/workspace/${orgId}/ws?token=${token}` });
+const c1 = new LoroWebsocketClient({
+  url: `${wsBase}/workspace/${organizationId}/ws?token=${token}`
+});
 await c1.waitConnected();
 const a1 = new LoroAdaptor();
 await c1.join({ roomId: room, crdtAdaptor: a1 });
@@ -31,7 +33,7 @@ const s0 = await stats();
 check("log has rows before reset", s0.updateRows > 0, `updateRows=${s0.updateRows}`);
 
 // 2. Reset the log.
-const res = await fetch(`${base}/workspace/${orgId}/reset-log`, {
+const res = await fetch(`${base}/workspace/${organizationId}/reset-log`, {
   method: "POST",
   headers: { authorization: `Bearer ${token}` }
 });
@@ -48,7 +50,9 @@ check("log cleared after reset", s1.updateRows === 0, `updateRows=${s1.updateRow
 //    re-uploads; the loro-websocket lib used here doesn't, so this asserts the
 //    harness-independent property: the empty room accepts joins + writes.)
 await sleep(400);
-const c2 = new LoroWebsocketClient({ url: `${wsBase}/workspace/${orgId}/ws?token=${token}` });
+const c2 = new LoroWebsocketClient({
+  url: `${wsBase}/workspace/${organizationId}/ws?token=${token}`
+});
 await c2.waitConnected();
 const a2 = new LoroAdaptor();
 await c2.join({ roomId: room, crdtAdaptor: a2 });

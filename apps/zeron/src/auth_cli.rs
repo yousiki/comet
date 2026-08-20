@@ -10,7 +10,7 @@
 
 use std::io::IsTerminal;
 
-use zeron_engine::{AuthState, Engine, EngineConfig, InstanceLock, WorkspaceScope};
+use zeron_engine::{AuthState, Engine, EngineConfig, InstanceLock, ProfileScope};
 
 #[derive(Debug, PartialEq, Eq)]
 struct AccountStatus {
@@ -19,9 +19,9 @@ struct AccountStatus {
     healthy: bool,
 }
 
-fn account_status(scope: WorkspaceScope, auth: &AuthState) -> AccountStatus {
+fn account_status(scope: ProfileScope, auth: &AuthState) -> AccountStatus {
     match scope {
-        WorkspaceScope::Local => match auth {
+        ProfileScope::Local => match auth {
             AuthState::SignedOut => AccountStatus {
                 mode: "local only",
                 auth: "signed out (optional in local-only mode)".into(),
@@ -30,7 +30,7 @@ fn account_status(scope: WorkspaceScope, auth: &AuthState) -> AccountStatus {
             AuthState::NeedsOrganization { user } => AccountStatus {
                 mode: "local only",
                 auth: format!(
-                    "signed in as {}; finish workspace setup to enable sync",
+                    "signed in as {}; finish organization setup to enable sync",
                     user.email
                 ),
                 healthy: true,
@@ -41,20 +41,23 @@ fn account_status(scope: WorkspaceScope, auth: &AuthState) -> AccountStatus {
                 healthy: true,
             },
         },
-        WorkspaceScope::Development => AccountStatus {
+        ProfileScope::Development => AccountStatus {
             mode: "development",
             auth: "dev mode (bearer = user id)".into(),
             healthy: true,
         },
-        WorkspaceScope::Synced => match auth {
-            AuthState::SignedIn { user, org_id } => AccountStatus {
+        ProfileScope::Synced => match auth {
+            AuthState::SignedIn {
+                user,
+                organization_id,
+            } => AccountStatus {
                 mode: "synced",
                 auth: format!(
                     "signed in as {}{}",
                     user.email,
-                    org_id
+                    organization_id
                         .as_ref()
-                        .map(|org| format!(" (workspace {org})"))
+                        .map(|organization| format!(" (organization {organization})"))
                         .unwrap_or_default()
                 ),
                 healthy: true,
@@ -62,7 +65,7 @@ fn account_status(scope: WorkspaceScope, auth: &AuthState) -> AccountStatus {
             AuthState::NeedsOrganization { user } => AccountStatus {
                 mode: "synced",
                 auth: format!(
-                    "signed in as {} but no workspace selected — run `zeron login`",
+                    "signed in as {} but no organization selected — run `zeron login`",
                     user.email
                 ),
                 healthy: false,
@@ -76,7 +79,7 @@ fn account_status(scope: WorkspaceScope, auth: &AuthState) -> AccountStatus {
     }
 }
 
-/// `zeron login`: authenticate via the paste-code flow (and workspace
+/// `zeron login`: authenticate via the paste-code flow (and organization
 /// onboarding), persist `session.json`, and exit.
 pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
@@ -86,16 +89,20 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
         println!("Auth is in dev mode (no WorkOS client id) — there is nothing to sign in to.");
         return Ok(());
     }
-    if let AuthState::SignedIn { user, org_id } = auth.state() {
+    if let AuthState::SignedIn {
+        user,
+        organization_id,
+    } = auth.state()
+    {
         println!(
             "Already signed in as {}{}.",
             user.email,
-            org_id
-                .map(|org| format!(" (workspace {org})"))
+            organization_id
+                .map(|organization| format!(" (organization {organization})"))
                 .unwrap_or_default()
         );
         println!("Run `zeron logout` first to switch accounts.");
-        println!("The next engine start will use the synced workspace.");
+        println!("The next engine start will use the synced profile.");
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
@@ -103,16 +110,19 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
     }
     zeron_engine::terminal_sign_in(&auth).await?;
     match auth.state() {
-        AuthState::SignedIn { user, org_id } => {
+        AuthState::SignedIn {
+            user,
+            organization_id,
+        } => {
             println!(
                 "\nSigned in as {}{}.",
                 user.email,
-                org_id
-                    .map(|org| format!(" (workspace {org})"))
+                organization_id
+                    .map(|organization| format!(" (organization {organization})"))
                     .unwrap_or_default()
             );
             println!(
-                "Sync is ready. Start or restart Zeron to open the synced workspace; existing local sessions will stay local."
+                "Sync is ready. Start or restart Zeron to open the organization's synced data; existing local sessions will stay local."
             );
         }
         // terminal_sign_in only returns Ok once signed in; keep an honest fallback.
@@ -157,7 +167,7 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
             );
         }
     }
-    println!("The next engine start will use the local-only workspace.");
+    println!("The next engine start will use the local-only profile.");
     Ok(())
 }
 
@@ -165,8 +175,8 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
 /// auth, and engine liveness. Local-only is a healthy signed-out state.
 pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
     let auth = Engine::build_auth(&config).await;
-    let next_scope = Engine::initial_workspace_scope(&auth);
-    let scope = live_engine_scope(config.ipc_port)
+    let next_scope = Engine::initial_profile_scope(&auth);
+    let scope = live_engine_profile_scope(config.ipc_port)
         .await
         .unwrap_or(next_scope);
     let account = account_status(scope, &auth.state());
@@ -198,7 +208,7 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
 /// Prefer the immutable scope of a live runtime. Falling back to the next-boot
 /// derivation is correct when no engine is listening and tolerant of old
 /// daemons that predate EngineInfo.
-async fn live_engine_scope(ipc_port: u16) -> Option<WorkspaceScope> {
+async fn live_engine_profile_scope(ipc_port: u16) -> Option<ProfileScope> {
     let client = zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
         .await
         .ok()?;
@@ -208,7 +218,7 @@ async fn live_engine_scope(ipc_port: u16) -> Option<WorkspaceScope> {
         .ok()?;
     serde_json::from_value::<zeron_engine::EngineInfo>(value)
         .ok()
-        .map(|info| info.workspace_scope)
+        .map(|info| info.profile_scope)
 }
 
 /// The same exclusive data-dir lock the engine holds for its lifetime: taken for
@@ -236,14 +246,14 @@ mod tests {
             edge_token: None,
             ipc_port: 0,
             default_harness: HarnessId::Mock,
-            org_id: None,
+            organization_id: None,
             workos_client_id: Some("client_test".into()),
         }
     }
 
     #[test]
     fn signed_out_local_status_is_healthy() {
-        let status = account_status(WorkspaceScope::Local, &AuthState::SignedOut);
+        let status = account_status(ProfileScope::Local, &AuthState::SignedOut);
         assert_eq!(status.mode, "local only");
         assert_eq!(status.auth, "signed out (optional in local-only mode)");
         assert!(status.healthy);
@@ -258,17 +268,17 @@ mod tests {
         };
         assert!(
             !account_status(
-                WorkspaceScope::Synced,
+                ProfileScope::Synced,
                 &AuthState::NeedsOrganization { user: user.clone() },
             )
             .healthy
         );
         assert!(
             account_status(
-                WorkspaceScope::Synced,
+                ProfileScope::Synced,
                 &AuthState::SignedIn {
                     user,
-                    org_id: Some("org-1".into()),
+                    organization_id: Some("org-1".into()),
                 },
             )
             .healthy
@@ -300,19 +310,13 @@ mod tests {
         )
         .unwrap();
         let before = Engine::build_auth(&config).await;
-        assert_eq!(
-            Engine::initial_workspace_scope(&before),
-            WorkspaceScope::Synced
-        );
+        assert_eq!(Engine::initial_profile_scope(&before), ProfileScope::Synced);
 
         logout(config.clone()).await.unwrap();
 
         assert!(!session.exists());
         let after = Engine::build_auth(&config).await;
-        assert_eq!(
-            Engine::initial_workspace_scope(&after),
-            WorkspaceScope::Local
-        );
+        assert_eq!(Engine::initial_profile_scope(&after), ProfileScope::Local);
     }
 
     #[tokio::test]

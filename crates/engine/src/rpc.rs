@@ -1,4 +1,4 @@
-//! EngineRpc — the engine-side `RpcService`: sessions + docs + the workspace-doc
+//! EngineRpc — the engine-side `RpcService`: sessions + docs + the registry
 //! entity surface.
 //!
 //! Methods (feature-inventory §2):
@@ -7,17 +7,17 @@
 //! - `QueueCommand {chatId, command}` → `{commandId}` (durable doc command)
 //! - `WatchDocMessages {chatId}` → stream of joined `SessionMessageEntry[]`,
 //!   re-emitted on every doc change
-//! - `WatchChats` / `WatchDevices` → streams of the workspace doc's entity rows
+//! - `WatchChats` / `WatchDevices` → streams of the registry's entity rows
 //! - `WatchSessions` → stream of `Session[]`: this engine's live statuses merged with
-//!   remote devices' workspace session rows
-//! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
+//!   remote devices' registry session rows
+//! - `Mutate {op, …}` → `{ok}` — registry entity mutations (createChat, renameChat,
 //!   setChatArchived, deleteChat, renameDevice, markChatSeen)
-//! - `EngineInfo` → `{deviceId, workspaceScope, profile?}` — this runtime's fixed
+//! - `EngineInfo` → `{deviceId, profileScope, profile?}` — this runtime's fixed
 //!   identity and data boundary (never forwarded)
 //! - `LocalDevice` → `{deviceId}` — legacy engine identity (never forwarded)
 //! - AuthRpc (feature-inventory §2): `AuthStatus` (stream), `SignIn`/`SignInHeadless` →
-//!   `{url}`, `CompleteSignIn {code}`, `SignOut`, `ListOrgs`, `CreateOrg {name}`,
-//!   `SelectOrg {organizationId}`
+//!   `{url}`, `CompleteSignIn {code}`, `SignOut`, `ListOrganizations`, `CreateOrganization {name}`,
+//!   `SelectOrganization {organizationId}`
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
@@ -35,7 +35,7 @@
 //! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
 //!   `UploadCommit {uploadId, fileName}` → `{path}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
-//!   done}` (path-jailed to the uploads dir + workspace-known chat cwds).
+//!   done}` (path-jailed to the uploads dir + known chat working directories).
 //!
 //! ## Device-addressed routing (`targetDeviceId`, feature-inventory §2.1)
 //!
@@ -57,9 +57,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
-use zeron_proto::{
-    ChatConfig, EngineInfo, EngineProfileIdentity, HarnessId, ToolCall, WorkspaceScope,
-};
+use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ProfileIdentity, ProfileScope, ToolCall};
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
@@ -68,11 +66,11 @@ use crate::change_requests::CheckoutChangeRequests;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
+use crate::registry_host::RegistryHost;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
-use crate::workspace_host::WorkspaceHost;
 
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
@@ -167,7 +165,7 @@ struct ListFoldersParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ReadWorkspaceFileParams {
+struct ReadWorkingDirectoryFileParams {
     #[serde(default)]
     chat_id: Option<String>,
     #[serde(default)]
@@ -417,8 +415,8 @@ enum MutateParams {
 pub struct EngineRpc {
     sessions: SessionsEngine,
     doc_host: DocHost,
-    workspace: WorkspaceHost,
-    registry: std::sync::Arc<HarnessRegistry>,
+    registry: RegistryHost,
+    harness_registry: std::sync::Arc<HarnessRegistry>,
     repos: Repos,
     terminals: Terminals,
     change_requests: CheckoutChangeRequests,
@@ -437,26 +435,26 @@ impl EngineRpc {
     pub fn new(
         sessions: SessionsEngine,
         doc_host: DocHost,
-        workspace: WorkspaceHost,
-        registry: std::sync::Arc<HarnessRegistry>,
+        registry: RegistryHost,
+        harness_registry: std::sync::Arc<HarnessRegistry>,
         repos: Repos,
         terminals: Terminals,
         change_requests: CheckoutChangeRequests,
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
-        workspace_scope: WorkspaceScope,
+        profile_scope: ProfileScope,
     ) -> Self {
         let engine_info = EngineInfo {
             device_id: doc_host.device_id().to_string(),
-            workspace_scope,
+            profile_scope,
             profile: None,
         };
         Self {
             sessions,
             doc_host,
-            workspace,
             registry,
+            harness_registry,
             repos,
             terminals,
             change_requests,
@@ -474,7 +472,7 @@ impl EngineRpc {
     /// Announce the immutable profile that opened this RPC service's stores.
     /// Kept as a builder so direct/test callers of `new` remain source-compatible
     /// and safely expose no profile unless they actually have one.
-    pub fn with_profile_identity(mut self, profile_identity: EngineProfileIdentity) -> Self {
+    pub fn with_profile_identity(mut self, profile_identity: ProfileIdentity) -> Self {
         self.engine_info.profile = Some(profile_identity);
         self
     }
@@ -518,26 +516,26 @@ impl EngineRpc {
     fn local_importer(&self) -> Result<&crate::local_import::LocalImporter, RpcError> {
         self.local_import
             .as_ref()
-            .ok_or_else(|| RpcError::Failed("local import requires a synced workspace".into()))
+            .ok_or_else(|| RpcError::Failed("local import requires a synced profile".into()))
     }
 
-    /// Resolve a mention-search root from synced workspace rows. A client may
+    /// Resolve a mention-search root from synced registry rows. A client may
     /// name an existing linked worktree for a new chat, but it is verified
     /// against the space repository before any filesystem walk begins.
     async fn file_search_root(&self, p: &FileSearchParams) -> Result<std::path::PathBuf, RpcError> {
         let local_device = self.doc_host.device_id();
         match (&p.chat_id, &p.space_id) {
             (Some(_), Some(_)) | (None, None) => Err(RpcError::BadParams(
-                "SearchFiles needs exactly one of chatId or spaceId".into(),
+                "SearchFiles needs exactly one of chatId or project (spaceId)".into(),
             )),
             (Some(chat_id), None) => {
                 if p.path.is_some() {
                     return Err(RpcError::BadParams(
-                        "SearchFiles path applies only to a space".into(),
+                        "SearchFiles path applies only to a project".into(),
                     ));
                 }
                 let chat = self
-                    .workspace
+                    .registry
                     .chat(chat_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
@@ -547,53 +545,52 @@ impl EngineRpc {
                 let cwd = chat
                     .cwd
                     .map(std::path::PathBuf::from)
-                    .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))?;
+                    .ok_or_else(|| RpcError::Failed("chat has no working directory".into()))?;
                 let space_id = chat
                     .space_id
-                    .ok_or_else(|| RpcError::Failed("chat has no workspace space".into()))?;
+                    .ok_or_else(|| RpcError::Failed("chat has no project".into()))?;
                 let space = self
-                    .workspace
+                    .registry
                     .space(&space_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("chat workspace space not found".into()))?;
+                    .ok_or_else(|| RpcError::Failed("chat project not found".into()))?;
                 if space.device_id != local_device {
                     return Err(RpcError::Failed(
-                        "chat space belongs to another device".into(),
+                        "chat project belongs to another device".into(),
                     ));
                 }
                 if let Some(cwd) = self
                     .repos
-                    .workspace_checkout(std::path::Path::new(&space.path), &cwd)
+                    .project_checkout(std::path::Path::new(&space.path), &cwd)
                     .await
                 {
                     Ok(cwd)
                 } else {
                     Err(RpcError::Failed(
-                        "chat folder is not a workspace checkout".into(),
+                        "chat path is outside its project checkout".into(),
                     ))
                 }
             }
             (None, Some(space_id)) => {
                 let space = self
-                    .workspace
+                    .registry
                     .space(space_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("space not found".into()))?;
+                    .ok_or_else(|| RpcError::Failed("project not found".into()))?;
                 if space.device_id != local_device {
-                    return Err(RpcError::Failed("space belongs to another device".into()));
+                    return Err(RpcError::Failed("project belongs to another device".into()));
                 }
                 let space_path = std::path::PathBuf::from(&space.path);
                 let requested = p
                     .path
                     .as_deref()
                     .map_or_else(|| space_path.clone(), std::path::PathBuf::from);
-                if let Some(requested) =
-                    self.repos.workspace_checkout(&space_path, &requested).await
+                if let Some(requested) = self.repos.project_checkout(&space_path, &requested).await
                 {
                     Ok(requested)
                 } else {
                     Err(RpcError::BadParams(
-                        "SearchFiles path is not a workspace checkout".into(),
+                        "SearchFiles path is outside the project checkout".into(),
                     ))
                 }
             }
@@ -605,8 +602,8 @@ impl EngineRpc {
     async fn change_request_root(&self, cwd: &str) -> Result<std::path::PathBuf, RpcError> {
         let requested = std::path::PathBuf::from(cwd);
         let local_device = self.doc_host.device_id();
-        let mut chats_rx = self.workspace.watch_chats();
-        let mut spaces_rx = self.workspace.watch_spaces();
+        let mut chats_rx = self.registry.watch_chats();
+        let mut spaces_rx = self.registry.watch_spaces();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
         loop {
             let chats = chats_rx.borrow_and_update().clone();
@@ -624,7 +621,7 @@ impl EngineRpc {
             {
                 if let Some(checkout) = self
                     .repos
-                    .workspace_checkout(std::path::Path::new(&space.path), &requested)
+                    .project_checkout(std::path::Path::new(&space.path), &requested)
                     .await
                 {
                     return Ok(checkout);
@@ -641,14 +638,14 @@ impl EngineRpc {
             }
         }
         Err(RpcError::BadParams(
-            "cwd is not a known checkout on this device".into(),
+            "working directory is not a known checkout on this device".into(),
         ))
     }
 
     /// Most-recent-first paths the current chat actually touched, followed by
     /// files still changed in its checkout. The search worker validates and
     /// normalizes them against the resolved root before using them as ranking
-    /// hints, so stale or out-of-workspace tool paths simply disappear.
+    /// hints, so stale paths outside the working directory simply disappear.
     fn featured_file_paths(&self, chat_id: &str) -> Vec<String> {
         let mut paths = Vec::new();
         let mut seen = HashSet::new();
@@ -674,7 +671,7 @@ impl EngineRpc {
             }
         }
 
-        if let Ok(Some(chat)) = self.workspace.chat(chat_id) {
+        if let Ok(Some(chat)) = self.registry.chat(chat_id) {
             let diffs = self.diff_sync.watch_diffs().borrow().clone();
             let diff = chat
                 .checkout_id
@@ -784,7 +781,7 @@ impl EngineRpc {
                 branch,
                 cwd,
             } => {
-                self.workspace
+                self.registry
                     .create_chat(
                         &chat_id,
                         space_id.as_deref(),
@@ -794,7 +791,7 @@ impl EngineRpc {
                     )
                     .map_err(failed)?;
                 if let Some(branch) = branch.as_deref().filter(|b| !b.is_empty()) {
-                    self.workspace
+                    self.registry
                         .set_chat_branch(&chat_id, branch)
                         .map_err(failed)?;
                 }
@@ -807,16 +804,16 @@ impl EngineRpc {
                 name,
                 git_detected,
             } => self
-                .workspace
+                .registry
                 .create_space(&space_id, &device_id, &path, name, git_detected)
                 .map_err(failed),
             MutateParams::RenameSpace { space_id, name } => self
-                .workspace
+                .registry
                 .rename_space(&space_id, name.as_deref())
                 .map_err(failed)
                 .map(drop),
             MutateParams::DeleteSpace { space_id } => {
-                let deleted = self.workspace.delete_space(&space_id).map_err(failed)?;
+                let deleted = self.registry.delete_space(&space_id).map_err(failed)?;
                 // Best-effort teardown of live runs we host for the deleted chats
                 // (the doc rows are already tombstoned; a straggler run would only
                 // write into an orphaned session doc).
@@ -834,17 +831,17 @@ impl EngineRpc {
                 Ok(())
             }
             MutateParams::RenameChat { chat_id, title } => self
-                .workspace
+                .registry
                 .rename_chat(&chat_id, &title)
                 .map_err(failed)
                 .map(drop),
             MutateParams::SetChatBranch { chat_id, branch } => self
-                .workspace
+                .registry
                 .set_chat_branch(&chat_id, &branch)
                 .map_err(failed)
                 .map(drop),
             MutateParams::SetChatCwd { chat_id, cwd } => self
-                .workspace
+                .registry
                 .set_chat_cwd(&chat_id, &cwd)
                 .map_err(failed)
                 .map(drop),
@@ -853,37 +850,37 @@ impl EngineRpc {
                 last_message_at,
                 created_at,
             } => self
-                .workspace
+                .registry
                 .set_chat_activity(&chat_id, last_message_at, created_at)
                 .map_err(failed)
                 .map(drop),
             MutateParams::SetChatHost { chat_id, device_id } => self
-                .workspace
+                .registry
                 .set_chat_host(&chat_id, &device_id)
                 .map_err(failed)
                 .map(drop),
             MutateParams::SetChatArchived { chat_id, archived } => self
-                .workspace
+                .registry
                 .set_chat_archived(&chat_id, archived)
                 .map_err(failed)
                 .map(drop),
             MutateParams::SetChatConfig { chat_id, config } => self
-                .workspace
+                .registry
                 .set_chat_config(&chat_id, &config)
                 .map_err(failed)
                 .map(drop),
             MutateParams::DeleteChat { chat_id } => {
-                self.workspace.delete_chat(&chat_id).map_err(failed)?;
+                self.registry.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
                 Ok(())
             }
             MutateParams::RenameDevice { device_id, name } => self
-                .workspace
+                .registry
                 .rename_device(&device_id, &name)
                 .map_err(failed)
                 .map(drop),
             MutateParams::DeleteDevice { device_id } => {
-                let deleted = self.workspace.delete_device(&device_id).map_err(failed)?;
+                let deleted = self.registry.delete_device(&device_id).map_err(failed)?;
                 // Same teardown as DeleteSpace: rows are already tombstoned;
                 // interrupt any runs we were driving for the removed chats and
                 // drop their doc-host handles.
@@ -901,13 +898,13 @@ impl EngineRpc {
                 Ok(())
             }
             MutateParams::SetDeviceShared { shared } => {
-                self.workspace.set_device_shared(shared).map_err(failed)
+                self.registry.set_device_shared(shared).map_err(failed)
             }
             MutateParams::MarkChatSeen { chat_id, at } => {
                 let at = at
                     .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
                     .unwrap_or_else(chrono::Utc::now);
-                self.workspace
+                self.registry
                     .mark_chat_seen(&chat_id, at)
                     .map_err(failed)
                     .map(drop)
@@ -965,7 +962,8 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_FOLDERS
             | methods::LIST_DRIVES
             | methods::SEARCH_FILES
-            | methods::READ_WORKSPACE_FILE
+            | methods::READ_WORKING_DIRECTORY_FILE
+            | methods::LEGACY_READ_WORKSPACE_FILE
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             // Checkout diffs are produced on the device holding the checkout.
@@ -1084,14 +1082,18 @@ impl AuthRpc {
                 | methods::SIGN_IN_HEADLESS
                 | methods::COMPLETE_SIGN_IN
                 | methods::SIGN_OUT
-                | methods::LIST_ORGS
-                | methods::CREATE_ORG
-                | methods::SELECT_ORG
+                | methods::LIST_ORGANIZATIONS
+                | methods::LEGACY_LIST_ORGANIZATIONS
+                | methods::CREATE_ORGANIZATION
+                | methods::LEGACY_CREATE_ORGANIZATION
+                | methods::SELECT_ORGANIZATION
+                | methods::LEGACY_SELECT_ORGANIZATION
                 | methods::LIST_MEMBERS
                 | methods::INVITE_MEMBER
                 | methods::SET_MEMBER_ROLE
                 | methods::REMOVE_MEMBER
-                | methods::DELETE_ORG
+                | methods::DELETE_ORGANIZATION
+                | methods::LEGACY_DELETE_ORGANIZATION
         )
     }
 }
@@ -1131,15 +1133,19 @@ impl RpcService for AuthRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            methods::LIST_ORGS => {
-                let orgs = self
+            methods::LIST_ORGANIZATIONS | methods::LEGACY_LIST_ORGANIZATIONS => {
+                let organizations = self
                     .auth
-                    .list_orgs()
+                    .list_organizations()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "orgs": orgs }))
+                if method == methods::LEGACY_LIST_ORGANIZATIONS {
+                    RpcReply::value(&serde_json::json!({ "orgs": organizations }))
+                } else {
+                    RpcReply::value(&serde_json::json!({ "organizations": organizations }))
+                }
             }
-            methods::CREATE_ORG => {
+            methods::CREATE_ORGANIZATION | methods::LEGACY_CREATE_ORGANIZATION => {
                 #[derive(Deserialize)]
                 struct P {
                     name: String,
@@ -1147,12 +1153,12 @@ impl RpcService for AuthRpc {
                 let p: P = parse_params(params)?;
                 let organization_id = self
                     .auth
-                    .create_org(&p.name)
+                    .create_organization(&p.name)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "organizationId": organization_id }))
             }
-            methods::SELECT_ORG => {
+            methods::SELECT_ORGANIZATION | methods::LEGACY_SELECT_ORGANIZATION => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
                 struct P {
@@ -1160,7 +1166,7 @@ impl RpcService for AuthRpc {
                 }
                 let p: P = parse_params(params)?;
                 self.auth
-                    .select_org(&p.organization_id)
+                    .select_organization(&p.organization_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
@@ -1229,7 +1235,7 @@ impl RpcService for AuthRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            methods::DELETE_ORG => {
+            methods::DELETE_ORGANIZATION | methods::LEGACY_DELETE_ORGANIZATION => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
                 struct P {
@@ -1238,7 +1244,7 @@ impl RpcService for AuthRpc {
                 let p: P = parse_params(params)?;
                 let outcome = self
                     .auth
-                    .delete_org(&p.organization_id)
+                    .delete_organization(&p.organization_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&outcome)
@@ -1266,22 +1272,33 @@ impl RpcService for EngineRpc {
                 .await;
         }
         match method {
-            methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+            methods::ENGINE_INFO => {
+                let mut value = serde_json::to_value(&self.engine_info)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if let Some(object) = value.as_object_mut()
+                    && let Some(scope) = object.get("profileScope").cloned()
+                {
+                    // Old clients require `workspaceScope`; current clients use
+                    // `profileScope`. Keep the alias at this RPC boundary.
+                    object.insert("workspaceScope".into(), scope);
+                }
+                Ok(RpcReply::Value(value))
+            }
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
-            methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::LIST_HARNESSES => RpcReply::value(&self.harness_registry.descriptors()),
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
-                self.registry
+                self.harness_registry
                     .set_enabled(p.harness, p.enabled)
                     .map_err(RpcError::Failed)?;
                 // Fresh catalog in the reply: the page repaints from it in one
                 // round trip, and a refused/raced toggle self-corrects.
-                RpcReply::value(&self.registry.descriptors())
+                RpcReply::value(&self.harness_registry.descriptors())
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
                 let harness = self
-                    .registry
+                    .harness_registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let models = harness
@@ -1299,7 +1316,7 @@ impl RpcService for EngineRpc {
                 // empty default.
                 let p: ListModelsParams = parse_params(params)?;
                 let harness = self
-                    .registry
+                    .harness_registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let commands = harness
@@ -1358,7 +1375,7 @@ impl RpcService for EngineRpc {
                 )))
             }
             methods::PROBE_SYNC => {
-                self.workspace.probe();
+                self.registry.probe();
                 self.doc_host.probe_open_chats();
                 self.doc_host.probe_edge_reachability();
                 RpcReply::value(&serde_json::json!({}))
@@ -1393,7 +1410,7 @@ impl RpcService for EngineRpc {
                         "serverResets": s.server_resets,
                     })
                 }
-                let workspace = self.workspace.sync_status();
+                let registry = self.registry.sync_status();
                 let chats: Vec<serde_json::Value> = self
                     .doc_host
                     .sync_statuses()
@@ -1405,29 +1422,31 @@ impl RpcService for EngineRpc {
                         })
                     })
                     .collect();
+                let registry = registry.as_ref().map(room_json);
                 RpcReply::value(&serde_json::json!({
                     "deviceId": self.doc_host.device_id(),
                     "nowMs": crate::now_ms(),
-                    "workspace": workspace.as_ref().map(room_json),
+                    "registry": registry.clone(),
+                    // Previous-version clients read `workspace`; current
+                    // clients read `registry`. Both describe the same room.
+                    "workspace": registry,
                     "chats": chats,
                 }))
             }
             methods::WATCH_CONNECTIVITY => Ok(RpcReply::Stream(watch_stream(
                 self.doc_host.watch_connectivity(),
             ))),
-            methods::WATCH_CHATS => {
-                Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
-            }
+            methods::WATCH_CHATS => Ok(RpcReply::Stream(watch_stream(self.registry.watch_chats()))),
             methods::WATCH_DEVICES => Ok(RpcReply::Stream(watch_stream(
-                self.workspace.watch_devices(),
+                self.registry.watch_devices(),
             ))),
-            methods::WATCH_SPACES => Ok(RpcReply::Stream(watch_stream(
-                self.workspace.watch_spaces(),
-            ))),
+            methods::WATCH_SPACES => {
+                Ok(RpcReply::Stream(watch_stream(self.registry.watch_spaces())))
+            }
             methods::WATCH_SESSIONS => {
-                // Local live statuses merged with remote devices' workspace rows.
+                // Local live statuses merged with remote devices' registry rows.
                 let merged = self
-                    .workspace
+                    .registry
                     .merged_sessions_watch(self.sessions.watch_sessions());
                 Ok(RpcReply::Stream(watch_stream(merged)))
             }
@@ -1442,7 +1461,7 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&status)
             }
-            methods::IMPORT_LOCAL_WORKSPACE => {
+            methods::IMPORT_LOCAL_PROFILE | methods::LEGACY_IMPORT_LOCAL_PROFILE => {
                 let importer = self.local_importer()?.clone();
                 // Progress rides an unbounded channel: the importer is
                 // blocking (sqlite + fs) and must never wedge on a slow
@@ -1586,7 +1605,9 @@ impl RpcService for EngineRpc {
                             .await
                             .map_err(|error| RpcError::Failed(error.to_string()))?;
                     if identity.id != p.checkout_id {
-                        return Err(RpcError::Failed("checkoutId does not match cwd".into()));
+                        return Err(RpcError::Failed(
+                            "checkout ID does not match the working directory".into(),
+                        ));
                     }
                     let root = identity.root.as_path();
                     let (snapshot, base, target) = match p.mode.as_str() {
@@ -1838,8 +1859,8 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
             }
-            methods::READ_WORKSPACE_FILE => {
-                let p: ReadWorkspaceFileParams = parse_params(params)?;
+            methods::READ_WORKING_DIRECTORY_FILE | methods::LEGACY_READ_WORKSPACE_FILE => {
+                let p: ReadWorkingDirectoryFileParams = parse_params(params)?;
                 // Same root resolution + ownership checks as SearchFiles; the
                 // repos layer then jails the read to that checkout.
                 let root = self
@@ -1852,7 +1873,7 @@ impl RpcService for EngineRpc {
                     .await?;
                 let file = self
                     .repos
-                    .read_workspace_file(root, std::path::PathBuf::from(p.path))
+                    .read_working_directory_file(root, std::path::PathBuf::from(p.path))
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&file)
@@ -1914,7 +1935,7 @@ impl RpcService for EngineRpc {
                 // The terminal runs in the chat's checkout; a chat with no cwd (or
                 // no row yet) gets the home directory.
                 let cwd = self
-                    .workspace
+                    .registry
                     .chat(&p.chat_id)
                     .ok()
                     .flatten()
@@ -2039,9 +2060,9 @@ impl RpcService for EngineRpc {
             }
             methods::READ_ATTACHMENT_CHUNK => {
                 let p: ReadAttachmentChunkParams = parse_params(params)?;
-                // Path jail: the uploads dir plus every workspace-known chat cwd.
+                // Path jail: the uploads dir plus every known chat working directory.
                 let roots: Vec<std::path::PathBuf> = self
-                    .workspace
+                    .registry
                     .read_chats()
                     .unwrap_or_default()
                     .into_iter()
@@ -2124,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_file_paths_keep_workspace_activity_only() {
+    fn tool_file_paths_keep_working_directory_activity_only() {
         assert_eq!(
             tool_file_path(&ToolCall::EditFile {
                 path: "src/main.rs".into(),
@@ -2142,7 +2163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_org_rpc_returns_the_organization_id_field() {
+    async fn create_organization_rpc_returns_the_organization_id_field() {
         let data_dir = tempfile::tempdir().expect("temp auth dir");
         let auth = Auth::new(crate::auth::AuthConfig::new(
             "http://127.0.0.1:9",
@@ -2150,14 +2171,69 @@ mod tests {
         ));
         let reply = AuthRpc::new(auth)
             .handle(
-                methods::CREATE_ORG,
-                serde_json::json!({"name": "Workspace"}),
+                methods::CREATE_ORGANIZATION,
+                serde_json::json!({"name": "Organization"}),
             )
             .await
-            .expect("create org RPC");
+            .expect("create Organization RPC");
         let RpcReply::Value(value) = reply else {
-            panic!("create org must be a unary reply");
+            panic!("create Organization must be a unary reply");
         };
         assert_eq!(value, serde_json::json!({"organizationId": ""}));
+    }
+
+    #[tokio::test]
+    async fn legacy_organization_methods_are_exact_server_dispatch_aliases() {
+        let data_dir = tempfile::tempdir().expect("temp auth dir");
+        let rpc = AuthRpc::new(Auth::new(crate::auth::AuthConfig::new(
+            "http://127.0.0.1:9",
+            data_dir.path(),
+        )));
+
+        for (method, params) in [
+            (methods::LEGACY_LIST_ORGANIZATIONS, serde_json::json!({})),
+            (
+                methods::LEGACY_CREATE_ORGANIZATION,
+                serde_json::json!({"name": "Organization"}),
+            ),
+            (
+                methods::LEGACY_SELECT_ORGANIZATION,
+                serde_json::json!({"organizationId": "org-1"}),
+            ),
+            (
+                methods::LEGACY_DELETE_ORGANIZATION,
+                serde_json::json!({"organizationId": "org-1"}),
+            ),
+        ] {
+            assert!(AuthRpc::handles(method));
+            assert!(
+                !matches!(
+                    rpc.handle(method, params).await,
+                    Err(RpcError::UnknownMethod(_))
+                ),
+                "legacy method {method} must reach its canonical handler"
+            );
+        }
+
+        let canonical = rpc
+            .handle(methods::LIST_ORGANIZATIONS, serde_json::json!({}))
+            .await
+            .expect("canonical list");
+        let legacy = rpc
+            .handle(methods::LEGACY_LIST_ORGANIZATIONS, serde_json::json!({}))
+            .await
+            .expect("legacy list");
+        assert!(
+            matches!(canonical, RpcReply::Value(value) if value == serde_json::json!({"organizations": []}))
+        );
+        assert!(
+            matches!(legacy, RpcReply::Value(value) if value == serde_json::json!({"orgs": []}))
+        );
+
+        assert!(!AuthRpc::handles("ListOrg"));
+        assert!(matches!(
+            rpc.handle("ListOrg", serde_json::json!({})).await,
+            Err(RpcError::UnknownMethod(method)) if method == "ListOrg"
+        ));
     }
 }

@@ -1,4 +1,4 @@
-//! `WorkspaceHost::is_host` fail-closed matrix (org-shared registry): an
+//! `RegistryHost::is_host` fail-closed matrix (organization-shared registry): an
 //! engine that has never synced its registry room must NOT believe it hosts a
 //! chat it has no row for — in a shared registry that window would
 //! double-execute a teammate's commands. Edge-less hosts keep the original
@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use zeron_doc::SessionCommandPayload;
-use zeron_engine::{EngineCore, HarnessRegistry, WorkspaceHost, WorkspaceHostConfig};
+use zeron_engine::{EngineCore, HarnessRegistry, RegistryHost, RegistryHostConfig};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
     AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel, SteeringMode,
@@ -64,20 +64,20 @@ impl Harness for CountingHarness {
     }
 }
 
-fn open_host(dir: &std::path::Path, edge: Option<zeron_engine::EdgeConfig>) -> WorkspaceHost {
+fn open_host(dir: &std::path::Path, edge: Option<zeron_engine::EdgeConfig>) -> RegistryHost {
     let store = Arc::new(DocsStore::open(dir).expect("store opens"));
-    WorkspaceHost::open(
+    RegistryHost::open(
         store,
-        WorkspaceHostConfig {
+        RegistryHostConfig {
             device_id: "dev-me".into(),
             device_name: "test".into(),
             platform: "linux".into(),
-            org_id: "org-test".into(),
+            organization_id: "org-test".into(),
             user_id: "alice".into(),
             edge,
         },
     )
-    .expect("workspace host opens")
+    .expect("registry host opens")
 }
 
 struct GatedRegistryEdge {

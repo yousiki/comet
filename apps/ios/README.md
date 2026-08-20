@@ -1,10 +1,9 @@
 # Zeron for iOS
 
 A native SwiftUI viewport onto the zeron mesh. The phone is a **peer
-device**: it joins the same Loro CRDT rooms as every other device (workspace
-doc + per-chat session docs over the edge's Durable Objects), renders the
-mirrors, and drives remote engines through the durable command queue. No
-engine runs on the phone.
+device**: it joins an Organization-wide registry and per-chat session rooms
+over the edge's Durable Objects, renders those mirrors, and drives remote
+engines through the durable command queue. No engine runs on the phone.
 
 ## Build & run
 
@@ -25,10 +24,10 @@ desktop's pulldown-cmark config).
 ### Connecting
 
 - **WorkOS**: enter the edge URL, open the sign-in page on any device, paste
-  the code it shows (`/auth/exchange`), pick an org (`/auth/refresh` re-scopes
-  the token with the `org_id` claim).
+  the code it shows (`/auth/exchange`), pick an Organization
+  (`/auth/refresh` re-scopes the token with WorkOS's `org_id` wire claim).
 - **Dev**: against an `AUTH_MODE=dev` edge (e.g. `wrangler dev`), enter a user
-  id + org id; the bearer is `userId@orgId`.
+  id + Organization id; the legacy development bearer is `userId@organizationId`.
 - **Demo mode**: fully offline dataset with a scripted streaming reply —
   explore the UI with no infrastructure. Launch args for screenshot rigs:
   `-demo [-route chat:<id>|space:<id>] [-stream]`.
@@ -42,9 +41,9 @@ Sync/
   RoomClient.swift      room.rs port: join with oplog VV, snapshot backfill,
                         resubmit-from-server-VV, DocUpdate+Ack, fragments,
                         %EPH presence sub-room, ping/pong lease, backoff
-  WorkspaceStore.swift  ws3/{org}/{user} mirror: devices/spaces/chats/sessions
-                        rows, presence heartbeats, viewer-side writes
-                        (createChat, archive, lastSeenAt, own device row)
+  RegistryStore.swift   Organization registry mirror: devices/spaces/chats/
+                        sessions rows, presence heartbeats, viewer-side writes
+                        (createChat, archive, lastSeenAt)
   SessionStore.swift    session doc mirror: entries/parts (continuations
                         joined), command ledger appends (rule 1), host nudge
 Markdown/
@@ -74,15 +73,15 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 
 | Desktop | iOS |
 | --- | --- |
-| Sidebar: Spaces + attention-sorted Sessions | Home screen sections (same sort ranks: awaiting > errored > working > completed > idle) |
-| Horizontal session tabs per space | Space detail: vertical session list (creation order) |
+| Sidebar: Projects + attention-sorted Sessions | Home screen sections (same sort ranks: awaiting > errored > working > completed > idle) |
+| Horizontal session tabs per Project | Project detail: vertical session list (creation order) |
 | Tab close = archive | Swipe-to-archive |
-| Archived shelf under the sidebar list (open by default, Show-more paging, hover-swap Unarchive) | Same shelf under Home/space lists; unarchive is swipe-to-unarchive |
+| Archived shelf under the sidebar list (open by default, Show-more paging, hover-swap Unarchive) | Same shelf under Home/Project lists; unarchive is swipe-to-unarchive |
 | Status word in the row corner (muted dots; Done keeps its pop; spinner rides bottom-right) | Same, same colors |
 | Composer `white_alpha(0.03)` pill + hairline | Liquid Glass pill (`glassEffect`) + hairline |
 | Harness brand SVG marks (icons.rs) | Same path data via a native SVG path parser (`BrandMarks.swift`) |
 | Harness/model picker popover + curated catalogs | Brand-mark cards + catalog menu + reasoning-ladder chips (`HarnessCatalog.swift`, ported from crates/harness) |
-| Add-space palette (device + folder browser) | New-space sheet: device tabs + remote folder browser (ListFolders over the device-room relay, git repos badged) |
+| Add Project palette (device + folder browser) | New Project sheet: device tabs + remote folder browser (ListFolders over the device-room relay, git repos badged) |
 | ControlRpc over device-room relay | `DeviceRelayClient` — binary `uleb128(len)+header+payload` frames, `{"s","k","to","from"}` header, ndjson ControlRpc; used for ListFolders + direct-to-host `Mutate {createSpace}` (local doc-write fallback when the host is offline) |
 | Hover timestamps / copy | Context menus |
 | gpui `list()` sum-tree virtualization | `LazyVStack` + stable row ids + version fingerprints |
@@ -94,8 +93,8 @@ the desktop sources cited in each file header.
 
 ### Writer discipline (what the phone writes)
 
-- Workspace doc: its own device row, chat creates (host = the space's owning
-  device), `archived`/`title`/`lastSeenAt` LWW sets, presence heartbeats.
+- Organization registry: chat creates (host = the Project's owning device),
+  `archived`/`title`/`lastSeenAt` LWW sets, presence heartbeats.
 - Session docs: command ledger appends only (`run`/`steer`/`interrupt`/
   `respondInput`), with client-minted message ids for optimistic echo. The
   host writes all transcript entries and command outcomes.

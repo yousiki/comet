@@ -4,9 +4,9 @@
  * token as `?token=` (WS clients cannot always set headers); plain requests
  * use `Authorization: Bearer`.
  *
- * Workspace rooms (`ws/{orgId}`) authorize on the token's WorkOS organization
- * claim (`org_id`, present when the session was refreshed scoped to an org):
- * membership = claim equals the room's orgId.
+ * Legacy workspace rooms (`ws/{organizationId}`) authorize on the token's
+ * WorkOS `org_id` wire claim, present when the session is scoped to a Comet
+ * Organization. Membership requires that claim to equal the URL Organization.
  */
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { Env } from "./env";
@@ -14,8 +14,8 @@ import type { Env } from "./env";
 export interface Verified {
   readonly userId: string;
   readonly sessionId?: string;
-  /** WorkOS `org_id` claim — the org the caller's session is scoped to. */
-  readonly orgId?: string;
+  /** Comet Organization id, decoded from WorkOS's `org_id` wire claim. */
+  readonly organizationId?: string;
 }
 
 const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
@@ -39,11 +39,13 @@ export const bearerFromRequest = (request: Request): string | undefined => {
 export const verifyToken = async (env: Env, token: string): Promise<Verified | undefined> => {
   if (env.AUTH_MODE === "dev") {
     // Dev mode mirrors the old apps/server: the bearer string IS the user id.
-    // `userId@orgId` additionally carries a fake org claim so workspace-room
-    // membership is exercisable locally (smoke tests).
+    // The legacy `userId@organizationId` development token carries a fake
+    // Organization claim so membership is exercisable locally.
     if (!token) return undefined;
     const at = token.indexOf("@");
-    if (at > 0) return { userId: token.slice(0, at), orgId: token.slice(at + 1) };
+    if (at > 0) {
+      return { userId: token.slice(0, at), organizationId: token.slice(at + 1) };
+    }
     return { userId: token };
   }
   const issuer =
@@ -55,7 +57,7 @@ export const verifyToken = async (env: Env, token: string): Promise<Verified | u
     return {
       userId: payload.sub,
       sessionId: typeof payload.sid === "string" ? payload.sid : undefined,
-      orgId: typeof payload.org_id === "string" ? payload.org_id : undefined
+      organizationId: typeof payload.org_id === "string" ? payload.org_id : undefined
     };
   } catch {
     return undefined;

@@ -1,10 +1,10 @@
-# Registry sync — the workspace index without a CRDT
+# Registry sync — the profile index without a CRDT
 
-**Status: shipped behind the `reg2/` ORG-SHARED room namespace (was per-user `reg1/`); replaces the `ws4/` Loro workspace doc.** One room per org — every member reads and writes the same table. Consequences for N users: the tombstone-GC horizon and `/reset` re-seed assumption now span all members (one member's re-seed restores only their subset).
+**Status: shipped behind the `reg2/` Organization-shared room namespace (was per-user `reg1/`); replaces the legacy `ws4/` Loro workspace doc.** One room per Organization — every member reads and writes the same table. Consequences for N users: the tombstone-GC horizon and `/reset` re-seed assumption now span all members (one member's re-seed restores only their subset).
 
 ## Why
 
-The workspace doc (sidebar index: devices, spaces, chats, session status) was a Loro CRDT
+The legacy workspace doc (sidebar index: devices, spaces, chats, session status) was a Loro CRDT
 synced through a Durable Object. Three incidents in one week (2026-07-30, 2026-08-04,
 2026-08-05) traced to the same root: the CRDT keeps *history*, and the DO must replay or
 re-export that history in wasm under a CPU limit. Loro's full-snapshot export deterministically
@@ -31,7 +31,7 @@ and that side is measured and healthy.
 
 ```
 engine A ── RegistryDoc (rows + pending ops, SQLite-persisted) ── RegistryClient ─┐
-                                                                                  ├─ RegistryRoom DO (reg1/{org}/{user})
+                                                                                  ├─ RegistryRoom DO (reg2/{organizationId})
 engine B ── RegistryDoc ── RegistryClient ────────────────────────────────────────┘   rows table + seq counter
 ```
 
@@ -99,7 +99,7 @@ Server→client:
 
 ## Migration (instant, on first boot after update)
 
-`WorkspaceHost::open`: if no `registry1` snapshot exists, read the legacy `workspace2`
+`RegistryHost::open`: if no `registry1` snapshot exists, read the legacy `workspace2`
 Loro snapshot, convert every row into pending upsert ops (HLCs derived from the rows' own
 timestamps, so genuinely-newer live writes beat migrated values), and save. The UI reads
 the overlay immediately — zero visible gap. Each device seeds the same converged values
@@ -110,8 +110,8 @@ The legacy snapshot is retained for rollback.
 
 - Presence stays ephemeral: in-memory map in the DO, 15s beats, 45s freshness window,
   same relay-probe fallback and deaf-socket tripwire in the host.
-- Per-device push attribution (`pushOutcomes`) is on `/registry/:orgId/stats` from day one —
+- Per-device push attribution (`pushOutcomes`) is on `/registry/:organizationId/stats` from day one —
   the only per-device surface that made the 2026-08-05 incident debuggable.
-- Nightly R2 backup of the row table (seq-monotonic guard), `/registry/:orgId/rows` repair
-  read, `POST /registry/:orgId/reset` operator wipe (fleet re-seeds automatically).
+- Nightly R2 backup of the row table (seq-monotonic guard), `/registry/:organizationId/rows` repair
+  read, `POST /registry/:organizationId/reset` operator wipe (fleet re-seeds automatically).
 - Legacy `/workspace/*` routes remain for older engine builds; nothing new joins them.

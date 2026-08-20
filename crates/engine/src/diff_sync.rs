@@ -12,7 +12,7 @@
 //!   the checkout (bearer = engine edge token), so "review pending changes while
 //!   the host sleeps" works;
 //! - `chat.branch` upkeep: the same fs events cover the checkout's git dir (HEAD),
-//!   so each snapshot reconciles mismatched workspace chat rows' `branch` (and
+//!   so each snapshot reconciles mismatched registry chat rows' `branch` (and
 //!   `checkoutId` at reconcile time).
 //!
 //! Fast recursive `notify` watchers (debounced [`WATCH_DEBOUNCE`]) are backed by a
@@ -40,8 +40,8 @@ use zeron_proto::{Chat, CheckoutDiff, DiffFileSummary};
 
 use crate::EngineError;
 use crate::doc_host::EdgeConfig;
+use crate::registry_host::RegistryHost;
 use crate::repos::{CheckoutIdentity, Repos};
-use crate::workspace_host::WorkspaceHost;
 
 /// Hard cap on the unified patch (plus untracked hunks) — "Partial snapshot".
 pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
@@ -128,7 +128,7 @@ pub struct TurnSnapshot {
 
 struct DiffSyncInner {
     repos: Repos,
-    workspace: WorkspaceHost,
+    registry: RegistryHost,
     device_id: String,
     edge: Option<EdgeConfig>,
     http: reqwest::Client,
@@ -152,11 +152,11 @@ pub struct CheckoutDiffSync {
 }
 
 impl CheckoutDiffSync {
-    /// Build and start the sync loop: follows the workspace chat watch and runs the
+    /// Build and start the sync loop: follows the registry chat watch and runs the
     /// 2-minute repair tick. Requires a tokio runtime.
     pub fn start(
         repos: Repos,
-        workspace: WorkspaceHost,
+        registry: RegistryHost,
         device_id: &str,
         edge: Option<EdgeConfig>,
     ) -> Self {
@@ -164,7 +164,7 @@ impl CheckoutDiffSync {
         let sync = Self {
             inner: Arc::new(DiffSyncInner {
                 repos,
-                workspace: workspace.clone(),
+                registry: registry.clone(),
                 device_id: device_id.to_string(),
                 edge,
                 http: reqwest::Client::new(),
@@ -177,7 +177,7 @@ impl CheckoutDiffSync {
         };
         let task = tokio::spawn(diff_sync_task(
             Arc::downgrade(&sync.inner),
-            workspace.watch_chats(),
+            registry.watch_chats(),
             sync.inner.cancel.clone(),
         ));
         *lock(&sync.inner.supervisor) = Some(task);
@@ -204,7 +204,7 @@ impl CheckoutDiffSync {
     /// Regroup this device's chats by checkout identity, then (re)build watchers.
     /// Public for tests (the background task calls it on every chat change).
     pub async fn reconcile_now(&self) {
-        let chats = self.inner.workspace.watch_chats().borrow().clone();
+        let chats = self.inner.registry.watch_chats().borrow().clone();
         reconcile(&self.inner, chats).await;
     }
 
@@ -277,7 +277,7 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
         };
         // Stamp the row's checkoutId so every device groups this chat correctly.
         if chat.checkout_id.as_deref() != Some(identity.id.as_str())
-            && let Err(err) = inner.workspace.set_chat_checkout(&chat.id, &identity.id)
+            && let Err(err) = inner.registry.set_chat_checkout(&chat.id, &identity.id)
         {
             tracing::debug!(chat = %chat.id, error = %err, "diff-sync: checkoutId write failed");
         }
@@ -484,7 +484,7 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
     let chats = lock(&entry.chats).clone();
     for chat in &chats {
         if chat.branch.as_deref() != Some(snapshot.branch.as_str())
-            && let Err(err) = inner.workspace.set_chat_branch(&chat.id, &snapshot.branch)
+            && let Err(err) = inner.registry.set_chat_branch(&chat.id, &snapshot.branch)
         {
             tracing::debug!(chat = %chat.id, error = %err, "diff-sync: branch write failed");
         }

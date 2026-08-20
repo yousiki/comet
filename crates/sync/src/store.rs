@@ -35,7 +35,7 @@ const MIGRATIONS: &[&str] = &[
     // and cursor cannot diverge (restored backups / copied devices simply
     // redownload from their honest cursor). `epoch` marks the cursor's room
     // generation as well as the thin-lineage boundary (M1/M3): 2 = chat2,
-    // 3 = org-shared chat3, NULL/0 = pre-migration s2 doc.
+    // 3 = organization-shared chat3, NULL/0 = pre-migration s2 doc.
     "ALTER TABLE snapshots ADD COLUMN cursor INTEGER;
      ALTER TABLE snapshots ADD COLUMN epoch INTEGER;",
 ];

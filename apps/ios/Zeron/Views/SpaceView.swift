@@ -1,6 +1,5 @@
-// Space detail — the phone's answer to the desktop's horizontal session tabs:
-// the space's sessions as a vertical list (creation order, like tab order),
-// swipe-to-archive (= tab close), and "+" to start a session in this space.
+// Project detail — the phone's answer to the desktop's horizontal session tabs.
+// The wire model remains `Space`; product copy consistently says Project.
 
 import SwiftUI
 
@@ -44,12 +43,12 @@ struct SpaceView: View {
         .scrollContentBackground(.hidden)
         .scrollEdgeEffectStyle(.soft, for: .top)
         .background(Theme.surface.ignoresSafeArea())
-        .navigationTitle(space?.displayName ?? "Space")  // feeds the back menu
+        .navigationTitle(space?.displayName ?? "Project")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
-                    Text(space?.displayName ?? "Space")
+                    Text(space?.displayName ?? "Project")
                         .font(Theme.sans(13, weight: .medium))
                         .foregroundStyle(Theme.text)
                         .lineLimit(1)
@@ -88,7 +87,7 @@ struct SpaceView: View {
             Image(systemName: "bubble.left.and.bubble.right")
                 .font(.system(size: 28, weight: .light))
                 .foregroundStyle(Theme.textFaint)
-            Text("No sessions in this space")
+            Text("No sessions in this project")
                 .font(Theme.sans(13))
                 .foregroundStyle(Theme.textFaint)
             Button {
@@ -114,9 +113,9 @@ struct SpaceView: View {
 }
 
 
-// MARK: - New space: remote folder browser
+// MARK: - New project: remote folder browser
 
-/// The desktop add-space palette translated to a sheet: device tabs, mono
+/// The desktop add-project palette translated to a sheet: device tabs, mono
 /// breadcrumb with an up button, the device's folders (git repos badged),
 /// "Use this folder" pinned at the bottom. Listing comes from the device over
 /// the relay (ListFolders); dotfiles are pre-filtered and long listings are
@@ -134,7 +133,7 @@ struct NewSpaceSheet: View {
 
     private var devices: [DeviceRow] {
         // Engines own folders; this phone can't. Offer every other device.
-        (model.demo?.devices ?? model.workspace?.devices ?? [])
+        (model.demo?.devices ?? model.registry?.devices ?? [])
             .filter { $0.platform != "ios" }
     }
 
@@ -160,7 +159,7 @@ struct NewSpaceSheet: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .background(SheetStyle.panel)
-            .navigationTitle("New space")
+            .navigationTitle("New project")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

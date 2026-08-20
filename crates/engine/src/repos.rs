@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use zeron_proto::{
     DriveEntry, FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage,
-    GitHistoryRef, GitHistoryRefKind, Repo, RepoRef, WorkspaceFileText, Worktree,
+    GitHistoryRef, GitHistoryRefKind, Repo, RepoRef, WorkingDirectoryFileText, Worktree,
 };
 
 use crate::EngineError;
@@ -32,9 +32,9 @@ const PATH_EXISTS_TIMEOUT: Duration = Duration::from_secs(2);
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
 /// Cap on returned folder entries (bounds response size).
 const FOLDER_LIST_MAX_ENTRIES: usize = 500;
-/// Cap on one workspace-file read (file-explorer viewer). Matches the diff
+/// Cap on one working-directory file read (file-explorer viewer). Matches the diff
 /// pane's per-file source cap — over it, contents are withheld, not partial.
-const WORKSPACE_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const WORKING_DIRECTORY_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Cap on returned drives (a machine with more mounts than this is a server
 /// farm, not a laptop picking a project folder).
 const DRIVE_LIST_MAX_ENTRIES: usize = 50;
@@ -548,7 +548,7 @@ impl Repos {
     /// Whether `candidate` is the repository root or one of its linked
     /// worktrees. Filesystem resolution happens on a disposable thread because
     /// user-selected paths may be dead mounts.
-    pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
+    pub async fn project_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
         let repo_path = repo_path.to_path_buf();
         let candidate = candidate.to_path_buf();
         let worktrees: Vec<_> = self
@@ -910,21 +910,21 @@ impl Repos {
         }
     }
 
-    // ── ReadWorkspaceFile ───────────────────────────────────────────────────
+    // ── ReadWorkingDirectoryFile ───────────────────────────────────────────────────
 
     /// One text file for the file-explorer viewer, jailed to `root` (a checkout
     /// resolved by the RPC layer): symlinks and non-regular files are rejected,
     /// both sides are canonicalized before the containment check, and files
-    /// over [`WORKSPACE_FILE_MAX_BYTES`] come back `truncated` with no text
+    /// over [`WORKING_DIRECTORY_FILE_MAX_BYTES`] come back `truncated` with no text
     /// (never partial). Same disposable worker + wall-clock ceiling as
     /// `ListFolders` — a dead mount fails this read, not the runtime.
-    pub async fn read_workspace_file(
+    pub async fn read_working_directory_file(
         &self,
         root: PathBuf,
         path: PathBuf,
-    ) -> Result<WorkspaceFileText, EngineError> {
-        let worker = disposable_worker("workspace-file-read", move || {
-            read_workspace_file_blocking(&root, &path)
+    ) -> Result<WorkingDirectoryFileText, EngineError> {
+        let worker = disposable_worker("working-directory-file-read", move || {
+            read_working_directory_file_blocking(&root, &path)
         });
         match tokio::time::timeout(FOLDER_LIST_TIMEOUT, worker).await {
             Ok(Some(result)) => result,
@@ -1007,14 +1007,14 @@ fn list_folders_blocking(target: &Path, show_hidden: bool) -> Result<FolderListi
 /// through the handle, never trusting a pre-read size. Windows keeps the
 /// weaker name-based check (no `O_NOFOLLOW`; symlink creation is privileged
 /// there). NUL bytes or invalid UTF-8 → `binary` with no text.
-fn read_workspace_file_blocking(
+fn read_working_directory_file_blocking(
     root: &Path,
     path: &Path,
-) -> Result<WorkspaceFileText, EngineError> {
+) -> Result<WorkingDirectoryFileText, EngineError> {
     use std::io::Read as _;
 
     let canonical_root = std::fs::canonicalize(root)
-        .map_err(|e| EngineError::Other(format!("canonical workspace root: {e}")))?;
+        .map_err(|e| EngineError::Other(format!("canonical working directory root: {e}")))?;
     let full = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1026,7 +1026,7 @@ fn read_workspace_file_blocking(
         .map_err(|e| EngineError::Other(format!("read file metadata: {e}")))?;
     if pre.file_type().is_symlink() || !pre.is_file() {
         return Err(EngineError::Other(
-            "path is not a regular workspace file".into(),
+            "path is not a regular working directory file".into(),
         ));
     }
     let mut options = std::fs::OpenOptions::new();
@@ -1038,38 +1038,42 @@ fn read_workspace_file_blocking(
     }
     let file = options
         .open(&full)
-        .map_err(|e| EngineError::Other(format!("open workspace file: {e}")))?;
+        .map_err(|e| EngineError::Other(format!("open working directory file: {e}")))?;
     let metadata = file
         .metadata()
         .map_err(|e| EngineError::Other(format!("read file metadata: {e}")))?;
     if !metadata.is_file() {
         return Err(EngineError::Other(
-            "path is not a regular workspace file".into(),
+            "path is not a regular working directory file".into(),
         ));
     }
     let canonical = std::fs::canonicalize(&full)
         .map_err(|e| EngineError::Other(format!("canonical file path: {e}")))?;
     if !canonical.starts_with(&canonical_root) {
-        return Err(EngineError::Other("file escapes the workspace".into()));
+        return Err(EngineError::Other(
+            "file escapes the working directory".into(),
+        ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         let named = std::fs::metadata(&canonical)
-            .map_err(|e| EngineError::Other(format!("stat workspace file: {e}")))?;
+            .map_err(|e| EngineError::Other(format!("stat working directory file: {e}")))?;
         if named.dev() != metadata.dev() || named.ino() != metadata.ino() {
-            return Err(EngineError::Other("file escapes the workspace".into()));
+            return Err(EngineError::Other(
+                "file escapes the working directory".into(),
+            ));
         }
     }
     // Capped read from the handle: one byte past the limit proves oversize
     // even if the file grew after the fstat above.
     let mut bytes = Vec::new();
-    file.take(WORKSPACE_FILE_MAX_BYTES + 1)
+    file.take(WORKING_DIRECTORY_FILE_MAX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| EngineError::Other(format!("read workspace file: {e}")))?;
+        .map_err(|e| EngineError::Other(format!("read working directory file: {e}")))?;
     let size = metadata.len().max(bytes.len() as u64);
-    if bytes.len() as u64 > WORKSPACE_FILE_MAX_BYTES {
-        return Ok(WorkspaceFileText {
+    if bytes.len() as u64 > WORKING_DIRECTORY_FILE_MAX_BYTES {
+        return Ok(WorkingDirectoryFileText {
             text: None,
             binary: false,
             truncated: true,
@@ -1081,7 +1085,7 @@ fn read_workspace_file_blocking(
     } else {
         String::from_utf8(bytes).ok()
     };
-    Ok(WorkspaceFileText {
+    Ok(WorkingDirectoryFileText {
         binary: text.is_none(),
         truncated: false,
         size,
@@ -1326,7 +1330,7 @@ fn search_files_blocking_with_cancel<F: Fn() -> bool>(
     cancelled: F,
 ) -> Result<Vec<FileSearchMatch>, EngineError> {
     let root = std::fs::canonicalize(root)
-        .map_err(|e| EngineError::Other(format!("could not search workspace: {e}")))?;
+        .map_err(|e| EngineError::Other(format!("could not search working directory: {e}")))?;
     let featured: HashMap<String, usize> = featured_paths
         .iter()
         .filter_map(|path| {
@@ -1710,7 +1714,7 @@ tmpfs /run tmpfs rw 0 0
     }
 
     #[tokio::test]
-    async fn workspace_checkout_rejects_sibling_paths() {
+    async fn project_checkout_rejects_sibling_paths() {
         let data = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let sibling = tempfile::tempdir().unwrap();
@@ -1718,12 +1722,12 @@ tmpfs /run tmpfs rw 0 0
             Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
 
         assert_eq!(
-            repos.workspace_checkout(root.path(), root.path()).await,
+            repos.project_checkout(root.path(), root.path()).await,
             std::fs::canonicalize(root.path()).ok()
         );
         assert!(
             repos
-                .workspace_checkout(root.path(), sibling.path())
+                .project_checkout(root.path(), sibling.path())
                 .await
                 .is_none()
         );

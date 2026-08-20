@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Two-USER shared-org e2e: real edge (wrangler dev), two headless engines
-# signed in as DIFFERENT users of the SAME org, and the e2e_driver proving the
-# org-shared session path:
+# Two-user shared-Organization E2E: real edge (wrangler dev), two headless engines
+# signed in as DIFFERENT users of the SAME Organization, and the e2e_driver proving the
+# Organization-shared session path:
 #
 #   alice's engine A hosts a chat; bob's engine B sees it in the shared
-#   registry (reg2/{org}), queues a Run into it through the chat3 room, A
+#   registry (reg2/{organizationId}), queues a Run into it through the chat3 room, A
 #   executes, and the transcript — with `userId: bob` attribution on the user
 #   entry — syncs back to B.
 #
-# Usage: scripts/e2e-shared-org.sh
+# Usage: scripts/e2e-shared-organization.sh
 # Env:   ZERON_E2E_EDGE_PORT (default 27640), ZERON_E2E_KEEP_LOGS=1 to keep logs.
 
 set -euo pipefail
@@ -17,9 +17,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 EDGE_PORT="${ZERON_E2E_EDGE_PORT:-27640}"
 EDGE_URL="http://localhost:${EDGE_PORT}"
-ORG="shorg1"
-TOKEN_A="alice@${ORG}"
-TOKEN_B="bob@${ORG}"
+ORGANIZATION_ID="shorg1"
+TOKEN_A="alice@${ORGANIZATION_ID}"
+TOKEN_B="bob@${ORGANIZATION_ID}"
 A_PORT=27811
 B_PORT=27812
 A_DIR=/tmp/e2e-shared-a
@@ -92,10 +92,10 @@ rm -rf "$A_DIR" "$B_DIR"
 mkdir -p "$A_DIR" "$B_DIR"
 
 # ZERON_USER_ID must match the dev bearer's user half: the edge derives the
-# caller from `user@org`, the engine stamps doc attribution from its profile.
+# caller from `user@organization`, the engine stamps doc attribution from its profile.
 start_engine() { # start_engine <data_dir> <ipc_port> <name> <token> <user> <log>
   ZERON_DATA_DIR="$1" ZERON_IPC_PORT="$2" ZERON_DEVICE_NAME="$3" \
-    ZERON_EDGE_URL="$EDGE_URL" ZERON_EDGE_TOKEN="$4" ZERON_ORG_ID="$ORG" \
+    ZERON_EDGE_URL="$EDGE_URL" ZERON_EDGE_TOKEN="$4" ZERON_ORGANIZATION_ID="$ORGANIZATION_ID" \
     ZERON_USER_ID="$5" ZERON_HARNESS=mock RUST_LOG=info \
     "$ZERON" headless >"$6" 2>&1 &
 }

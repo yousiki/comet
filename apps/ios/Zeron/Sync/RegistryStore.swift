@@ -1,6 +1,6 @@
-// Workspace registry mirror — the iOS analogue of the desktop's RegistryDoc
-// host (crates/doc/src/registry.rs + crates/engine WorkspaceHost). Joins the
-// per-user `/registry/{orgId}/ws` room, projects the row table into typed
+// Organization registry mirror — the iOS analogue of the desktop's RegistryDoc
+// host. Joins the Organization-wide `/registry/{organizationId}/ws` room,
+// projects the row table into typed
 // rows, and performs the writes the writer discipline allows a viewer device:
 // chat creates, archives, renames and seen marks. iOS is a viewport, not an
 // engine device, so it owns no device row; it does publish a presence beat
@@ -16,7 +16,7 @@ import Observation
 
 @MainActor
 @Observable
-final class WorkspaceStore {
+final class RegistryStore {
     private(set) var devices: [DeviceRow] = []
     private(set) var spaces: [Space] = []
     private(set) var chats: [Chat] = []
@@ -53,7 +53,9 @@ final class WorkspaceStore {
         // sidebar renders immediately and the hello backfills from our
         // cursor. First run after the update: no blob → cursor null → the
         // server's full state (the engines already seeded everything).
-        let blobURL = DocDisk.registryURL(orgId: config.orgId, userId: config.userId)
+        let blobURL = DocDisk.registryURL(
+            organizationId: config.organizationId,
+            userId: config.userId)
         if let data = try? Data(contentsOf: blobURL),
            let loaded = try? RegistryDoc.from(data: data, deviceId: config.deviceId) {
             doc = loaded
@@ -555,8 +557,8 @@ final class WorkspaceStore {
 
     // MARK: Writes (viewer-device discipline → op batches)
 
-    /// Mint a new chat onto a space (workspace_host.rs create_chat shape):
-    /// a full-row upsert. The host = the space's owning device picks it up
+    /// Mint a new chat onto a space (the registry host's create-chat shape):
+    /// a full-row upsert. The host = the Project's owning device picks it up
     /// via the registry.
     @discardableResult
     func createChat(space: Space, config chatConfig: ChatConfig,
@@ -569,8 +571,9 @@ final class WorkspaceStore {
             "cwd": .string(cwd ?? space.path),
             "spaceId": .string(space.id),
             "createdAt": .int(nowMs()),
-            // Born on the org-shared chat3 room (workspace_host.rs
-            // create_chat): mobile is always org-signed-in, and a brand-new
+            // Born on the Organization-shared legacy `chat3` namespace (the
+            // registry host's create-chat operation): mobile is always signed
+            // in to an Organization, and a brand-new
             // chat has an empty doc — nothing to seed, no migration race.
             "roomGen": .int(3),
         ]

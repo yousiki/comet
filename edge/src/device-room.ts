@@ -16,7 +16,7 @@
  */
 import { BytesReader, BytesWriter } from "loro-protocol";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
-import { AUTH_ORG_HEADER, AUTH_USER_HEADER, type Env } from "./env";
+import { AUTH_ORGANIZATION_HEADER, AUTH_USER_HEADER, type Env } from "./env";
 
 export interface DeviceFrameHeader {
   /** Stream id, unique per (connId, logical stream). */
@@ -151,13 +151,13 @@ export class DeviceRoom implements DurableObject {
       const role = url.searchParams.get("role") === "host" ? "host" : "client";
       if (role === "host") {
         // The device's own backend claims the room; the claim is the identity
-        // anchor every later client join is checked against. The owner's org
-        // (Worker-stamped) is recorded alongside so org members can nudge —
-        // re-set on every host join, which backfills pre-org legacy rooms.
+        // anchor every later client join is checked against. The owner's
+        // Worker-stamped Organization is recorded alongside so Organization
+        // members can nudge. `ownerOrg` remains the historical storage key.
         if (!owner) this.setMeta("owner", userId);
         else if (owner !== userId) return new Response("forbidden", { status: 403 });
-        const org = request.headers.get(AUTH_ORG_HEADER);
-        if (org) this.setMeta("ownerOrg", org);
+        const organizationId = request.headers.get(AUTH_ORGANIZATION_HEADER);
+        if (organizationId) this.setMeta("ownerOrg", organizationId);
       } else {
         if (!owner || owner !== userId) return new Response("forbidden", { status: 403 });
       }
@@ -209,15 +209,18 @@ export class DeviceRoom implements DurableObject {
     }
 
     // Durable command nudge (§7). The owner's devices may nudge, and — for
-    // org-shared sessions — so may any member of the owner's org (both org
-    // values are Worker-stamped, spoof-protected). The payload is only a chat
+    // Organization-shared sessions — so may any member of the owner's
+    // Organization (both values are Worker-stamped, spoof-protected). The payload is only a chat
     // id: the host validates against its own doc before executing anything.
     if (url.pathname === "/nudge" && request.method === "POST") {
       if (!owner) return json({ error: "forbidden" }, 404);
-      const ownerOrg = this.getMeta("ownerOrg");
-      const callerOrg = request.headers.get(AUTH_ORG_HEADER);
-      const sameOrg = ownerOrg !== undefined && ownerOrg !== "" && ownerOrg === callerOrg;
-      if (owner !== userId && !sameOrg) return json({ error: "forbidden" }, 403);
+      const ownerOrganizationId = this.getMeta("ownerOrg");
+      const callerOrganizationId = request.headers.get(AUTH_ORGANIZATION_HEADER);
+      const sameOrganization =
+        ownerOrganizationId !== undefined &&
+        ownerOrganizationId !== "" &&
+        ownerOrganizationId === callerOrganizationId;
+      if (owner !== userId && !sameOrganization) return json({ error: "forbidden" }, 403);
       const body = (await request.json().catch(() => null)) as { chatId?: string } | null;
       const chatId = body?.chatId;
       if (!chatId || !CHAT_ID_RE.test(chatId)) return json({ error: "bad_chat_id" }, 400);

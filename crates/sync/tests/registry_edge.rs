@@ -57,18 +57,18 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
     .expect("condition not reached in time");
 }
 
-fn edge_url(org: &str, user: &str) -> String {
+fn edge_url(organization_id: &str, user: &str) -> String {
     let base = std::env::var("ZERON_EDGE_WS")
         .expect("set ZERON_EDGE_WS to the edge origin, e.g. ws://127.0.0.1:27640");
-    // Dev-mode bearer `user@org` carries the org claim the registry route checks.
-    format!("{base}/registry/{org}/ws?token={user}@{org}&device=it")
+    // The dev-mode `user@organization` bearer carries the Organization claim.
+    format!("{base}/registry/{organization_id}/ws?token={user}@{organization_id}&device=it")
 }
 
 #[tokio::test]
 #[ignore = "requires a live edge: set ZERON_EDGE_WS (e.g. ws://127.0.0.1:27640)"]
 async fn two_rust_clients_converge_through_a_real_registry_do() {
-    let org = format!("org{}", uuid::Uuid::new_v4().simple());
-    let url = edge_url(&org, "alice");
+    let organization_id = format!("org{}", uuid::Uuid::new_v4().simple());
+    let url = edge_url(&organization_id, "alice");
 
     let doc_a = Arc::new(Mutex::new(RegistryDoc::new("dev-live-a")));
     let doc_b = Arc::new(Mutex::new(RegistryDoc::new("dev-live-b")));
@@ -175,8 +175,8 @@ async fn two_rust_clients_converge_through_a_real_registry_do() {
 #[tokio::test]
 #[ignore = "requires a live edge: set ZERON_EDGE_WS (e.g. ws://127.0.0.1:27640)"]
 async fn cursor_delta_and_churn_stay_bounded_on_a_real_do() {
-    let org = format!("org{}", uuid::Uuid::new_v4().simple());
-    let url = edge_url(&org, "alice");
+    let organization_id = format!("org{}", uuid::Uuid::new_v4().simple());
+    let url = edge_url(&organization_id, "alice");
 
     let doc = Arc::new(Mutex::new(RegistryDoc::new("dev-churn")));
     {

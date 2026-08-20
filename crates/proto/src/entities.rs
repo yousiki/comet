@@ -1,7 +1,7 @@
-//! Synced entity rows (workspace doc) and local projections.
+//! Synced registry entity rows and local projections.
 //!
-//! In zeron these were synced Postgres rows; in zeron they live in the per-org
-//! workspace Loro doc (see ARCHITECTURE.md §2.2) with the same field surface.
+//! In zeron these were synced Postgres rows; in zeron they live in the per-organization
+//! legacy workspace Loro doc (see ARCHITECTURE.md §2.2) with the same field surface.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -121,14 +121,14 @@ pub struct Chat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
     /// Which sync room generation serves this chat (docs/chat2-sync.md M2):
-    /// `None`/1 = legacy s2 loro room, 2 = chat2 dumb relay, 3 = org-shared
+    /// `None`/1 = legacy s2 loro room, 2 = chat2 dumb relay, 3 = organization-shared
     /// chat3 room. The HOST flips this in the same breath as seeding the
     /// room; every device dials the room the registry names. Per-chat and
     /// instantly revertible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_gen: Option<u32>,
     /// Creating user (additive; absent on rows from pre-attribution writers).
-    /// Sidebar "whose chat" label in org-shared registries. Informational.
+    /// Sidebar "whose chat" label in organization-shared registries. Informational.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
 }
@@ -312,9 +312,9 @@ pub struct DriveListing {
     pub drives: Vec<DriveEntry>,
 }
 
-/// A workspace-relative file or directory returned by `SearchFiles`.
+/// A working-directory-relative file or directory returned by `SearchFiles`.
 /// Contents deliberately never cross this boundary: mentioning a path leaves
-/// the harness to read it through its normal workspace tools when needed.
+/// the harness to read it through its normal working-directory tools when needed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileSearchMatch {
@@ -322,12 +322,12 @@ pub struct FileSearchMatch {
     pub is_dir: bool,
 }
 
-/// One workspace file's contents for the read-only file-explorer viewer
-/// (`ReadWorkspaceFile`). Unlike `SearchFiles`, contents DO cross this
+/// One working-directory file's contents for the read-only file-explorer viewer
+/// (`ReadWorkingDirectoryFile`). Unlike `SearchFiles`, contents DO cross this
 /// boundary — the read is jailed to the chat/space checkout root and capped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkspaceFileText {
+pub struct WorkingDirectoryFileText {
     /// UTF-8 contents; `None` when `binary` or `truncated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -461,7 +461,8 @@ pub enum AuthState {
     #[serde(rename_all = "camelCase")]
     SignedIn {
         user: UserProfile,
-        org_id: Option<String>,
+        #[serde(default, alias = "orgId")]
+        organization_id: Option<String>,
     },
 }
 

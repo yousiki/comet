@@ -64,7 +64,7 @@ pub mod methods {
     pub const PROBE_SYNC: &str = "ProbeSync";
     /// Live sync introspection (`zeron sync` / debug surfaces): per-room
     /// connection state, last pushed-frame/ack ages, rejoin/probe/resync
-    /// counters for the workspace room and every open chat doc. No params;
+    /// counters for the registry room and every open chat doc. No params;
     /// IPC-only.
     pub const SYNC_STATUS: &str = "SyncStatus";
     /// Pushed edge-connectivity posture (`zeron_proto::Connectivity`):
@@ -74,16 +74,16 @@ pub mod methods {
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";
-    /// Spaces registry (device+folder pairs) from the workspace doc.
+    /// Project registry (device+folder pairs) from the registry.
     pub const WATCH_SPACES: &str = "WatchSpaces";
-    /// Entity mutations against the workspace doc (feature-inventory §2 DataRpc).
+    /// Entity mutations against the registry (feature-inventory §2 DataRpc).
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     pub const MUTATE: &str = "Mutate";
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
-    /// This engine runtime's fixed device and workspace identity.
+    /// This engine runtime's fixed device and profile identity.
     pub const ENGINE_INFO: &str = "EngineInfo";
     /// Readiness barrier for the engine runtime. The call completes once stores
     /// and journals are assembled, or fails with the assembly error.
@@ -98,20 +98,27 @@ pub mod methods {
     pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
     pub const COMPLETE_SIGN_IN: &str = "CompleteSignIn";
     pub const SIGN_OUT: &str = "SignOut";
-    pub const LIST_ORGS: &str = "ListOrgs";
-    pub const CREATE_ORG: &str = "CreateOrg";
-    pub const SELECT_ORG: &str = "SelectOrg";
-    // Team management (feature: org-shared sessions). All IPC-only; the edge
+    pub const LIST_ORGANIZATIONS: &str = "ListOrganizations";
+    pub const CREATE_ORGANIZATION: &str = "CreateOrganization";
+    pub const SELECT_ORGANIZATION: &str = "SelectOrganization";
+    /// Previous-version IPC spellings accepted by servers only. New clients
+    /// must use the canonical Organization methods above.
+    pub const LEGACY_LIST_ORGANIZATIONS: &str = "ListOrgs";
+    pub const LEGACY_CREATE_ORGANIZATION: &str = "CreateOrg";
+    pub const LEGACY_SELECT_ORGANIZATION: &str = "SelectOrg";
+    // Organization management (feature: organization-shared sessions). All IPC-only; the edge
     // enforces admin-ness and last-admin protection — these are thin proxies.
     pub const LIST_MEMBERS: &str = "ListMembers";
     pub const INVITE_MEMBER: &str = "InviteMember";
     pub const SET_MEMBER_ROLE: &str = "SetMemberRole";
     pub const REMOVE_MEMBER: &str = "RemoveMember";
-    pub const DELETE_ORG: &str = "DeleteOrg";
+    pub const DELETE_ORGANIZATION: &str = "DeleteOrganization";
+    pub const LEGACY_DELETE_ORGANIZATION: &str = "DeleteOrg";
     /// One-time local→synced profile import: what's importable (unary).
     pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
     /// One-time local→synced profile import: run it (stream of progress items).
-    pub const IMPORT_LOCAL_WORKSPACE: &str = "ImportLocalWorkspace";
+    pub const IMPORT_LOCAL_PROFILE: &str = "ImportLocalProfile";
+    pub const LEGACY_IMPORT_LOCAL_PROFILE: &str = "ImportLocalWorkspace";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
@@ -130,7 +137,9 @@ pub mod methods {
     pub const SEARCH_FILES: &str = "SearchFiles";
     /// Read one text file inside a known chat/space checkout (file-explorer
     /// viewer). Jailed to the resolved checkout root; 2 MiB cap.
-    pub const READ_WORKSPACE_FILE: &str = "ReadWorkspaceFile";
+    pub const READ_WORKING_DIRECTORY_FILE: &str = "ReadWorkingDirectoryFile";
+    /// Legacy method accepted during the Workspace → Working Directory migration.
+    pub const LEGACY_READ_WORKSPACE_FILE: &str = "ReadWorkspaceFile";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).

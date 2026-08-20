@@ -217,7 +217,7 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
 
     // A knows the chat is hosted on B (local registry writes), and knows B's
     // stamped version passes the relay gate.
-    core_a.workspace.upsert_device_row(&Device {
+    core_a.registry.upsert_device_row(&Device {
         id: "device-b".into(),
         name: "b".into(),
         platform: "linux".into(),
@@ -234,7 +234,7 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
         .await
         .expect("createChat on A");
     core_b
-        .workspace
+        .registry
         .rename_chat(CHAT, "Pre-titled")
         .expect("pre-title on B (no auto-title harness run)");
 

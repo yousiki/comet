@@ -3,7 +3,7 @@
 //! boot gate, relative times.
 //!
 //! This lives in `proto` rather than in the viewport crate so the rules stay
-//! pure and independently testable: the same workspace doc must produce the
+//! pure and independently testable: the same registry state must produce the
 //! same row order on every surface, and there is exactly one implementation
 //! and one test suite per rule.
 //!
@@ -12,7 +12,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space, WorkspaceScope};
+use crate::{AuthState, Chat, ChatIndicator, ProfileScope, Session, SessionStatus, Space};
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -148,27 +148,27 @@ pub enum GatePhase {
     Failed(String),
     /// Engine up, but signed out — show the sign-in card.
     SignIn,
-    /// Signed in but no organization selected — "Create your workspace".
-    OrgGate,
+    /// Signed in but no organization selected — create/select an Organization.
+    OrganizationGate,
     /// Render the shell.
     Ready,
 }
 
 /// Missing scope is treated as synced. Current engines always publish
-/// [`WorkspaceScope`] before becoming ready, while old daemons are deliberately
+/// [`ProfileScope`] before becoming ready, while old daemons are deliberately
 /// kept behind the account gate instead of being mistaken for local runtimes.
 pub fn gate_phase(
     connection: &ConnectionStatus,
-    workspace_scope: Option<WorkspaceScope>,
+    profile_scope: Option<ProfileScope>,
     auth: Option<&AuthState>,
 ) -> GatePhase {
     match connection {
         ConnectionStatus::Connecting => GatePhase::Loading,
         ConnectionStatus::Failed(err) => GatePhase::Failed(err.clone()),
-        ConnectionStatus::Ready => match workspace_scope.unwrap_or(WorkspaceScope::Synced) {
-            WorkspaceScope::Local | WorkspaceScope::Development => GatePhase::Ready,
-            WorkspaceScope::Synced => match auth {
-                Some(AuthState::NeedsOrganization { .. }) => GatePhase::OrgGate,
+        ConnectionStatus::Ready => match profile_scope.unwrap_or(ProfileScope::Synced) {
+            ProfileScope::Local | ProfileScope::Development => GatePhase::Ready,
+            ProfileScope::Synced => match auth {
+                Some(AuthState::NeedsOrganization { .. }) => GatePhase::OrganizationGate,
                 Some(AuthState::SignedIn { .. }) => GatePhase::Ready,
                 Some(AuthState::SignedOut) | None => GatePhase::SignIn,
             },
@@ -190,11 +190,11 @@ mod gate_tests {
     }
 
     #[test]
-    fn workspace_scope_controls_the_auth_gate() {
+    fn profile_scope_controls_the_auth_gate() {
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Local),
+                Some(ProfileScope::Local),
                 Some(&AuthState::SignedOut),
             ),
             GatePhase::Ready
@@ -202,7 +202,7 @@ mod gate_tests {
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Synced),
+                Some(ProfileScope::Synced),
                 Some(&AuthState::SignedOut),
             ),
             GatePhase::SignIn
@@ -210,22 +210,22 @@ mod gate_tests {
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Synced),
+                Some(ProfileScope::Synced),
                 Some(&AuthState::NeedsOrganization { user: user() }),
             ),
-            GatePhase::OrgGate
+            GatePhase::OrganizationGate
         );
     }
 
     #[test]
     fn development_and_local_never_use_the_workos_gate() {
-        for scope in [WorkspaceScope::Local, WorkspaceScope::Development] {
+        for scope in [ProfileScope::Local, ProfileScope::Development] {
             for auth in [
                 AuthState::SignedOut,
                 AuthState::NeedsOrganization { user: user() },
                 AuthState::SignedIn {
                     user: user(),
-                    org_id: Some("org-1".into()),
+                    organization_id: Some("org-1".into()),
                 },
             ] {
                 assert_eq!(
@@ -267,8 +267,9 @@ pub fn parse_auth_state(value: &serde_json::Value) -> Option<AuthState> {
         "NeedsOrganization" => Some(AuthState::NeedsOrganization { user: user()? }),
         "SignedIn" => Some(AuthState::SignedIn {
             user: user()?,
-            org_id: value
-                .get("orgId")
+            organization_id: value
+                .get("organizationId")
+                .or_else(|| value.get("orgId"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         }),
@@ -406,9 +407,10 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
         ToolCall::ReadFile { path } => ("Read", path.clone()),
         ToolCall::WriteFile { path, .. } => ("Write", path.clone()),
         ToolCall::EditFile { path, .. } => ("Edit", path.clone()),
-        ToolCall::ApplyPatch { path } => {
-            ("Patch", path.clone().unwrap_or_else(|| "workspace".into()))
-        }
+        ToolCall::ApplyPatch { path } => (
+            "Patch",
+            path.clone().unwrap_or_else(|| "working directory".into()),
+        ),
         ToolCall::Search { pattern, path } => (
             "Search",
             match path {

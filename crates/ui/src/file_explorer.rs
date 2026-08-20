@@ -1,6 +1,6 @@
 //! The right-pane "Files" surface: a lazy directory tree over `ListFolders`
 //! (dotfiles shown, `.git` excluded engine-side) beside a read-only file
-//! viewer over `ReadWorkspaceFile`.
+//! viewer over `ReadWorkingDirectoryFile`.
 //!
 //! - roots at the selected chat's cwd and follows chat switches (the same
 //!   dynamic resolution the Diff surface uses); remote chats relay-forward
@@ -21,7 +21,7 @@ use gpui::{
     Window, div, font, list, prelude::*, px,
 };
 
-use zeron_proto::{FolderListing, WorkspaceFileText};
+use zeron_proto::{FolderListing, WorkingDirectoryFileText};
 use zeron_rpc::methods;
 use zeron_syntax::HighlightedDocument;
 
@@ -51,7 +51,7 @@ struct TreeRow {
 
 pub struct FileExplorer {
     state: Entity<AppState>,
-    /// Resolved workspace root (the selected chat's cwd) + relay target; both
+    /// Resolved Working Directory root (the selected chat's cwd) + relay target; both
     /// re-checked on every state change so chat switches re-root the tree.
     root: Option<String>,
     target: Option<String>,
@@ -67,7 +67,7 @@ pub struct FileExplorer {
 
     // Viewer.
     open_path: Option<String>,
-    file: Loadable<WorkspaceFileText>,
+    file: Loadable<WorkingDirectoryFileText>,
     lines: Vec<SharedString>,
     highlights: Option<Arc<HighlightedDocument>>,
     viewer_list: ListState,
@@ -106,7 +106,7 @@ impl FileExplorer {
         }
     }
 
-    /// Surface-tab title: the workspace folder's name.
+    /// Surface-tab title: the Working Directory folder's name.
     pub fn tab_title(&self) -> SharedString {
         self.root
             .as_deref()
@@ -138,7 +138,7 @@ impl FileExplorer {
         };
         let target = self.desired_target(cx);
         if self.root == root && self.target == target {
-            // Same workspace — just make sure the root listing was requested.
+            // Same Working Directory — just make sure the root listing was requested.
             if let Some(root) = self.root.clone()
                 && !self.listings.contains_key(&root)
             {
@@ -323,7 +323,7 @@ impl FileExplorer {
             let result = engine
                 .client()
                 .call(
-                    methods::READ_WORKSPACE_FILE,
+                    methods::READ_WORKING_DIRECTORY_FILE,
                     serde_json::Value::Object(params),
                 )
                 .await;
@@ -333,7 +333,7 @@ impl FileExplorer {
                     return;
                 }
                 match result {
-                    Ok(value) => match serde_json::from_value::<WorkspaceFileText>(value) {
+                    Ok(value) => match serde_json::from_value::<WorkingDirectoryFileText>(value) {
                         Ok(file) => this.set_file(path, file, cx),
                         Err(err) => this.file = Loadable::Error(err.to_string()),
                     },
@@ -345,7 +345,7 @@ impl FileExplorer {
         }));
     }
 
-    fn set_file(&mut self, path: String, file: WorkspaceFileText, cx: &mut Context<Self>) {
+    fn set_file(&mut self, path: String, file: WorkingDirectoryFileText, cx: &mut Context<Self>) {
         if let Some(text) = &file.text {
             self.lines = text
                 .lines()
@@ -395,7 +395,7 @@ impl FileExplorer {
     // ── Chrome ──────────────────────────────────────────────────────────────
 
     /// The 36px header-row contents the shell mounts above the pane: the open
-    /// file's workspace-relative path (else the root path) + refresh.
+    /// file's Working Directory-relative path (else the root path) + refresh.
     pub fn render_header_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let label = match (&self.open_path, &self.root) {
@@ -663,7 +663,7 @@ impl Render for FileExplorer {
                 .justify_center()
                 .text_size(px(12.0))
                 .text_color(theme.text_faint)
-                .child(SharedString::from("This chat has no workspace folder"));
+                .child(SharedString::from("This session has no working directory"));
         }
         let tree = self.render_tree(&theme, cx);
         let viewer = self.render_viewer(&theme, cx);

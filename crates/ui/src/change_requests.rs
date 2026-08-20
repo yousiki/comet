@@ -1,6 +1,6 @@
 //! In-memory checkout change-request state for desktop views.
 //!
-//! The workspace document remains the source of truth for chats and projects;
+//! The registry document remains the source of truth for chats and projects;
 //! pull-request metadata is host-local, short-lived capability state and is
 //! deliberately never written back into a synced document.
 

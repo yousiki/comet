@@ -10,7 +10,7 @@
 //!    join push the doc's full update log from VV zero (doc_host first-contact
 //!    push), and epoch 2 keeps `DocHost::open` off the s2 discard-and-adopt
 //!    branch that would drop the transcript.
-//!  - registry rows go through `WorkspaceHost::import_chat_row` /
+//!  - registry rows go through `RegistryHost::import_chat_row` /
 //!    `import_space_row` (live upserts: persisted, pushed, watched).
 //!  - attachments are NOT copied or rewritten. Transcripts embed absolute
 //!    paths under the local profile's uploads root, so that root becomes a
@@ -31,12 +31,12 @@ use zeron_sync::DocsStore;
 
 use crate::EngineError;
 use crate::chat2_host::CHAT2_DOC_EPOCH;
+use crate::registry_host::RegistryHost;
 use crate::run_journal::journal_paths;
 use crate::uploads::Uploads;
-use crate::workspace_host::WorkspaceHost;
 
 /// Marker recording completed imports, at `{data_dir}/local-import.json`.
-/// One entry per target (org, user): the same device may sign into several
+/// One entry per target (organization, user): the same device may sign into several
 /// accounts, and each gets its own one-time import.
 const MARKER_FILE: &str = "local-import.json";
 
@@ -58,7 +58,8 @@ struct Marker {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MarkerEntry {
-    org_id: String,
+    #[serde(alias = "orgId")]
+    organization_id: String,
     user_id: String,
     imported_at_ms: i64,
     imported_chats: usize,
@@ -69,11 +70,11 @@ struct MarkerEntry {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalImportStatus {
-    /// Chats in the local profile with no row in this synced workspace yet.
+    /// Chats in the local profile with no row in this synced registry yet.
     pub available_chats: usize,
-    /// Spaces in the local profile with no row in this synced workspace yet.
+    /// Spaces in the local profile with no row in this synced registry yet.
     pub available_spaces: usize,
-    /// A completed import for this (org, user) is already on record.
+    /// A completed import for this (organization, user) is already on record.
     pub imported_before: bool,
 }
 
@@ -119,11 +120,11 @@ pub struct LocalImporter {
 struct ImporterInner {
     data_dir: PathBuf,
     device_id: String,
-    org_id: String,
+    organization_id: String,
     user_id: String,
     target_store: Arc<DocsStore>,
     target_journals: PathBuf,
-    workspace: WorkspaceHost,
+    registry: RegistryHost,
     uploads: Uploads,
 }
 
@@ -132,22 +133,22 @@ impl LocalImporter {
     pub fn new(
         data_dir: &Path,
         device_id: &str,
-        org_id: &str,
+        organization_id: &str,
         user_id: &str,
         target_store: Arc<DocsStore>,
         target_journals: PathBuf,
-        workspace: WorkspaceHost,
+        registry: RegistryHost,
         uploads: Uploads,
     ) -> Self {
         Self {
             inner: Arc::new(ImporterInner {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
-                org_id: org_id.to_string(),
+                organization_id: organization_id.to_string(),
                 user_id: user_id.to_string(),
                 target_store,
                 target_journals,
-                workspace,
+                registry,
                 uploads,
             }),
         }
@@ -192,10 +193,9 @@ impl LocalImporter {
 
     fn imported_before(&self) -> bool {
         let _guard = marker_lock();
-        self.load_marker_locked()
-            .imports
-            .iter()
-            .any(|e| e.org_id == self.inner.org_id && e.user_id == self.inner.user_id)
+        self.load_marker_locked().imports.iter().any(|e| {
+            e.organization_id == self.inner.organization_id && e.user_id == self.inner.user_id
+        })
     }
 
     /// Record a completed import and re-arm the read-only uploads root for
@@ -210,11 +210,11 @@ impl LocalImporter {
     fn record_import(&self, chats: usize, spaces: usize) -> Result<(), EngineError> {
         let _guard = marker_lock();
         let mut marker = self.load_marker_locked();
-        marker
-            .imports
-            .retain(|e| !(e.org_id == self.inner.org_id && e.user_id == self.inner.user_id));
+        marker.imports.retain(|e| {
+            !(e.organization_id == self.inner.organization_id && e.user_id == self.inner.user_id)
+        });
         marker.imports.push(MarkerEntry {
-            org_id: self.inner.org_id.clone(),
+            organization_id: self.inner.organization_id.clone(),
             user_id: self.inner.user_id.clone(),
             imported_at_ms: crate::now_ms(),
             imported_chats: chats,
@@ -266,13 +266,13 @@ impl LocalImporter {
         };
         let mut available_chats = 0;
         for chat in registry.read_chats()? {
-            if self.inner.workspace.chat(&chat.id)?.is_none() {
+            if self.inner.registry.chat(&chat.id)?.is_none() {
                 available_chats += 1;
             }
         }
         let mut available_spaces = 0;
         for space in registry.read_spaces()? {
-            if self.inner.workspace.space(&space.id)?.is_none() {
+            if self.inner.registry.space(&space.id)?.is_none() {
                 available_spaces += 1;
             }
         }
@@ -312,11 +312,11 @@ impl LocalImporter {
         let (total_chats, total_spaces) = (chats.len(), spaces.len());
         let pending_chats: Vec<_> = chats
             .into_iter()
-            .filter(|chat| !matches!(self.inner.workspace.chat(&chat.id), Ok(Some(_))))
+            .filter(|chat| !matches!(self.inner.registry.chat(&chat.id), Ok(Some(_))))
             .collect();
         let pending_spaces: Vec<_> = spaces
             .into_iter()
-            .filter(|space| !matches!(self.inner.workspace.space(&space.id), Ok(Some(_))))
+            .filter(|space| !matches!(self.inner.registry.space(&space.id), Ok(Some(_))))
             .collect();
         let skipped_chats = total_chats - pending_chats.len();
         let skipped_spaces = total_spaces - pending_spaces.len();
@@ -328,9 +328,9 @@ impl LocalImporter {
 
         let mut imported_spaces = 0;
         for space in &pending_spaces {
-            match self.inner.workspace.import_space_row(space) {
+            match self.inner.registry.import_space_row(space) {
                 Ok(()) => imported_spaces += 1,
-                Err(err) => errors.push(format!("space {}: {err}", space.id)),
+                Err(err) => errors.push(format!("Project {}: {err}", space.id)),
             }
         }
 
@@ -431,7 +431,7 @@ impl LocalImporter {
         // s2 adopt branch.
         let mut row = chat.clone();
         row.room_gen = Some(CHAT2_DOC_EPOCH);
-        self.inner.workspace.import_chat_row(&row)?;
+        self.inner.registry.import_chat_row(&row)?;
         Ok(copied)
     }
 }
@@ -468,17 +468,21 @@ mod tests {
     }
 }
 
-/// Whether a recorded import grants the synced profile `(org, user)` the local
+/// Whether a recorded import grants the synced profile `(organization, user)` the local
 /// profile's uploads root as a read-only jail root. `EngineCore::assemble`
 /// calls this on every account-scoped boot.
-pub fn marker_grants_read_root(data_dir: &Path, org_id: &str, user_id: &str) -> Option<PathBuf> {
+pub fn marker_grants_read_root(
+    data_dir: &Path,
+    organization_id: &str,
+    user_id: &str,
+) -> Option<PathBuf> {
     let marker: Marker = std::fs::read_to_string(data_dir.join(MARKER_FILE))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())?;
     let hit = marker
         .imports
         .iter()
-        .any(|e| e.org_id == org_id && e.user_id == user_id);
+        .any(|e| e.organization_id == organization_id && e.user_id == user_id);
     let uploads = data_dir.join("profiles").join("local").join("uploads");
     (hit && uploads.is_dir()).then_some(uploads)
 }

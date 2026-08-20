@@ -367,7 +367,7 @@ async fn checkout_change_request_stream_matches_locally_and_through_device_routi
 
     let mut core_b = assemble(&dirs.path().join("b"), "device-b");
     core_b
-        .workspace
+        .registry
         .create_space(
             "space-pr",
             "device-b",
@@ -713,7 +713,7 @@ async fn terminal_stream_proxies_over_the_relay() {
     // terminal cwd.
     let core_b = assemble(&dirs.path().join("b"), "device-b");
     core_b
-        .workspace
+        .registry
         .create_space(
             "space-term",
             "device-b",
@@ -723,7 +723,7 @@ async fn terminal_stream_proxies_over_the_relay() {
         )
         .expect("space row on B");
     core_b
-        .workspace
+        .registry
         .create_chat("chat-term", Some("space-term"), None, None, None)
         .expect("chat row on B");
     let _host = core_b.start_host_relay(&relay_url, Arc::new(StaticToken("test-user".into())));

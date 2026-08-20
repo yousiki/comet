@@ -1,4 +1,4 @@
-// App session root: sign-in state machine, workspace connection, and the
+// App session root: sign-in state machine, Organization registry connection, and the
 // per-chat session store cache. Also hosts demo mode — an offline in-memory
 // dataset so the UI can be exercised without an edge deployment.
 
@@ -13,12 +13,12 @@ import os
 final class AppModel {
     enum Phase {
         case signedOut
-        case pickingOrg(AuthTokens, [AuthOrg])
+        case pickingOrganization(AuthTokens, [AuthOrganization])
         case ready
     }
 
     var phase: Phase = .signedOut
-    var workspace: WorkspaceStore?
+    var registry: RegistryStore?
     var demo: DemoDataset?
     private var sessionStores: [String: SessionStore] = [:]
     private var config: AppConfig?
@@ -29,7 +29,9 @@ final class AppModel {
     @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = "https://edge.siki.moe"
     @ObservationIgnored @AppStorage("authMode") var authModeRaw = AppConfig.Mode.workos.rawValue
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
-    @ObservationIgnored @AppStorage("orgId") var storedOrgId = ""
+    // Preserve the historical `orgId` defaults key so existing sign-ins keep
+    // their selected Organization across this terminology migration.
+    @ObservationIgnored @AppStorage("orgId") var storedOrganizationId = ""
     @ObservationIgnored @AppStorage("deviceId") var storedDeviceId = ""
 
     var deviceId: String {
@@ -68,7 +70,8 @@ final class AppModel {
         override("-setedge") { edgeURLString = $0 }
         override("-setmode") { authModeRaw = $0 }
         override("-setuser") { storedUserId = $0 }
-        override("-setorg") { storedOrgId = $0 }
+        // `-setorg` is a legacy e2e launch argument and remains stable.
+        override("-setorg") { storedOrganizationId = $0 }
         // Simulator rig: seed WorkOS tokens straight into the keychain (the
         // ASWebAuthenticationSession flow can't be driven headlessly).
         override("-setaccess") { Keychain.save($0, key: "accessToken") }
@@ -162,63 +165,71 @@ final class AppModel {
             return
         }
         startPathMonitor()
-        guard let url = URL(string: edgeURLString), !storedUserId.isEmpty, !storedOrgId.isEmpty else {
+        guard let url = URL(string: edgeURLString),
+              !storedUserId.isEmpty,
+              !storedOrganizationId.isEmpty else {
             return
         }
         let mode = AppConfig.Mode(rawValue: authModeRaw) ?? .workos
         switch mode {
         case .dev:
-            connect(url: url, mode: .dev, userId: storedUserId, orgId: storedOrgId,
-                    tokens: nil, devBearer: devBearer(userId: storedUserId, orgId: storedOrgId))
+            connect(url: url, mode: .dev, userId: storedUserId,
+                    organizationId: storedOrganizationId, tokens: nil,
+                    devBearer: devBearer(userId: storedUserId,
+                                         organizationId: storedOrganizationId))
         case .workos:
             guard let access = Keychain.load(key: "accessToken"),
                   let refresh = Keychain.load(key: "refreshToken") else { return }
-            connect(url: url, mode: .workos, userId: storedUserId, orgId: storedOrgId,
+            connect(url: url, mode: .workos, userId: storedUserId,
+                    organizationId: storedOrganizationId,
                     tokens: AuthTokens(accessToken: access, refreshToken: refresh), devBearer: nil)
         }
     }
 
     // MARK: Sign-in flows
 
-    /// WorkOS paste-code exchange. Returns the org list for the picker (or
-    /// connects straight away when exactly one org exists).
+    /// WorkOS paste-code exchange. Returns the Organization list for the picker
+    /// (or connects straight away when exactly one Organization exists).
     func signIn(edgeURL: URL, code: String) async throws {
         let client = AuthClient(baseURL: edgeURL)
         let (user, tokens) = try await client.exchange(code: code)
         edgeURLString = edgeURL.absoluteString
         authModeRaw = AppConfig.Mode.workos.rawValue
         storedUserId = user.id
-        let orgs = try await client.orgs(accessToken: tokens.accessToken)
-        if let only = orgs.first, orgs.count == 1 {
-            try await selectOrg(only, tokens: tokens)
-        } else if orgs.isEmpty {
-            throw AuthError.http(403, "No organizations for this account")
+        let organizations = try await client.organizations(accessToken: tokens.accessToken)
+        if let only = organizations.first, organizations.count == 1 {
+            try await selectOrganization(only, tokens: tokens)
+        } else if organizations.isEmpty {
+            throw AuthError.http(403, "No Organizations for this account")
         } else {
-            phase = .pickingOrg(tokens, orgs)
+            phase = .pickingOrganization(tokens, organizations)
         }
     }
 
-    func selectOrg(_ org: AuthOrg, tokens: AuthTokens) async throws {
+    func selectOrganization(_ organization: AuthOrganization, tokens: AuthTokens) async throws {
         guard let url = URL(string: edgeURLString) else { return }
-        // Re-scope the access token to the org (adds the org_id claim).
+        // Re-scope the access token to the Organization. `org_id` is the WorkOS
+        // wire claim and intentionally remains unchanged.
         let client = AuthClient(baseURL: url)
         let scoped = try await client.refresh(refreshToken: tokens.refreshToken,
-                                              organizationId: org.organizationId)
+                                              organizationId: organization.organizationId)
         Keychain.save(scoped.accessToken, key: "accessToken")
         Keychain.save(scoped.refreshToken, key: "refreshToken")
-        storedOrgId = org.organizationId
-        connect(url: url, mode: .workos, userId: storedUserId, orgId: org.organizationId,
+        storedOrganizationId = organization.organizationId
+        connect(url: url, mode: .workos, userId: storedUserId,
+                organizationId: organization.organizationId,
                 tokens: scoped, devBearer: nil)
     }
 
-    /// Dev-mode edge (AUTH_MODE=dev): bearer = "userId@orgId".
-    func signInDev(edgeURL: URL, userId: String, orgId: String) {
+    /// Dev-mode edge: the legacy test bearer is `userId@organizationId`.
+    func signInDev(edgeURL: URL, userId: String, organizationId: String) {
         edgeURLString = edgeURL.absoluteString
         authModeRaw = AppConfig.Mode.dev.rawValue
         storedUserId = userId
-        storedOrgId = orgId
-        connect(url: edgeURL, mode: .dev, userId: userId, orgId: orgId,
-                tokens: nil, devBearer: devBearer(userId: userId, orgId: orgId))
+        storedOrganizationId = organizationId
+        connect(url: edgeURL, mode: .dev, userId: userId, organizationId: organizationId,
+                tokens: nil,
+                devBearer: devBearer(userId: userId, organizationId: organizationId))
     }
 
     func enterDemoMode() {
@@ -227,8 +238,8 @@ final class AppModel {
     }
 
     func signOut() {
-        workspace?.stop()
-        workspace = nil
+        registry?.stop()
+        registry = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
         config = nil
@@ -237,34 +248,35 @@ final class AppModel {
         Keychain.delete(key: "refreshToken")
         DocDisk.wipeAll()  // local doc state belongs to the signed-in identity
         storedUserId = ""
-        storedOrgId = ""
+        storedOrganizationId = ""
         phase = .signedOut
     }
 
-    private func devBearer(userId: String, orgId: String) -> String {
-        orgId.isEmpty ? userId : "\(userId)@\(orgId)"
+    private func devBearer(userId: String, organizationId: String) -> String {
+        organizationId.isEmpty ? userId : "\(userId)@\(organizationId)"
     }
 
-    private func connect(url: URL, mode: AppConfig.Mode, userId: String, orgId: String,
+    private func connect(url: URL, mode: AppConfig.Mode, userId: String, organizationId: String,
                          tokens: AuthTokens?, devBearer: String?) {
-        let config = AppConfig(edgeURL: url, mode: mode, userId: userId, orgId: orgId,
+        let config = AppConfig(edgeURL: url, mode: mode, userId: userId,
+                               organizationId: organizationId,
                                deviceId: deviceId, deviceName: deviceName,
                                tokens: tokens, devBearer: devBearer)
         self.config = config
-        let store = WorkspaceStore(config: config)
-        workspace = store
+        let store = RegistryStore(config: config)
+        registry = store
         store.start()
         phase = .ready
     }
 
     // MARK: Unified data accessors (demo or live — one path for views)
 
-    var spaces: [Space] { demo?.spaces ?? workspace?.spaces ?? [] }
+    var spaces: [Space] { demo?.spaces ?? registry?.spaces ?? [] }
 
     // "Connected" for the header spinner means "server state has reached this
     // session" — over the socket OR the HTTPS pull (which lands in ~1 RTT and
     // is the only transport airplane wifi permits).
-    var connected: Bool { demo != nil || workspace?.connected == true || workspace?.synced == true }
+    var connected: Bool { demo != nil || registry?.connected == true || registry?.synced == true }
 
     var overviewChats: [Chat] {
         if let demo {
@@ -272,18 +284,18 @@ final class AppModel {
             let live = demo.chats.filter { !$0.archived && $0.spaceId.map(liveIds.contains) == true }
             return sortActive(live)
         }
-        return workspace?.overviewChats ?? []
+        return registry?.overviewChats ?? []
     }
 
     func chats(in spaceId: String) -> [Chat] {
         if let demo {
             return sortActive(demo.chats.filter { !$0.archived && $0.spaceId == spaceId })
         }
-        return workspace?.chats(in: spaceId) ?? []
+        return registry?.chats(in: spaceId) ?? []
     }
 
     func chat(id: String) -> Chat? {
-        (demo?.chats ?? workspace?.chats)?.first { $0.id == id }
+        (demo?.chats ?? registry?.chats)?.first { $0.id == id }
     }
 
     /// state.rs `space_for_chat` — nil for a dangling/missing space_id.
@@ -296,12 +308,12 @@ final class AppModel {
         if let demo {
             return chatIndicator(chat: chat, live: effectiveStatus(demo.sessions[chat.id], now: nowMs()))
         }
-        return workspace?.indicator(for: chat) ?? .idle
+        return registry?.indicator(for: chat) ?? .idle
     }
 
     func changeRequest(for chat: Chat) -> ChangeRequestSummary? {
         if let demo { return demo.changeRequests[chat.id] }
-        return workspace?.changeRequest(for: chat)
+        return registry?.changeRequest(for: chat)
     }
 
     func spaceIndicator(_ spaceId: String) -> ChatIndicator? {
@@ -309,7 +321,7 @@ final class AppModel {
     }
 
     func deviceName(_ deviceId: String) -> String {
-        (demo?.devices ?? workspace?.devices)?.first { $0.id == deviceId }?.name ?? deviceId
+        (demo?.devices ?? registry?.devices)?.first { $0.id == deviceId }?.name ?? deviceId
     }
 
     func deviceOnline(_ deviceId: String) -> Bool {
@@ -317,24 +329,24 @@ final class AppModel {
             guard let seen = demo.devices.first(where: { $0.id == deviceId })?.lastSeenAt else { return false }
             return nowMs() - seen < presenceFreshMs
         }
-        return workspace?.deviceOnline(deviceId) ?? false
+        return registry?.deviceOnline(deviceId) ?? false
     }
 
-    /// Live harness catalog from the space's owning device (Settings → Agents
+    /// Live harness catalog from the Project's owning device (Settings → Agents
     /// gates which agents a device offers); static pair when unreachable.
     func listHarnesses(space: Space) async -> [HarnessInfo] {
         if demo != nil {
             try? await Task.sleep(nanoseconds: 100_000_000)
             return HarnessCatalog.harnesses
         }
-        if let live = await workspace?.listHarnesses(deviceId: space.deviceId),
+        if let live = await registry?.listHarnesses(deviceId: space.deviceId),
            !live.isEmpty {
             return live
         }
         return HarnessCatalog.harnesses
     }
 
-    /// Live model catalog from the space's owning device (the desktop's
+    /// Live model catalog from the Project's owning device (the desktop's
     /// "catalog source = the device that runs the session" rule); static
     /// fallback when the device is unreachable.
     func listModels(space: Space, harness: String) async -> [ModelInfo] {
@@ -342,20 +354,20 @@ final class AppModel {
             try? await Task.sleep(nanoseconds: 100_000_000)
             return HarnessCatalog.models(for: harness)
         }
-        if let live = await workspace?.listModels(deviceId: space.deviceId, harness: harness),
+        if let live = await registry?.listModels(deviceId: space.deviceId, harness: harness),
            !live.isEmpty {
             return live
         }
         return HarnessCatalog.models(for: harness)
     }
 
-    /// Refs of the space's repo (git spaces only).
+    /// Refs of the Project's repository (git-backed Projects only).
     func listRefs(space: Space) async -> [RepoRef]? {
         if let demo {
             try? await Task.sleep(nanoseconds: 120_000_000)
             return demo.listRefs(spacePath: space.path)
         }
-        return await workspace?.listRefs(deviceId: space.deviceId, repoPath: space.path)
+        return await registry?.listRefs(deviceId: space.deviceId, repoPath: space.path)
     }
 
     /// Draft-mode checkout switch: `git checkout` in the SPACE's folder.
@@ -366,8 +378,8 @@ final class AppModel {
             demo.switchRef(path: space.path, refName: refName)
             return nil
         }
-        guard let workspace else { return "Not connected" }
-        return await workspace.switchRef(deviceId: space.deviceId,
+        guard let registry else { return "Not connected" }
+        return await registry.switchRef(deviceId: space.deviceId,
                                          repoPath: space.path, refName: refName)
     }
 
@@ -375,7 +387,7 @@ final class AppModel {
     /// ref's existing worktree (row writes, no git), else checkout in the
     /// session's own cwd on the host. Returns an error message or nil.
     func switchSessionRef(chat: Chat, ref: RepoRef) async -> String? {
-        guard let cwd = chat.cwd else { return "Session has no working folder" }
+        guard let cwd = chat.cwd else { return "Session has no working directory" }
         if let worktree = ref.worktreePath {
             if worktree == cwd { return nil }  // already here
             if let demo {
@@ -385,7 +397,7 @@ final class AppModel {
                 }
                 return nil
             }
-            workspace?.setChatCheckout(chatId: chat.id, cwd: worktree, branch: ref.name)
+            registry?.setChatCheckout(chatId: chat.id, cwd: worktree, branch: ref.name)
             return nil
         }
         if let demo {
@@ -396,13 +408,13 @@ final class AppModel {
             }
             return nil
         }
-        guard let workspace else { return "Not connected" }
-        let error = await workspace.switchRef(deviceId: chat.deviceId,
+        guard let registry else { return "Not connected" }
+        let error = await registry.switchRef(deviceId: chat.deviceId,
                                               repoPath: cwd, refName: ref.name)
         if error == nil {
             // The host's HEAD watcher reconciles chat.branch eventually;
             // stamp it optimistically so the UI answers immediately.
-            workspace.setChatCheckout(chatId: chat.id, cwd: cwd, branch: ref.name)
+            registry.setChatCheckout(chatId: chat.id, cwd: cwd, branch: ref.name)
         }
         return error
     }
@@ -413,7 +425,7 @@ final class AppModel {
             try? await Task.sleep(nanoseconds: 250_000_000)
             return demo.createWorktree(spacePath: space.path, base: base)
         }
-        return await workspace?.createWorktree(deviceId: space.deviceId,
+        return await registry?.createWorktree(deviceId: space.deviceId,
                                                repoPath: space.path, branch: base)
     }
 
@@ -428,10 +440,10 @@ final class AppModel {
                                    createdAt: nowMs(), spaceId: space.id, lastSeenAt: nowMs()))
             return id
         }
-        return workspace?.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
+        return registry?.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
     }
 
-    /// Browse folders on a remote device (the desktop add-space palette's data
+    /// Browse folders on a remote device (the desktop Add Project palette's data
     /// path). Demo mode serves a canned tree; live mode asks the device over
     /// the relay.
     func listFolders(deviceId: String, path: String?) async -> FolderListing? {
@@ -440,7 +452,7 @@ final class AppModel {
             let target = path ?? demo.homePath(deviceId: deviceId)
             return demo.listFolders(deviceId: deviceId, path: target)
         }
-        return await workspace?.listFolders(deviceId: deviceId, path: path)
+        return await registry?.listFolders(deviceId: deviceId, path: path)
     }
 
     @discardableResult
@@ -455,7 +467,7 @@ final class AppModel {
                                      createdAt: nowMs()))
             return id
         }
-        return await workspace?.createSpace(deviceId: deviceId, path: path, gitDetected: gitDetected)
+        return await registry?.createSpace(deviceId: deviceId, path: path, gitDetected: gitDetected)
     }
 
     /// Archived chats under the same scope as the list above the shelf.
@@ -465,7 +477,7 @@ final class AppModel {
                 $0.archived && (spaceId == nil || $0.spaceId == spaceId)
             })
         }
-        return workspace?.archivedChats(in: spaceId) ?? []
+        return registry?.archivedChats(in: spaceId) ?? []
     }
 
     func archive(chatId: String) { setArchived(chatId: chatId, archived: true) }
@@ -478,7 +490,7 @@ final class AppModel {
             }
             return
         }
-        workspace?.setArchived(chatId: chatId, archived: archived)
+        registry?.setArchived(chatId: chatId, archived: archived)
     }
 
     func setChatConfig(chatId: String, config: ChatConfig) {
@@ -488,7 +500,7 @@ final class AppModel {
             }
             return
         }
-        workspace?.setChatConfig(chatId: chatId, config: config)
+        registry?.setChatConfig(chatId: chatId, config: config)
     }
 
     func markSeen(chatId: String) {
@@ -498,17 +510,17 @@ final class AppModel {
             }
             return
         }
-        workspace?.markSeen(chatId: chatId)
+        registry?.markSeen(chatId: chatId)
     }
 
     /// Persist every open doc now (app backgrounding).
     func flushDocs() {
-        workspace?.flushToDisk()
+        registry?.flushToDisk()
         sessionStores.values.forEach { $0.flushToDisk() }
     }
 
     /// Foreground hook: kick every room NOW (see ChatRoomClient.kick) — after
-    /// a suspension the workspace room in particular stayed dead while chat
+    /// a suspension the registry room in particular stayed dead while chat
     /// views reconnected on open, freezing sidebar rows and Working
     /// indicators against perfectly live transcripts (2026-08-04).
     func foregrounded() {
@@ -516,15 +528,15 @@ final class AppModel {
     }
 
     private func kickAllRooms() {
-        workspace?.kickRoom()
+        registry?.kickRoom()
         // Deliver any roomGen flips that landed while the store had no open
         // view, then kick every room — registry first and instantly, chat
         // rooms trickled one per 200ms in attention order. Post-suspend and
         // path-recovery kicks redial dead sockets; a simultaneous N-socket
         // redial competed with the registry (the sidebar the user is
         // actually looking at) on thin links.
-        if let workspace {
-            for chat in workspace.chats {
+        if let registry {
+            for chat in registry.chats {
                 sessionStores[chat.id]?.updateRoomGen(chat.roomGen)
             }
         }
@@ -648,7 +660,7 @@ final class AppModel {
                 // connect spinner from ~1.5s to ~7s (NLC Edge, 2026-08-17).
                 // An open view still dials instantly via releaseDial.
                 let start = DispatchTime.now()
-                while !(self.workspace?.connected ?? false),
+                while !(self.registry?.connected ?? false),
                       DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds < 10_000_000_000 {
                     try? await Task.sleep(nanoseconds: 200_000_000)
                 }

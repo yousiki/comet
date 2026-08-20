@@ -5,7 +5,7 @@
 //! - [`ChatClient`]: joins a ChatRoom DO (`wss://…/chat2/{chatId}/ws?token=`),
 //!   catches up via checkpoint + row backfill, pushes local loro updates as
 //!   rows, and reconnects with exponential backoff.
-//! - [`RegistryClient`]: the per-profile workspace registry room (sidebar rows,
+//! - [`RegistryClient`]: the per-profile registry room (sidebar rows,
 //!   presence).
 //! - [`DocsStore`]: snapshot persistence (the doc IS the outbox — commands + user entries
 //!   flush immediately) and the processed-command ledger with mark-BEFORE-execute semantics.

@@ -3,9 +3,9 @@
 import { randomUUID } from "node:crypto";
 
 const base = process.env.EDGE_URL ?? "http://127.0.0.1:8787";
-const org = "pporg";
+const organizationId = "pporg";
 const user = "ppuser";
-const token = `${user}@${org}`;
+const token = `${user}@${organizationId}`;
 const chatId = randomUUID();
 const device = "pp-dev-a";
 let failures = 0;
@@ -28,7 +28,7 @@ const auth = { authorization: `Bearer ${token}` };
     hlc,
     set: { id: "pp-chat-1", deviceId: device, title: "pull push check", createdAt: now }
   };
-  const res = await fetch(`${base}/registry/${org}/push?device=${device}`, {
+  const res = await fetch(`${base}/registry/${organizationId}/push?device=${device}`, {
     method: "POST",
     headers: { ...auth, "content-type": "application/json" },
     body: JSON.stringify({ batch: "pp-batch-1", ops: [op] })
@@ -39,7 +39,7 @@ const auth = { authorization: `Bearer ${token}` };
   } else ok(`registry push acked seq=${ack.seq} applied=${ack.applied}`);
 
   // replay: LWW no-op, still acked
-  const replay = await fetch(`${base}/registry/${org}/push?device=${device}`, {
+  const replay = await fetch(`${base}/registry/${organizationId}/push?device=${device}`, {
     method: "POST",
     headers: { ...auth, "content-type": "application/json" },
     body: JSON.stringify({ batch: "pp-batch-1", ops: [op] })
@@ -50,7 +50,7 @@ const auth = { authorization: `Bearer ${token}` };
   } else ok("registry push replay is a no-op");
 
   const full = await (
-    await fetch(`${base}/registry/${org}/rows?device=${device}&beat=1`, { headers: auth })
+    await fetch(`${base}/registry/${organizationId}/rows?device=${device}&beat=1`, { headers: auth })
   ).json();
   if (!full.full || !Array.isArray(full.rows) || full.rows.length < 1) {
     fail(`registry pull full: ${JSON.stringify(full).slice(0, 200)}`);
@@ -59,7 +59,7 @@ const auth = { authorization: `Bearer ${token}` };
   else ok("pull beat recorded presence");
 
   const delta = await (
-    await fetch(`${base}/registry/${org}/rows?since=${full.seq}`, { headers: auth })
+    await fetch(`${base}/registry/${organizationId}/rows?since=${full.seq}`, { headers: auth })
   ).json();
   if (delta.full !== false || delta.rows.length !== 0) {
     fail(`registry pull at head should be an empty delta: ${JSON.stringify(delta).slice(0, 200)}`);

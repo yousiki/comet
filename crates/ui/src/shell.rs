@@ -23,7 +23,7 @@ use gpui::{
 
 use gpui_tokio::Tokio;
 use zeron_engine::InstanceLock;
-use zeron_proto::{AuthState, EngineInfo, WorkspaceScope};
+use zeron_proto::{AuthState, EngineInfo, ProfileScope};
 use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
@@ -42,15 +42,18 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
+use crate::settings::organization::{
+    OrganizationMutation, OrganizationMutationKind, OrganizationPage, OrganizationPageEvent,
+};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
-use crate::settings::team::{TeamMutation, TeamMutationKind, TeamPage, TeamPageEvent};
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
-    format_time_ago, org_name_valid, parse_orgs, sort_memberships,
+    AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator,
+    OrganizationRow, call_with_legacy_method, format_time_ago, organization_name_valid,
+    parse_organizations, sort_memberships, subscribe_with_legacy_method,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -189,10 +192,14 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         // traversal. Keep these scoped away from Terminal/PaletteSearch so a
         // literal tab still reaches those controls. Composer's MentionTab
         // binding gets first refusal and propagates when no mention is active.
-        KeyBinding::new("tab", FocusNextControl, Some("TeamMenu")),
-        KeyBinding::new("shift-tab", FocusPreviousControl, Some("TeamMenu")),
-        KeyBinding::new("tab", FocusNextControl, Some("TeamDialog")),
-        KeyBinding::new("shift-tab", FocusPreviousControl, Some("TeamDialog")),
+        KeyBinding::new("tab", FocusNextControl, Some("OrganizationMenu")),
+        KeyBinding::new("shift-tab", FocusPreviousControl, Some("OrganizationMenu")),
+        KeyBinding::new("tab", FocusNextControl, Some("OrganizationDialog")),
+        KeyBinding::new(
+            "shift-tab",
+            FocusPreviousControl,
+            Some("OrganizationDialog"),
+        ),
     ]);
 }
 
@@ -200,8 +207,8 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Devices,
-    /// Shared-workspace management: workspaces, members, roles, invites.
-    Team,
+    /// Organization management: memberships, roles, and invitations.
+    Organization,
     /// Which harnesses the composer offers (enable/disable toggles).
     Harnesses,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
@@ -215,7 +222,7 @@ pub enum SettingsSection {
 impl SettingsSection {
     pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Devices,
-        SettingsSection::Team,
+        SettingsSection::Organization,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
@@ -229,7 +236,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
-            SettingsSection::Team => "Team",
+            SettingsSection::Organization => "Organization",
             SettingsSection::Harnesses => "Agents",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
@@ -550,7 +557,7 @@ enum UpdateFlow {
     Failed(SharedString),
 }
 
-/// Account lifecycle owned by this process. Sign-in on a local workspace
+/// Account lifecycle owned by this process. Sign-in from a local profile
 /// flows through the in-place switch wizard (offer → switch → import → done);
 /// `RestartPending` survives only as the fallback when the in-place swap
 /// fails and a full quit is the safe way out.
@@ -621,13 +628,13 @@ enum AccountMenuAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TeamChangePhase {
-    /// SELECT_ORG has not completed; canceling is still safe.
+enum OrganizationChangePhase {
+    /// SELECT_ORGANIZATION has not completed; canceling is still safe.
     Selecting,
     /// Auth points at the target and the old fixed-profile runtime is being
     /// stopped or its replacement is booting.
     Restarting,
-    /// SELECT_ORG failed, so the current runtime/profile remains coherent.
+    /// SELECT_ORGANIZATION failed, so the current runtime/profile remains coherent.
     SelectFailed,
     /// Auth changed, but the old runtime could not be fully replaced. The app
     /// stays occluded until Retry completes the handoff.
@@ -635,57 +642,57 @@ enum TeamChangePhase {
 }
 
 #[derive(Debug, Clone)]
-struct TeamChange {
+struct OrganizationChange {
     organization_id: Option<String>,
-    /// Set for an externally observed account replacement. Team selection
+    /// Set for an externally observed account replacement. Organization selection
     /// normally keeps the same user, but another viewport may sign in as a
-    /// different user whose membership happens to target the same org.
+    /// different user whose membership happens to target the same Organization.
     expected_user_id: Option<String>,
     label: SharedString,
-    phase: TeamChangePhase,
+    phase: OrganizationChangePhase,
     error: Option<SharedString>,
     /// User mutation that initiated this handoff. External AuthStatus-driven
     /// replacements have no mutation. Keeping the full variant preserves its
     /// kind and makes a pre-RPC failure safely retryable without guessing.
-    mutation: Option<TeamMutation>,
+    mutation: Option<OrganizationMutation>,
     /// Kept across the clean-runtime reconciliation when the unary reply was
     /// lost. Reopening a coherent profile must not silently turn this into a
     /// reported success.
     original_error: Option<SharedString>,
     /// False only when the selection RPC transport disappeared before its
     /// unary reply. The replacement runtime is then a reconciliation probe:
-    /// it may safely reopen either the old or requested Team.
+    /// it may safely reopen either the old or requested Organization.
     selection_confirmed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct TeamHandoffRisk {
+struct OrganizationHandoffRisk {
     live_runs: usize,
     composer: ComposerUnsentRisk,
     pending_sends: usize,
 }
 
-impl TeamHandoffRisk {
+impl OrganizationHandoffRisk {
     fn has_any(self) -> bool {
         self.live_runs > 0 || self.composer.has_any() || self.pending_sends > 0
     }
 }
 
 #[derive(Debug, Clone)]
-struct PendingTeamChange {
-    mutation: TeamMutation,
-    risk: TeamHandoffRisk,
+struct PendingOrganizationChange {
+    mutation: OrganizationMutation,
+    risk: OrganizationHandoffRisk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TeamDialogKeyboardMode {
+enum OrganizationDialogKeyboardMode {
     Pending,
     SelectFailed,
     ReplaceFailed,
     Progress,
 }
 
-impl TeamDialogKeyboardMode {
+impl OrganizationDialogKeyboardMode {
     fn action_count(self) -> usize {
         match self {
             Self::Pending | Self::SelectFailed => 2,
@@ -716,23 +723,23 @@ impl TeamDialogKeyboardMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TeamDialogCommand {
+enum OrganizationDialogCommand {
     None,
     Cancel,
     Primary,
 }
 
-fn reduce_team_dialog_key(
-    mode: TeamDialogKeyboardMode,
+fn reduce_organization_dialog_key(
+    mode: OrganizationDialogKeyboardMode,
     key: &str,
     shift: bool,
     active: usize,
-) -> (usize, TeamDialogCommand) {
+) -> (usize, OrganizationDialogCommand) {
     // Progress dialogs are deliberately inert but still own keyboard focus.
     // Consuming their keys keeps Tab/Enter/Escape from reaching controls
-    // behind the modal while a Team runtime handoff is in flight.
-    if mode == TeamDialogKeyboardMode::Progress {
-        return (0, TeamDialogCommand::None);
+    // behind the modal while an Organization runtime handoff is in flight.
+    if mode == OrganizationDialogKeyboardMode::Progress {
+        return (0, OrganizationDialogCommand::None);
     }
     let count = mode.action_count();
     let active = active.min(count.saturating_sub(1));
@@ -741,19 +748,19 @@ fn reduce_team_dialog_key(
             let delta = if shift { -1 } else { 1 };
             (
                 popover::menu_step(Some(active), count, delta).unwrap_or(0),
-                TeamDialogCommand::None,
+                OrganizationDialogCommand::None,
             )
         }
         "enter" | "space" => (
             active,
             if active == mode.primary_action() {
-                TeamDialogCommand::Primary
+                OrganizationDialogCommand::Primary
             } else {
-                TeamDialogCommand::Cancel
+                OrganizationDialogCommand::Cancel
             },
         ),
-        "escape" if mode.can_cancel() => (active, TeamDialogCommand::Cancel),
-        _ => (active, TeamDialogCommand::None),
+        "escape" if mode.can_cancel() => (active, OrganizationDialogCommand::Cancel),
+        _ => (active, OrganizationDialogCommand::None),
     }
 }
 
@@ -774,7 +781,7 @@ enum RuntimeShutdownWait {
 /// raw Tokio JoinHandle: dropping a GPUI `Tokio::spawn` task aborts its future,
 /// which would leave a half-drained embedded runtime. A raw handle detaches on
 /// drop, and Shell retains it while the handoff is observable.
-struct TeamRuntimeShutdown {
+struct OrganizationRuntimeShutdown {
     status: tokio::sync::watch::Receiver<RuntimeShutdownStatus>,
     _task: tokio::task::JoinHandle<()>,
 }
@@ -782,7 +789,7 @@ struct TeamRuntimeShutdown {
 /// Destructive handoffs use the raw engine state, not the display staleness
 /// heuristic. A quiet tool call or an AwaitingInput run may remain legitimate
 /// well past 45 seconds and must still require explicit confirmation.
-fn live_team_run_count(sessions: &[zeron_proto::Session]) -> usize {
+fn live_organization_run_count(sessions: &[zeron_proto::Session]) -> usize {
     sessions
         .iter()
         .filter(|session| {
@@ -802,77 +809,86 @@ struct RuntimeProfileIdentity {
     organization_id: String,
 }
 
-/// Keep the active workspace at the top while preserving the existing
+/// Keep the active Organization at the top while preserving the existing
 /// case-insensitive order for every other membership.
-fn teams_current_first(mut orgs: Vec<OrgRow>, current: Option<&str>) -> Vec<OrgRow> {
-    let Some(current) = current else { return orgs };
-    if let Some(index) = orgs.iter().position(|org| org.organization_id == current)
+fn organizations_current_first(
+    mut organizations: Vec<OrganizationRow>,
+    current: Option<&str>,
+) -> Vec<OrganizationRow> {
+    let Some(current) = current else {
+        return organizations;
+    };
+    if let Some(index) = organizations
+        .iter()
+        .position(|organization| organization.organization_id == current)
         && index != 0
     {
-        let active = orgs.remove(index);
-        orgs.insert(0, active);
+        let active = organizations.remove(index);
+        organizations.insert(0, active);
     }
-    orgs
+    organizations
 }
 
 #[derive(Debug, Clone, Copy)]
-enum TeamRuntimeExpectation<'a> {
+enum OrganizationRuntimeExpectation<'a> {
     /// A transport-ambiguous mutation is reopening the durable state only; any
     /// AuthStatus proves the old fixed-profile runtime is gone.
     Any,
-    ExactOrg(&'a str),
+    ExactOrganization(&'a str),
     ExactProfile {
         organization_id: &'a str,
         user_id: &'a str,
     },
-    /// The final Team was deleted. Accepting an arbitrary signed-in profile
+    /// The final Organization was deleted. Accepting an arbitrary signed-in profile
     /// here would hide a stale session.json resurrection.
     SignedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AmbiguousTeamRuntimeOutcome {
+enum AmbiguousOrganizationRuntimeOutcome {
     RequestedProfile(RuntimeProfileIdentity),
     OtherProfile(RuntimeProfileIdentity),
     SignedOut,
     NeedsOrganization,
 }
 
-/// Resolve the durable auth result after a Team-selection RPC lost its unary
-/// reply. Only a signed-in, non-target profile proves that an ordinary Team is
+/// Resolve the durable auth result after an Organization-selection RPC lost its unary
+/// reply. Only a signed-in, non-target profile proves that an ordinary Organization is
 /// safely open and can offer a selection retry. Fail-closed auth outcomes need
-/// their own lifecycle handling instead of being mislabeled as the old Team.
-fn classify_ambiguous_team_runtime(
+/// their own lifecycle handling instead of being mislabeled as the old Organization.
+fn classify_ambiguous_organization_runtime(
     auth: &AuthState,
     requested_organization_id: &str,
-) -> AmbiguousTeamRuntimeOutcome {
+) -> AmbiguousOrganizationRuntimeOutcome {
     match auth {
         AuthState::SignedIn {
             user,
-            org_id: Some(organization_id),
+            organization_id: Some(organization_id),
         } => {
             let profile = RuntimeProfileIdentity {
                 user_id: user.id.clone(),
                 organization_id: organization_id.clone(),
             };
             if organization_id == requested_organization_id {
-                AmbiguousTeamRuntimeOutcome::RequestedProfile(profile)
+                AmbiguousOrganizationRuntimeOutcome::RequestedProfile(profile)
             } else {
-                AmbiguousTeamRuntimeOutcome::OtherProfile(profile)
+                AmbiguousOrganizationRuntimeOutcome::OtherProfile(profile)
             }
         }
-        AuthState::SignedOut => AmbiguousTeamRuntimeOutcome::SignedOut,
-        AuthState::NeedsOrganization { .. } | AuthState::SignedIn { org_id: None, .. } => {
-            AmbiguousTeamRuntimeOutcome::NeedsOrganization
-        }
+        AuthState::SignedOut => AmbiguousOrganizationRuntimeOutcome::SignedOut,
+        AuthState::NeedsOrganization { .. }
+        | AuthState::SignedIn {
+            organization_id: None,
+            ..
+        } => AmbiguousOrganizationRuntimeOutcome::NeedsOrganization,
     }
 }
 
-/// An RPC error never proves that Team selection left durable auth unchanged:
+/// An RPC error never proves that Organization selection left durable auth unchanged:
 /// Engine-level `Failed` covers both a definite rejection and fail-closed
 /// ambiguous refresh outcomes. Only an AuthStatus that has already published
 /// the exact target can upgrade the subsequent reopen to a confirmed switch.
-fn team_selection_error_is_confirmed(
+fn organization_selection_error_is_confirmed(
     current_organization_id: Option<&str>,
     requested_organization_id: &str,
 ) -> bool {
@@ -882,102 +898,112 @@ fn team_selection_error_is_confirmed(
 /// Extract the durable target promised by a successful mutation reply. A
 /// malformed success is treated exactly like a lost reply: auth may already
 /// have moved, so the fixed-profile runtime still has to be reconciled.
-fn confirmed_team_mutation_target(
-    mutation: &TeamMutation,
+fn confirmed_organization_mutation_target(
+    mutation: &OrganizationMutation,
     value: &serde_json::Value,
 ) -> Result<Option<String>, String> {
     match mutation {
-        TeamMutation::Select {
+        OrganizationMutation::Select {
             organization_id, ..
         } => Ok(Some(organization_id.clone())),
-        TeamMutation::Create { .. } => value
+        OrganizationMutation::Create { .. } => value
             .get("organizationId")
             .and_then(|value| value.as_str())
             .filter(|organization_id| !organization_id.is_empty())
             .map(|organization_id| Some(organization_id.to_string()))
-            .ok_or_else(|| "Create Team returned no organizationId".to_string()),
-        TeamMutation::Delete { .. } => match value.get("action").and_then(|value| value.as_str()) {
-            Some("signedOut") => Ok(None),
-            Some("switched") => value
-                .get("organizationId")
-                .and_then(|value| value.as_str())
-                .filter(|organization_id| !organization_id.is_empty())
-                .map(|organization_id| Some(organization_id.to_string()))
-                .ok_or_else(|| "Delete Team switched without an organizationId".to_string()),
-            _ => Err("Delete Team returned an unknown outcome".to_string()),
-        },
+            .ok_or_else(|| "Create Organization returned no organizationId".to_string()),
+        OrganizationMutation::Delete { .. } => {
+            match value.get("action").and_then(|value| value.as_str()) {
+                Some("signedOut") => Ok(None),
+                Some("switched") => value
+                    .get("organizationId")
+                    .and_then(|value| value.as_str())
+                    .filter(|organization_id| !organization_id.is_empty())
+                    .map(|organization_id| Some(organization_id.to_string()))
+                    .ok_or_else(|| {
+                        "Delete Organization switched without an organizationId".to_string()
+                    }),
+                _ => Err("Delete Organization returned an unknown outcome".to_string()),
+            }
+        }
     }
 }
 
-fn team_mutation_verb(kind: TeamMutationKind) -> &'static str {
+fn organization_mutation_verb(kind: OrganizationMutationKind) -> &'static str {
     match kind {
-        TeamMutationKind::Select => "switch Team",
-        TeamMutationKind::Create => "create Team",
-        TeamMutationKind::Delete => "delete Team",
+        OrganizationMutationKind::Select => "switch Organization",
+        OrganizationMutationKind::Create => "create Organization",
+        OrganizationMutationKind::Delete => "delete Organization",
     }
 }
 
-fn team_outcome_unknown_notice(change: &TeamChange) -> Option<SharedString> {
+fn organization_outcome_unknown_notice(change: &OrganizationChange) -> Option<SharedString> {
     let mutation = change.mutation.as_ref()?;
     let error = change.original_error.as_ref()?;
     Some(
         format!(
-            "The {} request ended without a confirmed response: {error}. Zeron reopened a safe workspace, but the operation's outcome was unknown. The Team list was refreshed where available; verify it before trying again.",
-            team_mutation_verb(mutation.kind())
+            "The {} request ended without a confirmed response: {error}. Zeron reopened a safe profile, but the operation's outcome was unknown. The Organization list was refreshed where available; verify it before trying again.",
+            organization_mutation_verb(mutation.kind())
         )
         .into(),
     )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SignedOutTeamRuntimeAction {
+enum SignedOutOrganizationRuntimeAction {
     AlreadyLocal,
     ReplaceSyncedWithLocal,
 }
 
-/// A fail-closed Team selection normally makes the very first replacement
+/// A fail-closed Organization selection normally makes the very first replacement
 /// bootstrap choose the local profile. Only a runtime that still reports the
 /// old Synced scope needs another coordinated synced-to-local transition.
-fn signed_out_team_runtime_action(
-    workspace_scope: Option<WorkspaceScope>,
-) -> SignedOutTeamRuntimeAction {
-    if workspace_scope == Some(WorkspaceScope::Synced) {
-        SignedOutTeamRuntimeAction::ReplaceSyncedWithLocal
+fn signed_out_organization_runtime_action(
+    profile_scope: Option<ProfileScope>,
+) -> SignedOutOrganizationRuntimeAction {
+    if profile_scope == Some(ProfileScope::Synced) {
+        SignedOutOrganizationRuntimeAction::ReplaceSyncedWithLocal
     } else {
-        SignedOutTeamRuntimeAction::AlreadyLocal
+        SignedOutOrganizationRuntimeAction::AlreadyLocal
     }
 }
 
 /// `None` means the replacement runtime has not published AuthStatus yet.
 /// Once it has, a confirmed switch must prove the exact durable auth outcome
 /// before the occluding handoff dialog disappears.
-fn validate_team_runtime_auth(
+fn validate_organization_runtime_auth(
     auth: Option<&AuthState>,
-    expected: TeamRuntimeExpectation<'_>,
+    expected: OrganizationRuntimeExpectation<'_>,
 ) -> Option<Result<(), String>> {
     let auth = auth?;
     Some(match expected {
-        TeamRuntimeExpectation::Any => Ok(()),
-        TeamRuntimeExpectation::ExactOrg(expected) => {
+        OrganizationRuntimeExpectation::Any => Ok(()),
+        OrganizationRuntimeExpectation::ExactOrganization(expected) => {
             let actual = match auth {
-                AuthState::SignedIn { org_id, .. } => org_id.as_deref(),
+                AuthState::SignedIn {
+                    organization_id, ..
+                } => organization_id.as_deref(),
                 AuthState::NeedsOrganization { .. } | AuthState::SignedOut => None,
             };
             if actual == Some(expected) {
                 Ok(())
             } else {
                 Err(format!(
-                    "The replacement runtime opened a different Team than expected ({expected})."
+                    "The replacement runtime opened a different Organization than expected ({expected})."
                 ))
             }
         }
-        TeamRuntimeExpectation::ExactProfile {
-            organization_id,
+        OrganizationRuntimeExpectation::ExactProfile {
+            organization_id: expected_organization_id,
             user_id,
         } => {
             let matches = match auth {
-                AuthState::SignedIn { user, org_id } => {
-                    user.id == user_id && org_id.as_deref() == Some(organization_id)
+                AuthState::SignedIn {
+                    user,
+                    organization_id,
+                } => {
+                    user.id == user_id
+                        && organization_id.as_deref() == Some(expected_organization_id)
                 }
                 AuthState::NeedsOrganization { .. } | AuthState::SignedOut => false,
             };
@@ -985,15 +1011,15 @@ fn validate_team_runtime_auth(
                 Ok(())
             } else {
                 Err(format!(
-                    "The replacement runtime opened a different account or Team than expected ({user_id} in {organization_id})."
+                    "The replacement runtime opened a different account or Organization than expected ({user_id} in {expected_organization_id})."
                 ))
             }
         }
-        TeamRuntimeExpectation::SignedOut => {
+        OrganizationRuntimeExpectation::SignedOut => {
             if matches!(auth, AuthState::SignedOut) {
                 Ok(())
             } else {
-                Err("The deleted Team's session was still active after reopening.".into())
+                Err("The deleted Organization's session was still active after reopening.".into())
             }
         }
     })
@@ -1003,24 +1029,27 @@ fn runtime_profile_identity(auth: Option<&AuthState>) -> Option<RuntimeProfileId
     match auth? {
         AuthState::SignedIn {
             user,
-            org_id: Some(organization_id),
+            organization_id: Some(organization_id),
         } => Some(RuntimeProfileIdentity {
             user_id: user.id.clone(),
             organization_id: organization_id.clone(),
         }),
-        AuthState::SignedIn { org_id: None, .. }
+        AuthState::SignedIn {
+            organization_id: None,
+            ..
+        }
         | AuthState::NeedsOrganization { .. }
         | AuthState::SignedOut => None,
     }
 }
 
 /// The data-plane profile is announced by EngineInfo when the runtime opens
-/// its stores. Unlike AuthStatus, it never follows a Team selection in place.
+/// its stores. Unlike AuthStatus, it never follows an Organization selection in place.
 fn engine_runtime_profile_identity(
     engine_info: Option<&EngineInfo>,
 ) -> Option<RuntimeProfileIdentity> {
     let engine_info = engine_info?;
-    if engine_info.workspace_scope != WorkspaceScope::Synced {
+    if engine_info.profile_scope != ProfileScope::Synced {
         return None;
     }
     let profile = engine_info.profile.as_ref()?;
@@ -1033,22 +1062,25 @@ fn engine_runtime_profile_identity(
 /// A replacement is coherent only when its mutable authentication control
 /// plane describes the immutable profile that actually opened its data plane.
 /// Keep the handoff occluded if a bootstrap probe reconnects to the old daemon
-/// after SELECT_ORG has already published the target AuthStatus.
-fn validate_team_runtime_planes(engine_info: &EngineInfo, auth: &AuthState) -> Result<(), String> {
+/// after SELECT_ORGANIZATION has already published the target AuthStatus.
+fn validate_organization_runtime_planes(
+    engine_info: &EngineInfo,
+    auth: &AuthState,
+) -> Result<(), String> {
     match auth {
         AuthState::SignedIn {
             user,
-            org_id: Some(organization_id),
+            organization_id: Some(organization_id),
         } => {
-            if engine_info.workspace_scope != WorkspaceScope::Synced {
+            if engine_info.profile_scope != ProfileScope::Synced {
                 return Err(
-                    "The replacement authentication is signed in, but its runtime did not open a synced Team profile."
+                    "The replacement authentication is signed in, but its runtime did not open a synced Organization profile."
                         .into(),
                 );
             }
             let Some(profile) = engine_runtime_profile_identity(Some(engine_info)) else {
                 return Err(
-                    "The replacement runtime did not announce its fixed Team profile; retry after the old runtime has stopped."
+                    "The replacement runtime did not announce its fixed Organization profile; retry after the old runtime has stopped."
                         .into(),
                 );
             };
@@ -1061,23 +1093,25 @@ fn validate_team_runtime_planes(engine_info: &EngineInfo, auth: &AuthState) -> R
             Ok(())
         }
         AuthState::SignedOut => {
-            if engine_info.workspace_scope == WorkspaceScope::Local {
+            if engine_info.profile_scope == ProfileScope::Local {
                 Ok(())
             } else {
                 Err(
-                    "Authentication is signed out, but the replacement runtime still owns a synced Team profile."
+                    "Authentication is signed out, but the replacement runtime still owns a synced Organization profile."
                         .into(),
                 )
             }
         }
-        AuthState::NeedsOrganization { .. } | AuthState::SignedIn { org_id: None, .. } => {
-            if engine_info.workspace_scope == WorkspaceScope::Synced
-                && engine_info.profile.is_none()
-            {
+        AuthState::NeedsOrganization { .. }
+        | AuthState::SignedIn {
+            organization_id: None,
+            ..
+        } => {
+            if engine_info.profile_scope == ProfileScope::Synced && engine_info.profile.is_none() {
                 Ok(())
             } else {
                 Err(
-                    "Authentication needs a Team, but the replacement runtime still owns another data profile."
+                    "Authentication needs an Organization, but the replacement runtime still owns another data profile."
                         .into(),
                 )
             }
@@ -1087,18 +1121,18 @@ fn validate_team_runtime_planes(engine_info: &EngineInfo, auth: &AuthState) -> R
 
 /// Detect an AuthStatus profile change that this viewport did not initiate. A
 /// missing baseline is first attachment, not a switch: the caller records it
-/// and waits for a later, different user/org pair. Explicit handoffs own their
+/// and waits for a later, different user/Organization pair. Explicit handoffs own their
 /// own reconciliation and must never recursively trigger this path.
-fn external_team_replacement_target(
+fn external_organization_replacement_target(
     baseline: Option<&RuntimeProfileIdentity>,
     connection: &ConnectionStatus,
-    workspace_scope: Option<WorkspaceScope>,
+    profile_scope: Option<ProfileScope>,
     auth: Option<&AuthState>,
     explicit_handoff: bool,
 ) -> Option<RuntimeProfileIdentity> {
     if explicit_handoff
         || !matches!(connection, ConnectionStatus::Ready)
-        || workspace_scope != Some(WorkspaceScope::Synced)
+        || profile_scope != Some(ProfileScope::Synced)
     {
         return None;
     }
@@ -1240,9 +1274,9 @@ fn local_work_phrase(chats: usize, spaces: usize) -> Option<String> {
     }
 }
 
-fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
+fn account_menu_action(scope: Option<ProfileScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
     match scope {
-        Some(WorkspaceScope::Local) => match flow {
+        Some(ProfileScope::Local) => match flow {
             SyncFlow::Idle => Some(AccountMenuAction::EnableSync),
             SyncFlow::Enabling | SyncFlow::Canceling => Some(AccountMenuAction::SyncInProgress),
             SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => {
@@ -1256,7 +1290,7 @@ fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<
             | SyncFlow::SigningOut
             | SyncFlow::SignedOutRestartRequired => None,
         },
-        Some(WorkspaceScope::Synced) => match flow {
+        Some(ProfileScope::Synced) => match flow {
             SyncFlow::SignedOutRestartRequired => None,
             // A pending import failure must stay reachable: this is the only
             // surface that can reopen the retry dialog on a synced runtime.
@@ -1264,17 +1298,17 @@ fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<
             _ if flow.is_switch_lifecycle() => Some(AccountMenuAction::SyncInProgress),
             _ => Some(AccountMenuAction::SignOut),
         },
-        Some(WorkspaceScope::Development) | None => None,
+        Some(ProfileScope::Development) | None => None,
     }
 }
 
 fn sync_flow_after_auth(
     flow: SyncFlow,
-    scope: Option<WorkspaceScope>,
+    scope: Option<ProfileScope>,
     auth: Option<&AuthState>,
 ) -> SyncFlow {
     match scope {
-        Some(WorkspaceScope::Local) => match (flow, auth) {
+        Some(ProfileScope::Local) => match (flow, auth) {
             // The in-place switch owns its own lifecycle once started.
             (flow, _) if flow.is_switch_lifecycle() => flow,
             // AuthStatus belongs to the runtime, not to the Shell that opened
@@ -1288,7 +1322,7 @@ fn sync_flow_after_auth(
             (_, Some(AuthState::SignedIn { .. })) => SyncFlow::SwitchOffer { notice_open: true },
             _ => flow,
         },
-        Some(WorkspaceScope::Synced) => match auth {
+        Some(ProfileScope::Synced) => match auth {
             // AuthStatus is shared by every viewport attached to the runtime.
             // Once a synced store loses its credentials, every Shell must stop:
             // letting another viewport sign in would authenticate a new account
@@ -1302,15 +1336,15 @@ fn sync_flow_after_auth(
                 _ => SyncFlow::Idle,
             },
         },
-        Some(WorkspaceScope::Development) => SyncFlow::Idle,
+        Some(ProfileScope::Development) => SyncFlow::Idle,
         None => flow,
     }
 }
 
-/// The "Create your workspace" gate (feature-inventory §1.2 OrgGate).
-struct OrgGateUi {
+/// The "Create your organization" gate (feature-inventory §1.2 OrganizationGate).
+struct OrganizationGateUi {
     name_input: Entity<ComposerInput>,
-    orgs: Loadable<Vec<OrgRow>>,
+    organizations: Loadable<Vec<OrganizationRow>>,
     submitting: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
@@ -1386,8 +1420,8 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
-    team_page: Option<Entity<TeamPage>>,
-    team_page_sub: Option<Subscription>,
+    organization_page: Option<Entity<OrganizationPage>>,
+    organization_page_sub: Option<Subscription>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
@@ -1431,21 +1465,21 @@ pub struct Shell {
     user_menu_scroll: gpui::ScrollHandle,
     /// Memberships shown directly in the avatar menu. Loaded eagerly once the
     /// synced runtime is ready, and refreshable from the menu on failure.
-    user_menu_orgs: Loadable<Vec<OrgRow>>,
-    user_menu_orgs_task: Option<Task<()>>,
-    /// Coordinated Team switch lifecycle (selection → stop → bootstrap).
-    team_change: Option<TeamChange>,
-    /// Any avatar-menu or Settings Team mutation that would stop work or
+    user_menu_organizations: Loadable<Vec<OrganizationRow>>,
+    user_menu_organizations_task: Option<Task<()>>,
+    /// Coordinated Organization switch lifecycle (selection → stop → bootstrap).
+    organization_change: Option<OrganizationChange>,
+    /// Any avatar-menu or Settings Organization mutation that would stop work or
     /// discard unsent input. No auth RPC begins until the user continues.
-    pending_team_change: Option<PendingTeamChange>,
+    pending_organization_change: Option<PendingOrganizationChange>,
     /// Keyboard focus stays on the modal card while Tab roves its visible
     /// actions. This traps focus inside the profile-isolation safety overlay.
-    team_dialog_focus: FocusHandle,
-    team_dialog_mode: Option<TeamDialogKeyboardMode>,
-    team_dialog_active: usize,
+    organization_dialog_focus: FocusHandle,
+    organization_dialog_mode: Option<OrganizationDialogKeyboardMode>,
+    organization_dialog_active: usize,
     /// Account + organization captured when this fixed-profile runtime first
     /// became Ready. A shared AuthStatus change means another viewport changed
-    /// Team or account, so this viewport must join the runtime handoff too.
+    /// Organization or account, so this viewport must join the runtime handoff too.
     fixed_runtime_profile: Option<RuntimeProfileIdentity>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
@@ -1460,14 +1494,14 @@ pub struct Shell {
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: zeron_update::InstallKind,
-    org: Option<OrgGateUi>,
+    organization_gate: Option<OrganizationGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
     runtime_change_task: Option<Task<()>>,
-    /// Background Team teardown outlives individual UI timeout waiters. Retry
+    /// Background Organization teardown outlives individual UI timeout waiters. Retry
     /// joins this same receiver instead of starting a concurrent shutdown.
-    team_runtime_shutdown: Option<TeamRuntimeShutdown>,
+    organization_runtime_shutdown: Option<OrganizationRuntimeShutdown>,
     runtime_change_error: Option<SharedString>,
     /// The one-time local→synced import stream (switch wizard progress step).
     import_task: Option<Task<()>>,
@@ -1629,7 +1663,7 @@ impl Shell {
         let fixed_runtime_profile = {
             let state = state.read(cx);
             if matches!(state.connection, ConnectionStatus::Ready)
-                && state.workspace_scope == Some(WorkspaceScope::Synced)
+                && state.profile_scope == Some(ProfileScope::Synced)
             {
                 let engine_info = state.engine().map(|engine| engine.engine_info());
                 engine_runtime_profile_identity(engine_info.as_ref())
@@ -1662,7 +1696,7 @@ impl Shell {
         // More capture knobs of the same kind: `ZERON_OPEN_DIALOG=rename|delete`
         // opens that dialog for the first chat once chats land; `=model` pops
         // the combined harness/model menu once the shell is Ready;
-        // `ZERON_FORCE_GATE=signin|org|failed` renders that gate regardless of
+        // `ZERON_FORCE_GATE=signin|organization|failed` renders that gate regardless of
         // real auth state (display-only — for styling passes).
         let debug_dialog = std::env::var("ZERON_OPEN_DIALOG").ok();
         // `ZERON_DEMO_UPLOAD=<pct>:<image path>` fabricates an in-flight image
@@ -1671,7 +1705,9 @@ impl Shell {
         let debug_upload = std::env::var("ZERON_DEMO_UPLOAD").ok();
         let debug_gate = match std::env::var("ZERON_FORCE_GATE").ok().as_deref() {
             Some("signin") => Some(GatePhase::SignIn),
-            Some("org") => Some(GatePhase::OrgGate),
+            Some("organization") => Some(GatePhase::OrganizationGate),
+            // Explicit legacy alias for existing development scripts.
+            Some("org") => Some(GatePhase::OrganizationGate),
             Some("failed") => Some(GatePhase::Failed(
                 "Could not reach the zeron engine on port 27901".into(),
             )),
@@ -1708,8 +1744,8 @@ impl Shell {
             route,
             nav,
             devices_page: None,
-            team_page: None,
-            team_page_sub: None,
+            organization_page: None,
+            organization_page_sub: None,
             archived_page: None,
             appearance_page: None,
             notifications_page: None,
@@ -1735,25 +1771,25 @@ impl Shell {
             user_menu_focus: cx.focus_handle(),
             user_menu_active: None,
             user_menu_scroll: gpui::ScrollHandle::new(),
-            user_menu_orgs: Loadable::Idle,
-            user_menu_orgs_task: None,
-            team_change: None,
-            pending_team_change: None,
-            team_dialog_focus: cx.focus_handle(),
-            team_dialog_mode: None,
-            team_dialog_active: 0,
+            user_menu_organizations: Loadable::Idle,
+            user_menu_organizations_task: None,
+            organization_change: None,
+            pending_organization_change: None,
+            organization_dialog_focus: cx.focus_handle(),
+            organization_dialog_mode: None,
+            organization_dialog_active: 0,
             fixed_runtime_profile,
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
             install: zeron_update::detect_install(),
-            org: None,
+            organization_gate: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
             auth_task: None,
             runtime_change_task: None,
-            team_runtime_shutdown: None,
+            organization_runtime_shutdown: None,
             runtime_change_error: None,
             import_task: None,
             import_current: None,
@@ -1796,7 +1832,7 @@ impl Shell {
     }
 
     /// Reset every view, task and cache that belongs to the runtime profile
-    /// which has just stopped. Lifecycle coordinators (`team_change` and
+    /// which has just stopped. Lifecycle coordinators (`organization_change` and
     /// `sync_flow`) deliberately survive: their occluding progress/error UI
     /// owns the handoff until the replacement runtime proves it is ready.
     fn reset_profile_ui(&mut self, cx: &mut Context<Self>) {
@@ -1838,8 +1874,8 @@ impl Shell {
         self.route = Route::Chat;
         self.nav = NavHistory::new(NavEntry::Chat(String::new()));
         self.devices_page = None;
-        self.team_page = None;
-        self.team_page_sub = None;
+        self.organization_page = None;
+        self.organization_page_sub = None;
         self.archived_page = None;
         self.accounts_page = None;
         self.harnesses_page = None;
@@ -1861,14 +1897,14 @@ impl Shell {
         self.user_menu = popover::Popup::default();
         self.user_menu_active = None;
         self.user_menu_scroll = gpui::ScrollHandle::new();
-        self.user_menu_orgs = Loadable::Idle;
-        self.user_menu_orgs_task = None;
-        self.pending_team_change = None;
-        self.team_dialog_mode = None;
-        self.team_dialog_active = 0;
+        self.user_menu_organizations = Loadable::Idle;
+        self.user_menu_organizations_task = None;
+        self.pending_organization_change = None;
+        self.organization_dialog_mode = None;
+        self.organization_dialog_active = 0;
         self.fixed_runtime_profile = None;
         self.sidebar_notice = None;
-        self.org = None;
+        self.organization_gate = None;
         self.mutate_task = None;
         self.auth_task = None;
         self.import_task = None;
@@ -1890,7 +1926,7 @@ impl Shell {
 
         // These persisted fields are lists/ids from a specific profile. Wipe
         // only them; layout, appearance, notification and shortcut choices
-        // remain device-local and unchanged across Team switches.
+        // remain device-local and unchanged across Organization switches.
         let mut settings_changed = false;
         settings_changed |= self.settings.last_space_id.take().is_some();
         settings_changed |= self.settings.open_tabs.take().is_some();
@@ -1912,11 +1948,11 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
-        let next_sync_flow = if self.team_change.is_some() {
+        let next_sync_flow = if self.organization_change.is_some() {
             self.sync_flow
         } else {
             let state = state.read(cx);
-            sync_flow_after_auth(self.sync_flow, state.workspace_scope, state.auth.as_ref())
+            sync_flow_after_auth(self.sync_flow, state.profile_scope, state.auth.as_ref())
         };
         if next_sync_flow != self.sync_flow {
             self.sync_flow = next_sync_flow;
@@ -1924,33 +1960,36 @@ impl Shell {
                 self.sync_flow,
                 SyncFlow::RestartPending { .. } | SyncFlow::SwitchOffer { .. }
             ) {
-                self.org = None;
+                self.organization_gate = None;
             }
         }
         // The in-place local→synced switch: once the replacement runtime is
         // attached and Ready, kick the import (or finish) from here.
         self.drive_sync_switch(cx);
-        self.drive_team_change(cx);
-        self.observe_external_team_selection(cx);
+        self.drive_organization_change(cx);
+        self.observe_external_organization_selection(cx);
         let should_load_menu_orgs = {
             let state = state.read(cx);
-            state.workspace_scope == Some(WorkspaceScope::Synced)
+            state.profile_scope == Some(ProfileScope::Synced)
                 && matches!(state.auth, Some(AuthState::SignedIn { .. }))
-                && matches!(self.user_menu_orgs, Loadable::Idle)
-                && self.team_change.is_none()
+                && matches!(self.user_menu_organizations, Loadable::Idle)
+                && self.organization_change.is_none()
         };
         if should_load_menu_orgs {
-            self.load_user_menu_orgs(cx);
+            self.load_user_menu_organizations(cx);
         }
         let signed_out_synced = {
             let state = state.read(cx);
-            state.workspace_scope == Some(WorkspaceScope::Synced)
+            state.profile_scope == Some(ProfileScope::Synced)
                 && matches!(state.auth, Some(AuthState::SignedOut))
         };
         // AuthStatus is shared by every viewport. Whichever viewport owns the
         // embedded runtime drains it; remote viewports request daemon shutdown
         // and all of them independently reattach to the new local runtime.
-        if signed_out_synced && self.runtime_change_task.is_none() && self.team_change.is_none() {
+        if signed_out_synced
+            && self.runtime_change_task.is_none()
+            && self.organization_change.is_none()
+        {
             self.start_local_runtime_transition(false, cx);
         }
         // Capture knob: the add-space palette needs only the device registry.
@@ -2832,13 +2871,13 @@ impl Shell {
     }
 
     fn open_user_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state.read(cx).workspace_scope == Some(WorkspaceScope::Synced)
-            && matches!(self.user_menu_orgs, Loadable::Idle)
+        if self.state.read(cx).profile_scope == Some(ProfileScope::Synced)
+            && matches!(self.user_menu_organizations, Loadable::Idle)
         {
-            self.load_user_menu_orgs(cx);
+            self.load_user_menu_organizations(cx);
         }
         self.user_menu_active = self
-            .user_menu_orgs
+            .user_menu_organizations
             .ready()
             .and_then(|rows| (!rows.is_empty()).then_some(0));
         self.user_menu.open(());
@@ -2877,37 +2916,37 @@ impl Shell {
             }
             popover::MenuKey::Up | popover::MenuKey::Down => {
                 let count = self
-                    .user_menu_orgs
+                    .user_menu_organizations
                     .ready()
                     .map_or(0, |memberships| memberships.len());
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 self.user_menu_active = popover::menu_step(self.user_menu_active, count, delta);
                 if let Some(active) = self.user_menu_active {
-                    // Identity + Teams heading precede the membership rows.
+                    // Identity + Organizations heading precede the membership rows.
                     self.user_menu_scroll.scroll_to_item(active + 2);
                 }
                 cx.notify();
             }
             popover::MenuKey::Enter | popover::MenuKey::ModEnter
-                if matches!(self.user_menu_orgs, Loadable::Error(_)) =>
+                if matches!(self.user_menu_organizations, Loadable::Error(_)) =>
             {
-                self.user_menu_orgs = Loadable::Idle;
-                self.load_user_menu_orgs(cx);
+                self.user_menu_organizations = Loadable::Idle;
+                self.load_user_menu_organizations(cx);
             }
             popover::MenuKey::Enter | popover::MenuKey::ModEnter
                 if self.user_menu_active.is_some() =>
             {
-                self.activate_user_menu_team(window, cx);
+                self.activate_user_menu_organization(window, cx);
             }
             popover::MenuKey::Other if raw == "space" => {
-                if matches!(self.user_menu_orgs, Loadable::Error(_)) {
-                    self.user_menu_orgs = Loadable::Idle;
-                    self.load_user_menu_orgs(cx);
+                if matches!(self.user_menu_organizations, Loadable::Error(_)) {
+                    self.user_menu_organizations = Loadable::Idle;
+                    self.load_user_menu_organizations(cx);
                 } else if self.user_menu_active.is_some() {
-                    self.activate_user_menu_team(window, cx);
+                    self.activate_user_menu_organization(window, cx);
                 }
             }
-            // Consume Enter even while the Team list is loading or empty.
+            // Consume Enter even while the Organization list is loading or empty.
             // Otherwise it bubbles into the avatar trigger and closes the
             // menu, while Space correctly leaves it open.
             popover::MenuKey::Enter | popover::MenuKey::ModEnter => {}
@@ -2916,12 +2955,12 @@ impl Shell {
         cx.stop_propagation();
     }
 
-    fn activate_user_menu_team(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn activate_user_menu_organization(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.user_menu_active else {
             return;
         };
-        let Some(org) = self
-            .user_menu_orgs
+        let Some(organization) = self
+            .user_menu_organizations
             .ready()
             .and_then(|memberships| memberships.get(active))
             .cloned()
@@ -2929,24 +2968,26 @@ impl Shell {
             self.user_menu_active = None;
             return;
         };
-        if self.current_org_id(cx).as_deref() == Some(org.organization_id.as_str()) {
+        if self.current_organization_id(cx).as_deref()
+            == Some(organization.organization_id.as_str())
+        {
             self.close_user_menu(cx);
             window.focus(&self.user_menu_trigger_focus, cx);
             return;
         }
-        let team_busy = self.pending_team_change.is_some()
+        let organization_busy = self.pending_organization_change.is_some()
             || self.runtime_change_task.is_some()
-            || self.team_change.as_ref().is_some_and(|change| {
+            || self.organization_change.as_ref().is_some_and(|change| {
                 matches!(
                     change.phase,
-                    TeamChangePhase::Selecting | TeamChangePhase::Restarting
+                    OrganizationChangePhase::Selecting | OrganizationChangePhase::Restarting
                 )
             });
-        if !team_busy {
-            self.request_team_mutation(
-                TeamMutation::Select {
-                    organization_id: org.organization_id,
-                    label: org.name.into(),
+        if !organization_busy {
+            self.request_organization_mutation(
+                OrganizationMutation::Select {
+                    organization_id: organization.organization_id,
+                    label: organization.name.into(),
                 },
                 cx,
             );
@@ -3028,21 +3069,21 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Team => {
-                if self.team_page.is_none() {
+            SettingsSection::Organization => {
+                if self.organization_page.is_none() {
                     let state = self.state.clone();
-                    let page = cx.new(|cx| TeamPage::new(state, cx));
-                    self.team_page_sub = Some(cx.subscribe(
+                    let page = cx.new(|cx| OrganizationPage::new(state, cx));
+                    self.organization_page_sub = Some(cx.subscribe(
                         &page,
-                        |this: &mut Shell, _, event: &TeamPageEvent, cx| match event {
-                            TeamPageEvent::RequestRuntimeChange(mutation) => {
-                                this.request_team_mutation(mutation.clone(), cx)
+                        |this: &mut Shell, _, event: &OrganizationPageEvent, cx| match event {
+                            OrganizationPageEvent::RequestRuntimeChange(mutation) => {
+                                this.request_organization_mutation(mutation.clone(), cx)
                             }
                         },
                     ));
-                    self.team_page = Some(page);
+                    self.organization_page = Some(page);
                 }
-                match &self.team_page {
+                match &self.organization_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -3237,111 +3278,118 @@ impl Shell {
         cx.notify();
     }
 
-    // ---- Team switch lifecycle ----
+    // ---- Organization switch lifecycle ----
 
-    fn observe_external_team_selection(&mut self, cx: &mut Context<Self>) {
-        let (connection, workspace_scope, auth, engine_profile) = {
+    fn observe_external_organization_selection(&mut self, cx: &mut Context<Self>) {
+        let (connection, profile_scope, auth, engine_profile) = {
             let state = self.state.read(cx);
             let engine_info = state.engine().map(|engine| engine.engine_info());
             (
                 state.connection.clone(),
-                state.workspace_scope,
+                state.profile_scope,
                 state.auth.clone(),
                 engine_runtime_profile_identity(engine_info.as_ref()),
             )
         };
 
         if matches!(connection, ConnectionStatus::Ready)
-            && workspace_scope == Some(WorkspaceScope::Local)
+            && profile_scope == Some(ProfileScope::Local)
         {
             self.fixed_runtime_profile = None;
             return;
         }
 
-        let explicit_handoff = self.team_change.is_some();
+        let explicit_handoff = self.organization_change.is_some();
         // Capture the immutable data-plane boundary first. If this viewport
-        // attached after SELECT_ORG published but before the old runtime died,
+        // attached after SELECT_ORGANIZATION published but before the old runtime died,
         // comparing it to AuthStatus below immediately detects that split.
         if self.fixed_runtime_profile.is_none()
             && !explicit_handoff
             && self.runtime_change_task.is_none()
             && matches!(connection, ConnectionStatus::Ready)
-            && workspace_scope == Some(WorkspaceScope::Synced)
+            && profile_scope == Some(ProfileScope::Synced)
             && let Some(profile) = engine_profile
         {
             self.fixed_runtime_profile = Some(profile);
         }
 
         if self.runtime_change_task.is_none()
-            && let Some(target) = external_team_replacement_target(
+            && let Some(target) = external_organization_replacement_target(
                 self.fixed_runtime_profile.as_ref(),
                 &connection,
-                workspace_scope,
+                profile_scope,
                 auth.as_ref(),
                 explicit_handoff,
             )
         {
             let organization_id = target.organization_id.clone();
             let label = self
-                .user_menu_orgs
+                .user_menu_organizations
                 .ready()
-                .and_then(|orgs| {
-                    orgs.iter()
-                        .find(|org| org.organization_id == organization_id)
-                        .map(|org| SharedString::from(org.name.clone()))
+                .and_then(|organizations| {
+                    organizations
+                        .iter()
+                        .find(|organization| organization.organization_id == organization_id)
+                        .map(|organization| SharedString::from(organization.name.clone()))
                 })
-                .unwrap_or_else(|| "the selected Team".into());
-            self.start_team_runtime_replacement(label, Some(organization_id), true, cx);
-            if let Some(change) = self.team_change.as_mut() {
+                .unwrap_or_else(|| "the selected Organization".into());
+            self.start_organization_runtime_replacement(label, Some(organization_id), true, cx);
+            if let Some(change) = self.organization_change.as_mut() {
                 change.expected_user_id = Some(target.user_id);
             }
             return;
         }
     }
 
-    fn current_org_id(&self, cx: &Context<Self>) -> Option<String> {
+    fn current_organization_id(&self, cx: &Context<Self>) -> Option<String> {
         match self.state.read(cx).auth.as_ref()? {
-            AuthState::SignedIn { org_id, .. } => org_id.clone(),
+            AuthState::SignedIn {
+                organization_id, ..
+            } => organization_id.clone(),
             _ => None,
         }
     }
 
-    fn current_team_name(&self, cx: &Context<Self>) -> Option<SharedString> {
-        let current = self.current_org_id(cx)?;
-        self.user_menu_orgs
+    fn current_organization_name(&self, cx: &Context<Self>) -> Option<SharedString> {
+        let current = self.current_organization_id(cx)?;
+        self.user_menu_organizations
             .ready()?
             .iter()
-            .find(|org| org.organization_id == current)
-            .map(|org| org.name.clone().into())
+            .find(|organization| organization.organization_id == current)
+            .map(|organization| organization.name.clone().into())
     }
 
-    fn load_user_menu_orgs(&mut self, cx: &mut Context<Self>) {
-        if self.user_menu_orgs.is_loading() || self.user_menu_orgs_task.is_some() {
+    fn load_user_menu_organizations(&mut self, cx: &mut Context<Self>) {
+        if self.user_menu_organizations.is_loading() || self.user_menu_organizations_task.is_some()
+        {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.user_menu_orgs = Loadable::Error("Engine not connected".into());
+            self.user_menu_organizations = Loadable::Error("Engine not connected".into());
             cx.notify();
             return;
         };
-        let current = self.current_org_id(cx);
-        self.user_menu_orgs = Loadable::Loading;
-        self.user_menu_orgs_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_ORGS, serde_json::json!({}))
-                .await;
+        let current = self.current_organization_id(cx);
+        self.user_menu_organizations = Loadable::Loading;
+        self.user_menu_organizations_task = Some(cx.spawn(async move |this, cx| {
+            let result = call_with_legacy_method(
+                engine.client(),
+                methods::LIST_ORGANIZATIONS,
+                methods::LEGACY_LIST_ORGANIZATIONS,
+                serde_json::json!({}),
+            )
+            .await;
             this.update(cx, |shell, cx| {
-                shell.user_menu_orgs_task = None;
-                shell.user_menu_orgs = match result {
-                    Ok(value) => Loadable::Ready(teams_current_first(
-                        sort_memberships(parse_orgs(&value)),
+                shell.user_menu_organizations_task = None;
+                shell.user_menu_organizations = match result {
+                    Ok(value) => Loadable::Ready(organizations_current_first(
+                        sort_memberships(parse_organizations(&value)),
                         current.as_deref(),
                     )),
                     Err(error) => Loadable::Error(error.to_string()),
                 };
                 shell.user_menu_active = shell
-                    .user_menu_orgs
+                    .user_menu_organizations
                     .ready()
                     .and_then(|rows| (!rows.is_empty()).then_some(0));
                 cx.notify();
@@ -3351,78 +3399,87 @@ impl Shell {
         cx.notify();
     }
 
-    fn team_label(&self, organization_id: &str, fallback: SharedString) -> SharedString {
-        self.user_menu_orgs
+    fn organization_label(&self, organization_id: &str, fallback: SharedString) -> SharedString {
+        self.user_menu_organizations
             .ready()
-            .and_then(|orgs| {
-                orgs.iter()
-                    .find(|org| org.organization_id == organization_id)
-                    .map(|org| SharedString::from(org.name.clone()))
+            .and_then(|organizations| {
+                organizations
+                    .iter()
+                    .find(|organization| organization.organization_id == organization_id)
+                    .map(|organization| SharedString::from(organization.name.clone()))
             })
             .unwrap_or(fallback)
     }
 
-    fn team_handoff_risk(&self, cx: &App) -> TeamHandoffRisk {
+    fn organization_handoff_risk(&self, cx: &App) -> OrganizationHandoffRisk {
         let (live_runs, pending_sends) = {
             let state = self.state.read(cx);
             (
-                live_team_run_count(&state.sessions),
+                live_organization_run_count(&state.sessions),
                 state.pending_send_count(),
             )
         };
         let composer = self.composer.read(cx).unsent_risk(cx);
-        TeamHandoffRisk {
+        OrganizationHandoffRisk {
             live_runs,
             composer,
             pending_sends,
         }
     }
 
-    /// Shared destructive preflight for both avatar-menu and Settings Team
+    /// Shared destructive preflight for both avatar-menu and Settings Organization
     /// mutations. No profile-changing RPC is issued before this returns or the
     /// user confirms the stored pending mutation.
-    fn request_team_mutation(&mut self, mutation: TeamMutation, cx: &mut Context<Self>) {
-        if let TeamMutation::Select {
+    fn request_organization_mutation(
+        &mut self,
+        mutation: OrganizationMutation,
+        cx: &mut Context<Self>,
+    ) {
+        if let OrganizationMutation::Select {
             organization_id, ..
         } = &mutation
-            && self.current_org_id(cx).as_deref() == Some(organization_id.as_str())
+            && self.current_organization_id(cx).as_deref() == Some(organization_id.as_str())
         {
             self.close_user_menu(cx);
             return;
         }
-        if self.pending_team_change.is_some()
+        if self.pending_organization_change.is_some()
             || self.runtime_change_task.is_some()
-            || self.team_change.as_ref().is_some_and(|change| {
+            || self.organization_change.as_ref().is_some_and(|change| {
                 matches!(
                     change.phase,
-                    TeamChangePhase::Selecting | TeamChangePhase::Restarting
+                    OrganizationChangePhase::Selecting | OrganizationChangePhase::Restarting
                 )
             })
         {
             return;
         }
-        let risk = self.team_handoff_risk(cx);
+        let risk = self.organization_handoff_risk(cx);
         if risk.has_any() {
             self.close_user_menu(cx);
-            self.pending_team_change = Some(PendingTeamChange { mutation, risk });
+            self.pending_organization_change = Some(PendingOrganizationChange { mutation, risk });
             cx.notify();
             return;
         }
-        self.begin_team_mutation(mutation, cx);
+        self.begin_organization_mutation(mutation, cx);
     }
 
-    fn begin_team_mutation(&mut self, mutation: TeamMutation, cx: &mut Context<Self>) {
-        if self.runtime_change_task.is_some() || self.team_change.is_some() {
+    fn begin_organization_mutation(
+        &mut self,
+        mutation: OrganizationMutation,
+        cx: &mut Context<Self>,
+    ) {
+        if self.runtime_change_task.is_some() || self.organization_change.is_some() {
             return;
         }
         let label = mutation.label();
         let requested_organization_id = mutation.requested_organization_id().map(str::to_owned);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.team_change = Some(TeamChange {
+            self.organization_change = Some(OrganizationChange {
                 organization_id: requested_organization_id,
                 expected_user_id: None,
                 label,
-                phase: TeamChangePhase::SelectFailed,
+                phase: OrganizationChangePhase::SelectFailed,
                 error: Some("Engine not connected".into()),
                 mutation: Some(mutation),
                 original_error: None,
@@ -3433,57 +3490,71 @@ impl Shell {
         };
         self.close_user_menu(cx);
         self.runtime_change_error = None;
-        self.team_change = Some(TeamChange {
+        self.organization_change = Some(OrganizationChange {
             organization_id: requested_organization_id.clone(),
             expected_user_id: None,
             label: label.clone(),
-            phase: TeamChangePhase::Selecting,
+            phase: OrganizationChangePhase::Selecting,
             error: None,
             mutation: Some(mutation.clone()),
             original_error: None,
             selection_confirmed: false,
         });
-        let original_org = self.current_org_id(cx);
-        let (method, params) = mutation.rpc();
+        let original_organization = self.current_organization_id(cx);
+        let (method, legacy_method, params) = mutation.rpc();
         let request = Tokio::spawn(cx, async move {
-            tokio::time::timeout(RUNTIME_CHANGE_TIMEOUT, engine.client().call(method, params)).await
+            tokio::time::timeout(
+                RUNTIME_CHANGE_TIMEOUT,
+                call_with_legacy_method(engine.client(), method, legacy_method, params),
+            )
+            .await
         });
         self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
             let result = request.await;
             this.update(cx, |shell, cx| {
                 shell.runtime_change_task = None;
                 match result {
-                    Ok(Ok(Ok(value))) => match confirmed_team_mutation_target(&mutation, &value) {
-                        Ok(target) => {
-                            let resolved_label = target
-                                .as_deref()
-                                .map(|target| shell.team_label(target, label.clone()))
-                                .unwrap_or_else(|| "local workspace".into());
-                            shell.start_team_runtime_replacement(resolved_label, target, true, cx);
+                    Ok(Ok(Ok(value))) => {
+                        match confirmed_organization_mutation_target(&mutation, &value) {
+                            Ok(target) => {
+                                let resolved_label = target
+                                    .as_deref()
+                                    .map(|target| shell.organization_label(target, label.clone()))
+                                    .unwrap_or_else(|| "local profile".into());
+                                shell.start_organization_runtime_replacement(
+                                    resolved_label,
+                                    target,
+                                    true,
+                                    cx,
+                                );
+                            }
+                            Err(error) => shell.reconcile_unknown_organization_mutation(
+                                mutation,
+                                original_organization,
+                                error,
+                                cx,
+                            ),
                         }
-                        Err(error) => {
-                            shell.reconcile_unknown_team_mutation(mutation, original_org, error, cx)
-                        }
-                    },
-                    Ok(Ok(Err(error))) => shell.reconcile_unknown_team_mutation(
+                    }
+                    Ok(Ok(Err(error))) => shell.reconcile_unknown_organization_mutation(
                         mutation,
-                        original_org,
+                        original_organization,
                         error.to_string(),
                         cx,
                     ),
-                    Ok(Err(_)) => shell.reconcile_unknown_team_mutation(
+                    Ok(Err(_)) => shell.reconcile_unknown_organization_mutation(
                         mutation,
-                        original_org,
+                        original_organization,
                         format!(
-                            "Team request timed out after {} seconds",
+                            "Organization request timed out after {} seconds",
                             RUNTIME_CHANGE_TIMEOUT.as_secs()
                         ),
                         cx,
                     ),
-                    Err(error) => shell.reconcile_unknown_team_mutation(
+                    Err(error) => shell.reconcile_unknown_organization_mutation(
                         mutation,
-                        original_org,
-                        format!("Team request task failed: {error}"),
+                        original_organization,
+                        format!("Organization request task failed: {error}"),
                         cx,
                     ),
                 }
@@ -3493,19 +3564,19 @@ impl Shell {
         cx.notify();
     }
 
-    fn reconcile_unknown_team_mutation(
+    fn reconcile_unknown_organization_mutation(
         &mut self,
-        mutation: TeamMutation,
-        original_org: Option<String>,
+        mutation: OrganizationMutation,
+        original_organization: Option<String>,
         error: String,
         cx: &mut Context<Self>,
     ) {
         let requested = mutation.requested_organization_id().map(str::to_owned);
-        let actual = self.current_org_id(cx);
-        let observed_change = actual != original_org;
+        let actual = self.current_organization_id(cx);
+        let observed_change = actual != original_organization;
         let confirmed = observed_change
             || requested.as_deref().is_some_and(|requested| {
-                team_selection_error_is_confirmed(actual.as_deref(), requested)
+                organization_selection_error_is_confirmed(actual.as_deref(), requested)
             });
         let target = if observed_change {
             actual.clone()
@@ -3514,36 +3585,36 @@ impl Shell {
         };
         let label = target
             .as_deref()
-            .map(|target| self.team_label(target, mutation.label()))
+            .map(|target| self.organization_label(target, mutation.label()))
             .unwrap_or_else(|| {
                 if observed_change {
-                    "local workspace".into()
+                    "local profile".into()
                 } else {
                     mutation.label()
                 }
             });
-        if let Some(change) = self.team_change.as_mut() {
+        if let Some(change) = self.organization_change.as_mut() {
             change.original_error = Some(error.into());
             change.mutation = Some(mutation);
         }
-        self.start_team_runtime_replacement(label, target, confirmed, cx);
+        self.start_organization_runtime_replacement(label, target, confirmed, cx);
     }
 
-    fn cancel_pending_team_change(&mut self, cx: &mut Context<Self>) {
-        self.pending_team_change = None;
+    fn cancel_pending_organization_change(&mut self, cx: &mut Context<Self>) {
+        self.pending_organization_change = None;
         cx.notify();
     }
 
-    fn confirm_pending_team_change(&mut self, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_team_change.take() else {
+    fn confirm_pending_organization_change(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_organization_change.take() else {
             return;
         };
-        self.begin_team_mutation(pending.mutation, cx);
+        self.begin_organization_mutation(pending.mutation, cx);
     }
 
-    /// Auth has already selected the new Team. Stop the old fixed-profile
+    /// Auth has already selected the new Organization. Stop the old fixed-profile
     /// runtime, wait for its daemon/lock to disappear, then bootstrap in place.
-    fn start_team_runtime_replacement(
+    fn start_organization_runtime_replacement(
         &mut self,
         label: SharedString,
         requested_organization_id: Option<String>,
@@ -3553,9 +3624,9 @@ impl Shell {
         if self.runtime_change_task.is_some() {
             return;
         }
-        self.pending_team_change = None;
+        self.pending_organization_change = None;
         let (expected_user_id, mutation, original_error) = self
-            .team_change
+            .organization_change
             .as_ref()
             .map(|change| {
                 (
@@ -3566,16 +3637,16 @@ impl Shell {
             })
             .unwrap_or((None, None, None));
         let organization_id = requested_organization_id.or_else(|| {
-            self.team_change
+            self.organization_change
                 .as_ref()
                 .and_then(|change| change.organization_id.clone())
         });
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.team_change = Some(TeamChange {
+            self.organization_change = Some(OrganizationChange {
                 organization_id,
                 expected_user_id,
                 label,
-                phase: TeamChangePhase::ReplaceFailed,
+                phase: OrganizationChangePhase::ReplaceFailed,
                 error: Some("Engine not connected".into()),
                 mutation,
                 original_error,
@@ -3585,14 +3656,14 @@ impl Shell {
             return;
         };
         self.close_user_menu(cx);
-        self.user_menu_orgs_task = None;
-        self.user_menu_orgs = Loadable::Idle;
+        self.user_menu_organizations_task = None;
+        self.user_menu_organizations = Loadable::Idle;
         self.runtime_change_error = None;
-        self.team_change = Some(TeamChange {
+        self.organization_change = Some(OrganizationChange {
             organization_id,
             expected_user_id,
             label: label.clone(),
-            phase: TeamChangePhase::Restarting,
+            phase: OrganizationChangePhase::Restarting,
             error: None,
             mutation,
             original_error,
@@ -3600,7 +3671,7 @@ impl Shell {
         });
         let ipc_port = self.boot.ipc_port;
         let data_dir = self.data_dir.clone();
-        let shutdown_status = if let Some(shutdown) = self.team_runtime_shutdown.as_ref() {
+        let shutdown_status = if let Some(shutdown) = self.organization_runtime_shutdown.as_ref() {
             shutdown.status.clone()
         } else {
             let (status_tx, status) = tokio::sync::watch::channel(RuntimeShutdownStatus::Running);
@@ -3608,7 +3679,7 @@ impl Shell {
                 let result = stop_synced_runtime(engine, ipc_port, &data_dir).await;
                 status_tx.send_replace(RuntimeShutdownStatus::Finished(result));
             });
-            self.team_runtime_shutdown = Some(TeamRuntimeShutdown {
+            self.organization_runtime_shutdown = Some(OrganizationRuntimeShutdown {
                 status: status.clone(),
                 _task: task,
             });
@@ -3627,7 +3698,7 @@ impl Shell {
             this.update(cx, |shell, cx| {
                 shell.runtime_change_task = None;
                 if !matches!(&outcome, RuntimeShutdownWait::TimedOut) {
-                    shell.team_runtime_shutdown = None;
+                    shell.organization_runtime_shutdown = None;
                 }
                 match outcome {
                     RuntimeShutdownWait::Finished(Ok(())) => {
@@ -3637,15 +3708,15 @@ impl Shell {
                         AppState::bootstrap(state.clone(), boot, cx);
                     }
                     RuntimeShutdownWait::Finished(Err(error)) => {
-                        if let Some(change) = shell.team_change.as_mut() {
-                            change.phase = TeamChangePhase::ReplaceFailed;
+                        if let Some(change) = shell.organization_change.as_mut() {
+                            change.phase = OrganizationChangePhase::ReplaceFailed;
                             change.error = Some(error.into());
                         }
                         cx.notify();
                     }
                     RuntimeShutdownWait::TimedOut => {
-                        if let Some(change) = shell.team_change.as_mut() {
-                            change.phase = TeamChangePhase::ReplaceFailed;
+                        if let Some(change) = shell.organization_change.as_mut() {
+                            change.phase = OrganizationChangePhase::ReplaceFailed;
                             change.error = Some(
                                 format!(
                                     "The engine is still stopping after {} seconds. Teardown continues safely in the background; Retry will rejoin it without starting another shutdown.",
@@ -3657,8 +3728,8 @@ impl Shell {
                         cx.notify();
                     }
                     RuntimeShutdownWait::WorkerEnded => {
-                        if let Some(change) = shell.team_change.as_mut() {
-                            change.phase = TeamChangePhase::ReplaceFailed;
+                        if let Some(change) = shell.organization_change.as_mut() {
+                            change.phase = OrganizationChangePhase::ReplaceFailed;
                             change.error = Some(
                                 "The background engine teardown ended without reporting a result. Retry will start a fresh shutdown attempt."
                                     .into(),
@@ -3673,20 +3744,20 @@ impl Shell {
         cx.notify();
     }
 
-    fn drive_team_change(&mut self, cx: &mut Context<Self>) {
+    fn drive_organization_change(&mut self, cx: &mut Context<Self>) {
         if self.runtime_change_task.is_some()
             || !matches!(
-                self.team_change.as_ref().map(|change| change.phase),
-                Some(TeamChangePhase::Restarting)
+                self.organization_change.as_ref().map(|change| change.phase),
+                Some(OrganizationChangePhase::Restarting)
             )
         {
             return;
         }
-        let (connection, workspace_scope, auth, engine_info) = {
+        let (connection, profile_scope, auth, engine_info) = {
             let state = self.state.read(cx);
             (
                 state.connection.clone(),
-                state.workspace_scope,
+                state.profile_scope,
                 state.auth.clone(),
                 state.engine().map(|engine| engine.engine_info()),
             )
@@ -3694,44 +3765,47 @@ impl Shell {
         match connection {
             ConnectionStatus::Ready => {
                 let (expectation, target, selection_confirmed) = self
-                    .team_change
+                    .organization_change
                     .as_ref()
                     .map(|change| {
                         (
                             if !change.selection_confirmed {
-                                TeamRuntimeExpectation::Any
+                                OrganizationRuntimeExpectation::Any
                             } else if let Some(organization_id) = change.organization_id.as_deref()
                             {
                                 match change.expected_user_id.as_deref() {
-                                    Some(user_id) => TeamRuntimeExpectation::ExactProfile {
+                                    Some(user_id) => OrganizationRuntimeExpectation::ExactProfile {
                                         organization_id,
                                         user_id,
                                     },
-                                    None => TeamRuntimeExpectation::ExactOrg(organization_id),
+                                    None => OrganizationRuntimeExpectation::ExactOrganization(
+                                        organization_id,
+                                    ),
                                 }
                             } else {
-                                TeamRuntimeExpectation::SignedOut
+                                OrganizationRuntimeExpectation::SignedOut
                             },
                             change.organization_id.clone(),
                             change.selection_confirmed,
                         )
                     })
-                    .unwrap_or((TeamRuntimeExpectation::Any, None, true));
-                let Some(validation) = validate_team_runtime_auth(auth.as_ref(), expectation)
+                    .unwrap_or((OrganizationRuntimeExpectation::Any, None, true));
+                let Some(validation) =
+                    validate_organization_runtime_auth(auth.as_ref(), expectation)
                 else {
                     return; // wait for the replacement runtime's first AuthStatus frame
                 };
                 if let Err(error) = validation {
-                    if let Some(change) = self.team_change.as_mut() {
-                        change.phase = TeamChangePhase::ReplaceFailed;
+                    if let Some(change) = self.organization_change.as_mut() {
+                        change.phase = OrganizationChangePhase::ReplaceFailed;
                         change.error = Some(error.into());
                     }
                     cx.notify();
                     return;
                 }
                 let Some(engine_info) = engine_info.as_ref() else {
-                    if let Some(change) = self.team_change.as_mut() {
-                        change.phase = TeamChangePhase::ReplaceFailed;
+                    if let Some(change) = self.organization_change.as_mut() {
+                        change.phase = OrganizationChangePhase::ReplaceFailed;
                         change.error = Some(
                             "The replacement connection did not expose a fixed runtime identity."
                                 .into(),
@@ -3743,102 +3817,102 @@ impl Shell {
                 let Some(auth) = auth.as_ref() else {
                     return;
                 };
-                if let Err(error) = validate_team_runtime_planes(engine_info, auth) {
-                    if let Some(change) = self.team_change.as_mut() {
-                        change.phase = TeamChangePhase::ReplaceFailed;
+                if let Err(error) = validate_organization_runtime_planes(engine_info, auth) {
+                    if let Some(change) = self.organization_change.as_mut() {
+                        change.phase = OrganizationChangePhase::ReplaceFailed;
                         change.error = Some(error.into());
                     }
                     cx.notify();
                     return;
                 }
                 let outcome_unknown_notice = self
-                    .team_change
+                    .organization_change
                     .as_ref()
-                    .and_then(team_outcome_unknown_notice);
+                    .and_then(organization_outcome_unknown_notice);
                 let runtime_profile = engine_runtime_profile_identity(Some(engine_info));
                 if !selection_confirmed && let Some(target) = target {
-                    match classify_ambiguous_team_runtime(auth, &target) {
-                        AmbiguousTeamRuntimeOutcome::RequestedProfile(_) => {}
-                        AmbiguousTeamRuntimeOutcome::OtherProfile(_) => {
+                    match classify_ambiguous_organization_runtime(auth, &target) {
+                        AmbiguousOrganizationRuntimeOutcome::RequestedProfile(_) => {}
+                        AmbiguousOrganizationRuntimeOutcome::OtherProfile(_) => {
                             // The ambiguous RPC did not durably select the
-                            // requested Team. A concrete signed-in profile is
+                            // requested Organization. A concrete signed-in profile is
                             // open, so Cancel is safe and Retry can select again.
                             self.fixed_runtime_profile = runtime_profile.clone();
-                            if let Some(change) = self.team_change.as_mut() {
-                                change.phase = TeamChangePhase::SelectFailed;
+                            if let Some(change) = self.organization_change.as_mut() {
+                                change.phase = OrganizationChangePhase::SelectFailed;
                                 let original = change
                                     .original_error
                                     .as_deref()
-                                    .unwrap_or("the Team response was lost");
+                                    .unwrap_or("the Organization response was lost");
                                 change.error = Some(format!(
-                                    "The operation outcome was unknown ({original}). Your previous Team reopened safely. Refresh Teams to verify the result, then retry only if needed."
+                                    "The operation outcome was unknown ({original}). Your previous Organization reopened safely. Refresh Organizations to verify the result, then retry only if needed."
                                 ).into());
                             }
                             if outcome_unknown_notice.is_some() {
                                 self.sidebar_notice = outcome_unknown_notice.clone();
                             }
-                            self.user_menu_orgs = Loadable::Idle;
-                            self.load_user_menu_orgs(cx);
+                            self.user_menu_organizations = Loadable::Idle;
+                            self.load_user_menu_organizations(cx);
                             cx.notify();
                             return;
                         }
-                        AmbiguousTeamRuntimeOutcome::SignedOut => {
+                        AmbiguousOrganizationRuntimeOutcome::SignedOut => {
                             // A fail-closed SELECT refresh can clear the session.
                             // The replacement bootstrap normally opens Local
                             // directly. Only an unexpectedly-still-Synced runtime
                             // needs another transition; waiting for a future
                             // AuthStatus notification can leave that case stuck.
                             self.fixed_runtime_profile = None;
-                            self.team_change = None;
+                            self.organization_change = None;
                             self.runtime_change_error = None;
                             if outcome_unknown_notice.is_some() {
                                 self.sidebar_notice = outcome_unknown_notice.clone();
                             }
-                            match signed_out_team_runtime_action(workspace_scope) {
-                                SignedOutTeamRuntimeAction::AlreadyLocal => {
+                            match signed_out_organization_runtime_action(profile_scope) {
+                                SignedOutOrganizationRuntimeAction::AlreadyLocal => {
                                     self.sync_flow = SyncFlow::Idle;
-                                    self.user_menu_orgs = Loadable::Idle;
+                                    self.user_menu_organizations = Loadable::Idle;
                                     cx.notify();
                                 }
-                                SignedOutTeamRuntimeAction::ReplaceSyncedWithLocal => {
+                                SignedOutOrganizationRuntimeAction::ReplaceSyncedWithLocal => {
                                     self.start_local_runtime_transition(false, cx);
                                 }
                             }
                             return;
                         }
-                        AmbiguousTeamRuntimeOutcome::NeedsOrganization => {
+                        AmbiguousOrganizationRuntimeOutcome::NeedsOrganization => {
                             // The clean replacement runtime already owns this
                             // auth state. Let the normal organization gate take
-                            // over instead of presenting it as an old-Team retry.
+                            // over instead of presenting it as an old-Organization retry.
                             self.fixed_runtime_profile = None;
-                            self.team_change = None;
+                            self.organization_change = None;
                             self.runtime_change_error = None;
                             if outcome_unknown_notice.is_some() {
                                 self.sidebar_notice = outcome_unknown_notice.clone();
                             }
-                            self.user_menu_orgs = Loadable::Idle;
+                            self.user_menu_organizations = Loadable::Idle;
                             cx.notify();
                             return;
                         }
                     }
                 }
                 self.fixed_runtime_profile = runtime_profile;
-                self.team_change = None;
+                self.organization_change = None;
                 self.runtime_change_error = None;
                 if outcome_unknown_notice.is_some() {
                     self.sidebar_notice = outcome_unknown_notice;
                 }
-                self.user_menu_orgs = Loadable::Idle;
-                if self.state.read(cx).workspace_scope == Some(WorkspaceScope::Synced)
+                self.user_menu_organizations = Loadable::Idle;
+                if self.state.read(cx).profile_scope == Some(ProfileScope::Synced)
                     && matches!(self.state.read(cx).auth, Some(AuthState::SignedIn { .. }))
                 {
-                    self.load_user_menu_orgs(cx);
+                    self.load_user_menu_organizations(cx);
                 }
                 cx.notify();
             }
             ConnectionStatus::Failed(error) => {
-                if let Some(change) = self.team_change.as_mut() {
-                    change.phase = TeamChangePhase::ReplaceFailed;
+                if let Some(change) = self.organization_change.as_mut() {
+                    change.phase = OrganizationChangePhase::ReplaceFailed;
                     change.error = Some(error.into());
                 }
                 cx.notify();
@@ -3847,26 +3921,27 @@ impl Shell {
         }
     }
 
-    fn retry_team_change(&mut self, cx: &mut Context<Self>) {
-        let Some(change) = self.team_change.clone() else {
+    fn retry_organization_change(&mut self, cx: &mut Context<Self>) {
+        let Some(change) = self.organization_change.clone() else {
             return;
         };
         match change.phase {
-            TeamChangePhase::SelectFailed => {
-                self.team_change = None;
+            OrganizationChangePhase::SelectFailed => {
+                self.organization_change = None;
                 if let Some(mutation) = change.mutation {
-                    self.request_team_mutation(mutation, cx);
+                    self.request_organization_mutation(mutation, cx);
                 } else if let Some(organization_id) = change.organization_id {
-                    if self.current_org_id(cx).as_deref() == Some(organization_id.as_str()) {
-                        self.start_team_runtime_replacement(
+                    if self.current_organization_id(cx).as_deref() == Some(organization_id.as_str())
+                    {
+                        self.start_organization_runtime_replacement(
                             change.label,
                             Some(organization_id),
                             true,
                             cx,
                         );
                     } else {
-                        self.request_team_mutation(
-                            TeamMutation::Select {
+                        self.request_organization_mutation(
+                            OrganizationMutation::Select {
                                 organization_id,
                                 label: change.label,
                             },
@@ -3875,46 +3950,46 @@ impl Shell {
                     }
                 } else {
                     self.sidebar_notice = Some(
-                        "This Team operation cannot be retried safely. Refresh Teams and verify its outcome."
+                        "This Organization operation cannot be retried safely. Refresh Organizations and verify its outcome."
                             .into(),
                     );
                     cx.notify();
                 }
             }
-            TeamChangePhase::ReplaceFailed => {
+            OrganizationChangePhase::ReplaceFailed => {
                 if self.state.read(cx).engine().is_some() {
-                    self.start_team_runtime_replacement(
+                    self.start_organization_runtime_replacement(
                         change.label,
                         change.organization_id,
                         change.selection_confirmed,
                         cx,
                     );
                 } else {
-                    if let Some(change) = self.team_change.as_mut() {
-                        change.phase = TeamChangePhase::Restarting;
+                    if let Some(change) = self.organization_change.as_mut() {
+                        change.phase = OrganizationChangePhase::Restarting;
                         change.error = None;
                     }
                     AppState::bootstrap(self.state.clone(), self.boot.clone(), cx);
                     cx.notify();
                 }
             }
-            TeamChangePhase::Selecting | TeamChangePhase::Restarting => {}
+            OrganizationChangePhase::Selecting | OrganizationChangePhase::Restarting => {}
         }
     }
 
-    fn cancel_failed_team_selection(&mut self, cx: &mut Context<Self>) {
+    fn cancel_failed_organization_selection(&mut self, cx: &mut Context<Self>) {
         if matches!(
-            self.team_change.as_ref().map(|change| change.phase),
-            Some(TeamChangePhase::SelectFailed)
+            self.organization_change.as_ref().map(|change| change.phase),
+            Some(OrganizationChangePhase::SelectFailed)
         ) {
-            self.team_change = None;
+            self.organization_change = None;
             cx.notify();
         }
     }
 
     fn request_sign_out(&mut self, cx: &mut Context<Self>) {
         self.close_user_menu(cx);
-        if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
+        if self.state.read(cx).profile_scope != Some(ProfileScope::Synced) {
             return;
         }
         self.sync_flow = SyncFlow::SignOutConfirm;
@@ -3980,12 +4055,15 @@ impl Shell {
     }
 
     fn cancel_auth_setup(&mut self, cx: &mut Context<Self>) {
-        let local = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);
+        let local = self.state.read(cx).profile_scope == Some(ProfileScope::Local);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
         let pending_auth = self.auth_task.take();
-        let pending_org = self.org.as_mut().and_then(|org| org.task.take());
+        let pending_organization_gate = self
+            .organization_gate
+            .as_mut()
+            .and_then(|gate| gate.task.take());
         if local {
             self.sync_flow = SyncFlow::Canceling;
         }
@@ -3995,7 +4073,7 @@ impl Shell {
             if let Some(task) = pending_auth {
                 task.await;
             }
-            if let Some(task) = pending_org {
+            if let Some(task) = pending_organization_gate {
                 task.await;
             }
             let result = engine
@@ -4005,7 +4083,7 @@ impl Shell {
             this.update(cx, |shell, cx| {
                 match result {
                     Ok(_) => {
-                        shell.org = None;
+                        shell.organization_gate = None;
                         if local {
                             shell.sync_flow = SyncFlow::Idle;
                         }
@@ -4126,7 +4204,7 @@ impl Shell {
             let state = self.state.read(cx);
             (
                 matches!(state.connection, ConnectionStatus::Ready),
-                state.workspace_scope,
+                state.profile_scope,
             )
         };
         if !ready {
@@ -4138,7 +4216,7 @@ impl Shell {
             return;
         }
         match scope {
-            Some(WorkspaceScope::Synced) => {
+            Some(ProfileScope::Synced) => {
                 if import {
                     self.spawn_local_import(cx);
                 } else {
@@ -4149,7 +4227,7 @@ impl Shell {
             Some(_) => {
                 self.sync_flow = SyncFlow::RestartPending { notice_open: true };
                 self.runtime_change_error =
-                    Some("The synced workspace did not come up — restart to finish.".into());
+                    Some("The organization profile did not come up — restart to finish.".into());
                 cx.notify();
             }
             None => {}
@@ -4172,11 +4250,14 @@ impl Shell {
         self.runtime_change_error = None;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
         let stream = Tokio::spawn(cx, async move {
-            let mut items = engine
-                .client()
-                .subscribe(methods::IMPORT_LOCAL_WORKSPACE, serde_json::json!({}))
-                .await
-                .map_err(|error| error.to_string())?;
+            let mut items = subscribe_with_legacy_method(
+                engine.client(),
+                methods::IMPORT_LOCAL_PROFILE,
+                methods::LEGACY_IMPORT_LOCAL_PROFILE,
+                serde_json::json!({}),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             while let Some(item) = items.recv().await {
                 let _ = tx.send(item);
             }
@@ -4307,12 +4388,12 @@ impl Shell {
     }
 
     fn start_sign_in(&mut self, cx: &mut Context<Self>) {
-        let scope = self.state.read(cx).workspace_scope;
-        if scope == Some(WorkspaceScope::Development) {
+        let scope = self.state.read(cx).profile_scope;
+        if scope == Some(ProfileScope::Development) {
             return;
         }
         self.close_user_menu(cx);
-        if scope == Some(WorkspaceScope::Local) {
+        if scope == Some(ProfileScope::Local) {
             self.sync_flow = SyncFlow::Enabling;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -4331,8 +4412,7 @@ impl Shell {
                     cx.notify();
                 }
                 Err(err) => {
-                    if scope == Some(WorkspaceScope::Local) && shell.sync_flow == SyncFlow::Enabling
-                    {
+                    if scope == Some(ProfileScope::Local) && shell.sync_flow == SyncFlow::Enabling {
                         shell.sync_flow = SyncFlow::Idle;
                     }
                     shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
@@ -4344,44 +4424,49 @@ impl Shell {
         cx.notify();
     }
 
-    // ---- org gate ----
+    // ---- Organization gate ----
 
-    fn ensure_org_ui(&mut self, cx: &mut Context<Self>) {
-        if self.org.is_some() {
+    fn ensure_organization_ui(&mut self, cx: &mut Context<Self>) {
+        if self.organization_gate.is_some() {
             return;
         }
-        let name_input = cx.new(|cx| ComposerInput::new("Workspace name", cx));
+        let name_input = cx.new(|cx| ComposerInput::new("Organization name", cx));
         let events = cx.subscribe(&name_input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
-                this.create_org(cx);
+                this.create_organization(cx);
             }
         });
-        self.org = Some(OrgGateUi {
+        self.organization_gate = Some(OrganizationGateUi {
             name_input,
-            orgs: Loadable::Idle,
+            organizations: Loadable::Idle,
             submitting: false,
             error: None,
             task: None,
             _events: events,
         });
-        self.load_orgs(cx);
+        self.load_organizations(cx);
     }
 
-    fn load_orgs(&mut self, cx: &mut Context<Self>) {
+    fn load_organizations(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let Some(org) = self.org.as_mut() else { return };
-        org.orgs = Loadable::Loading;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_ORGS, serde_json::json!({}))
-                .await;
+        let Some(gate) = self.organization_gate.as_mut() else {
+            return;
+        };
+        gate.organizations = Loadable::Loading;
+        gate.task = Some(cx.spawn(async move |this, cx| {
+            let result = call_with_legacy_method(
+                engine.client(),
+                methods::LIST_ORGANIZATIONS,
+                methods::LEGACY_LIST_ORGANIZATIONS,
+                serde_json::json!({}),
+            )
+            .await;
             this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.orgs = match result {
-                        Ok(value) => Loadable::Ready(sort_memberships(parse_orgs(&value))),
+                if let Some(gate) = shell.organization_gate.as_mut() {
+                    gate.organizations = match result {
+                        Ok(value) => Loadable::Ready(sort_memberships(parse_organizations(&value))),
                         Err(err) => Loadable::Error(err.to_string()),
                     };
                 }
@@ -4392,32 +4477,37 @@ impl Shell {
         cx.notify();
     }
 
-    fn create_org(&mut self, cx: &mut Context<Self>) {
+    fn create_organization(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let Some(org) = self.org.as_mut() else { return };
-        if org.submitting {
+        let Some(gate) = self.organization_gate.as_mut() else {
+            return;
+        };
+        if gate.submitting {
             return;
         }
-        let name = org.name_input.read(cx).text().trim().to_string();
-        if !org_name_valid(&name) {
-            org.error = Some("Enter a workspace name".into());
+        let name = gate.name_input.read(cx).text().trim().to_string();
+        if !organization_name_valid(&name) {
+            gate.error = Some("Enter an organization name".into());
             cx.notify();
             return;
         }
-        org.submitting = true;
-        org.error = None;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::CREATE_ORG, serde_json::json!({ "name": name }))
-                .await;
+        gate.submitting = true;
+        gate.error = None;
+        gate.task = Some(cx.spawn(async move |this, cx| {
+            let result = call_with_legacy_method(
+                engine.client(),
+                methods::CREATE_ORGANIZATION,
+                methods::LEGACY_CREATE_ORGANIZATION,
+                serde_json::json!({ "name": name }),
+            )
+            .await;
             this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.submitting = false;
+                if let Some(gate) = shell.organization_gate.as_mut() {
+                    gate.submitting = false;
                     if let Err(err) = result {
-                        org.error = Some(format!("{err}").into());
+                        gate.error = Some(format!("{err}").into());
                     }
                     // Success: the AuthStatus stream flips to SignedIn and the
                     // gate falls away on its own.
@@ -4429,26 +4519,28 @@ impl Shell {
         cx.notify();
     }
 
-    fn select_org(&mut self, organization_id: String, cx: &mut Context<Self>) {
+    fn select_organization(&mut self, organization_id: String, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let Some(org) = self.org.as_mut() else { return };
-        org.submitting = true;
-        org.error = None;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::SELECT_ORG,
-                    serde_json::json!({ "organizationId": organization_id }),
-                )
-                .await;
+        let Some(gate) = self.organization_gate.as_mut() else {
+            return;
+        };
+        gate.submitting = true;
+        gate.error = None;
+        gate.task = Some(cx.spawn(async move |this, cx| {
+            let result = call_with_legacy_method(
+                engine.client(),
+                methods::SELECT_ORGANIZATION,
+                methods::LEGACY_SELECT_ORGANIZATION,
+                serde_json::json!({ "organizationId": organization_id }),
+            )
+            .await;
             this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.submitting = false;
+                if let Some(gate) = shell.organization_gate.as_mut() {
+                    gate.submitting = false;
                     if let Err(err) = result {
-                        org.error = Some(format!("{err}").into());
+                        gate.error = Some(format!("{err}").into());
                     }
                 }
                 cx.notify();
@@ -4810,7 +4902,7 @@ impl Shell {
 
     /// Zeron-drawn Linux caption controls, one overlay per populated side.
     /// Shell-level chrome like the Windows cluster: mounted at the root so
-    /// they stay above the splash and every auth/org/error gate.
+    /// they stay above the splash and every auth/organization/error gate.
     fn render_linux_caption_controls(&self, window: &Window, cx: &App) -> Vec<AnyElement> {
         let Some(layout) = self.linux_captions else {
             return Vec::new();
@@ -4905,7 +4997,7 @@ impl Shell {
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
-            SettingsSection::Team => icons::GLOBAL,
+            SettingsSection::Organization => icons::GLOBAL,
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
@@ -5393,9 +5485,9 @@ impl Shell {
     }
 
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (user, workspace_scope) = {
+        let (user, profile_scope) = {
             let state = self.state.read(cx);
-            (state.auth_user().cloned(), state.workspace_scope)
+            (state.auth_user().cloned(), state.profile_scope)
         };
 
         // Keyed rows: (stable key, estimated height, element) — the key + height
@@ -5460,8 +5552,8 @@ impl Shell {
             SharedString,
             Option<SharedString>,
             SharedString,
-        ) = match workspace_scope {
-            Some(WorkspaceScope::Local) => {
+        ) = match profile_scope {
+            Some(ProfileScope::Local) => {
                 let line = if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
                     "Sync ready after restart"
                 } else {
@@ -5469,12 +5561,12 @@ impl Shell {
                 };
                 (line.into(), None, "Stored on this device".into())
             }
-            Some(WorkspaceScope::Development) => (
+            Some(ProfileScope::Development) => (
                 "Development".into(),
                 Some("Local development runtime".into()),
                 "Authentication disabled".into(),
             ),
-            Some(WorkspaceScope::Synced) | None => {
+            Some(ProfileScope::Synced) | None => {
                 let line: SharedString = user
                     .as_ref()
                     .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
@@ -5483,15 +5575,16 @@ impl Shell {
                     .as_ref()
                     .map(|u| SharedString::from(u.email.clone()))
                     .unwrap_or_else(|| line.clone());
-                let team = user.as_ref().map(|_| {
-                    self.current_team_name(cx)
-                        .unwrap_or_else(|| match &self.user_menu_orgs {
-                            Loadable::Idle | Loadable::Loading => "Loading Team…".into(),
-                            Loadable::Error(_) => "Team unavailable".into(),
-                            Loadable::Ready(_) => "No Team selected".into(),
-                        })
+                let organization = user.as_ref().map(|_| {
+                    self.current_organization_name(cx).unwrap_or_else(|| {
+                        match &self.user_menu_organizations {
+                            Loadable::Idle | Loadable::Loading => "Loading Organization…".into(),
+                            Loadable::Error(_) => "Organization unavailable".into(),
+                            Loadable::Ready(_) => "No Organization selected".into(),
+                        }
+                    })
                 });
-                (line, team, email)
+                (line, organization, email)
             }
         };
         let user_menu =
@@ -5750,7 +5843,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.user_menu.is_open();
-        let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
+        let action = account_menu_action(self.state.read(cx).profile_scope, self.sync_flow);
         // Bottom-of-sidebar identity: generated blob avatar + scope/account
         // label and its secondary status line. The avatar is seeded from the
         // stable identity string (email when signed in, scope label
@@ -5758,10 +5851,10 @@ impl Shell {
         let avatar = crate::avatar::blob_avatar(&menu_identity, 28.0);
         let mut trigger = div()
             .id("user-menu")
-            .key_context("TeamMenu")
+            .key_context("OrganizationMenu")
             .track_focus(&self.user_menu_trigger_focus)
             .role(Role::Button)
-            .aria_label("Team and account menu")
+            .aria_label("Organization and account menu")
             .aria_expanded(open)
             .flex_none()
             .rounded(px(8.0))
@@ -5839,26 +5932,26 @@ impl Shell {
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
-            let synced = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Synced);
-            let current_org = self.current_org_id(cx);
-            let team_busy = self.pending_team_change.is_some()
+            let synced = self.state.read(cx).profile_scope == Some(ProfileScope::Synced);
+            let current_organization = self.current_organization_id(cx);
+            let organization_busy = self.pending_organization_change.is_some()
                 || self.runtime_change_task.is_some()
-                || self.team_change.as_ref().is_some_and(|change| {
+                || self.organization_change.as_ref().is_some_and(|change| {
                     matches!(
                         change.phase,
-                        TeamChangePhase::Selecting | TeamChangePhase::Restarting
+                        OrganizationChangePhase::Selecting | OrganizationChangePhase::Restarting
                     )
                 });
-            let orgs = self.user_menu_orgs.clone();
-            // Exactly as wide as the trigger row. Team memberships live here,
+            let organizations = self.user_menu_organizations.clone();
+            // Exactly as wide as the trigger row. Organization memberships live here,
             // above the management/account actions, so the common switch path
             // is one click after opening the avatar menu.
             let mut menu = popover::popover_card(theme)
                 .id("user-menu-scroll")
-                .key_context("TeamMenu")
+                .key_context("OrganizationMenu")
                 .track_focus(&self.user_menu_focus)
                 .role(Role::Menu)
-                .aria_label("Teams and account actions")
+                .aria_label("Organizations and account actions")
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
                 .max_h(px(420.0))
                 .overflow_y_scroll()
@@ -5902,11 +5995,11 @@ impl Shell {
                 );
 
             if synced {
-                menu = menu.child(popover::menu_heading(theme, "Teams"));
-                match orgs {
+                menu = menu.child(popover::menu_heading(theme, "Organizations"));
+                match organizations {
                     Loadable::Idle | Loadable::Loading => {
                         menu = menu.child(div().px(px(8.0)).child(popover::skeleton_rows(
-                            "user-menu-teams-skeleton",
+                            "user-menu-organizations-skeleton",
                             theme,
                             2,
                             cx.entity_id(),
@@ -5915,22 +6008,25 @@ impl Shell {
                     }
                     Loadable::Error(message) => {
                         menu = menu.child(
-                            popover::error_row(theme, &format!("Could not load Teams: {message}"))
-                                .child(
-                                    div()
-                                        .id("user-menu-teams-retry")
-                                        .rounded(px(7.0))
-                                        .px(px(8.0))
-                                        .py(px(4.0))
-                                        .text_color(theme.text)
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(theme.glass_hover()))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.user_menu_orgs = Loadable::Idle;
-                                            this.load_user_menu_orgs(cx);
-                                        }))
-                                        .child("Retry"),
-                                ),
+                            popover::error_row(
+                                theme,
+                                &format!("Could not load Organizations: {message}"),
+                            )
+                            .child(
+                                div()
+                                    .id("user-menu-organizations-retry")
+                                    .rounded(px(7.0))
+                                    .px(px(8.0))
+                                    .py(px(4.0))
+                                    .text_color(theme.text)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme.glass_hover()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.user_menu_organizations = Loadable::Idle;
+                                        this.load_user_menu_organizations(cx);
+                                    }))
+                                    .child("Retry"),
+                            ),
                         );
                     }
                     Loadable::Ready(rows) if rows.is_empty() => {
@@ -5940,28 +6036,34 @@ impl Shell {
                                 .py(px(7.0))
                                 .text_size(px(12.0))
                                 .text_color(theme.text_muted)
-                                .child("No Teams available"),
+                                .child("No Organizations available"),
                         );
                     }
                     Loadable::Ready(rows) => {
-                        for (ix, org) in rows.into_iter().enumerate() {
-                            let is_current =
-                                current_org.as_deref() == Some(org.organization_id.as_str());
+                        for (ix, organization) in rows.into_iter().enumerate() {
+                            let is_current = current_organization.as_deref()
+                                == Some(organization.organization_id.as_str());
                             let is_keyboard_active = self.user_menu_active == Some(ix);
-                            let organization_id = org.organization_id.clone();
-                            let label: SharedString = org.name.clone().into();
-                            let role: SharedString = if org.role == "admin" {
+                            let organization_id = organization.organization_id.clone();
+                            let label: SharedString = organization.name.clone().into();
+                            let role: SharedString = if organization.role == "admin" {
                                 "Admin".into()
                             } else {
                                 "Member".into()
                             };
-                            let row_id: SharedString = format!("user-menu-team-{ix}").into();
-                            let fade_key: SharedString = format!("user-menu-team-fade-{ix}").into();
+                            let row_id: SharedString =
+                                format!("user-menu-organization-{ix}").into();
+                            let fade_key: SharedString =
+                                format!("user-menu-organization-fade-{ix}").into();
                             let accessible_label: SharedString = format!(
                                 "{}, {}{}",
-                                org.name,
+                                organization.name,
                                 role,
-                                if is_current { ", current Team" } else { "" }
+                                if is_current {
+                                    ", current Organization"
+                                } else {
+                                    ""
+                                }
                             )
                             .into();
                             let mut row = popover::menu_row_nav(
@@ -5975,12 +6077,15 @@ impl Shell {
                             .aria_label(accessible_label)
                             .aria_selected(is_current)
                             .when(is_keyboard_active, |row| row.aria_active_descendant())
-                            .when(team_busy && !is_current, |row| row.opacity(0.45))
+                            .when(organization_busy && !is_current, |row| row.opacity(0.45))
                             // Generated crest, seeded by the organization id so
-                            // renaming a Team does not change its badge.
+                            // renaming an Organization does not change its badge.
                             .child(
-                                crate::avatar::team_avatar(&org.organization_id, 16.0)
-                                    .self_center(),
+                                crate::avatar::organization_avatar(
+                                    &organization.organization_id,
+                                    16.0,
+                                )
+                                .self_center(),
                             )
                             .child(
                                 div()
@@ -6007,10 +6112,10 @@ impl Shell {
                                             .flex_none()
                                             .text_color(theme.success_muted),
                                     );
-                            } else if !team_busy {
+                            } else if !organization_busy {
                                 row = row.on_click(cx.listener(move |this, _, _, cx| {
-                                    this.request_team_mutation(
-                                        TeamMutation::Select {
+                                    this.request_organization_mutation(
+                                        OrganizationMutation::Select {
                                             organization_id: organization_id.clone(),
                                             label: label.clone(),
                                         },
@@ -6137,47 +6242,47 @@ impl Shell {
         trigger.into_any_element()
     }
 
-    fn render_team_change_overlay(
+    fn render_organization_change_overlay(
         &mut self,
         viewport: gpui::Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let change = self.team_change.clone()?;
+        let change = self.organization_change.clone()?;
         let theme = Theme::of(cx).clone();
         let (title, body) = match change.phase {
-            TeamChangePhase::Selecting => (
+            OrganizationChangePhase::Selecting => (
                 format!("Switching to {}…", change.label),
-                "Updating your Team selection before opening its workspace.".to_string(),
+                "Updating your Organization selection before opening its profile.".to_string(),
             ),
-            TeamChangePhase::Restarting => (
+            OrganizationChangePhase::Restarting => (
                 format!("Opening {}…", change.label),
-                "Closing the previous workspace cleanly, then reconnecting in place. Keep Zeron open."
+                "Closing the previous profile cleanly, then reconnecting in place. Keep Zeron open."
                     .to_string(),
             ),
-            TeamChangePhase::SelectFailed => (
-                "Couldn't switch Teams".to_string(),
-                "The current workspace is unchanged. You can retry or return to it.".to_string(),
+            OrganizationChangePhase::SelectFailed => (
+                "Couldn't switch Organizations".to_string(),
+                "The current Organization is unchanged. You can retry or return to it.".to_string(),
             ),
-            TeamChangePhase::ReplaceFailed => (
-                "Couldn't finish opening the Team".to_string(),
-                "Your Team selection changed, but the old workspace did not fully release its runtime. Retry the handoff before continuing."
+            OrganizationChangePhase::ReplaceFailed => (
+                "Couldn't finish opening the Organization".to_string(),
+                "Your Organization selection changed, but the old profile did not fully release its runtime. Retry the handoff before continuing."
                     .to_string(),
             ),
         };
         let mut card = popover::dialog_card(&theme)
-            .id("team-runtime-change-card")
-            .key_context("TeamDialog")
-            .track_focus(&self.team_dialog_focus)
+            .id("organization-runtime-change-card")
+            .key_context("OrganizationDialog")
+            .track_focus(&self.organization_dialog_focus)
             .role(Role::Dialog)
             .aria_label(title.clone())
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                this.team_dialog_key(event, window, cx)
+                this.organization_dialog_key(event, window, cx)
             }))
             .on_action(cx.listener(|this, _: &FocusNextControl, _, cx| {
-                this.move_team_dialog_action(false, cx)
+                this.move_organization_dialog_action(false, cx)
             }))
             .on_action(cx.listener(|this, _: &FocusPreviousControl, _, cx| {
-                this.move_team_dialog_action(true, cx)
+                this.move_organization_dialog_action(true, cx)
             }))
             .child(popover::dialog_title(&theme, &title))
             .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, body)));
@@ -6192,160 +6297,181 @@ impl Shell {
             );
         }
         match change.phase {
-            TeamChangePhase::SelectFailed => {
-                card = card.child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
-                        .child(
-                            popover::btn_ghost(&theme, "Cancel", "team-switch-failed-cancel")
-                                .id("team-switch-failed-cancel")
+            OrganizationChangePhase::SelectFailed => {
+                card =
+                    card.child(
+                        div()
+                            .mt(px(16.0))
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(
+                                popover::btn_ghost(
+                                    &theme,
+                                    "Cancel",
+                                    "organization-switch-failed-cancel",
+                                )
+                                .id("organization-switch-failed-cancel")
                                 .role(Role::Button)
-                                .aria_label("Cancel Team switch")
+                                .aria_label("Cancel Organization switch")
                                 .border_1()
-                                .border_color(if self.team_dialog_active == 0 {
+                                .border_color(if self.organization_dialog_active == 0 {
                                     theme.border_strong
                                 } else {
                                     theme.border_strong.opacity(0.0)
                                 })
-                                .when(self.team_dialog_active == 0, |button| {
+                                .when(self.organization_dialog_active == 0, |button| {
                                     button.aria_active_descendant()
                                 })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cancel_failed_team_selection(cx)
-                                })),
-                        )
-                        .child(
-                            popover::btn_primary(&theme, "Retry")
-                                .id("team-switch-failed-retry")
-                                .role(Role::Button)
-                                .aria_label("Retry Team switch")
-                                .border_1()
-                                .border_color(if self.team_dialog_active == 1 {
-                                    theme.border_strong
-                                } else {
-                                    theme.border_strong.opacity(0.0)
-                                })
-                                .when(self.team_dialog_active == 1, |button| {
-                                    button.aria_active_descendant()
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| this.retry_team_change(cx))),
-                        ),
-                );
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.cancel_failed_organization_selection(cx),
+                                )),
+                            )
+                            .child(
+                                popover::btn_primary(&theme, "Retry")
+                                    .id("organization-switch-failed-retry")
+                                    .role(Role::Button)
+                                    .aria_label("Retry Organization switch")
+                                    .border_1()
+                                    .border_color(if self.organization_dialog_active == 1 {
+                                        theme.border_strong
+                                    } else {
+                                        theme.border_strong.opacity(0.0)
+                                    })
+                                    .when(self.organization_dialog_active == 1, |button| {
+                                        button.aria_active_descendant()
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.retry_organization_change(cx)
+                                    })),
+                            ),
+                    );
             }
-            TeamChangePhase::ReplaceFailed => {
+            OrganizationChangePhase::ReplaceFailed => {
                 card = card.child(
                     div().mt(px(16.0)).flex().flex_row().justify_end().child(
                         popover::btn_primary(&theme, "Retry")
-                            .id("team-replace-failed-retry")
+                            .id("organization-replace-failed-retry")
                             .role(Role::Button)
-                            .aria_label("Retry Team handoff")
+                            .aria_label("Retry Organization handoff")
                             .border_1()
                             .border_color(theme.border_strong)
                             .aria_active_descendant()
-                            .on_click(cx.listener(|this, _, _, cx| this.retry_team_change(cx))),
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.retry_organization_change(cx)),
+                            ),
                     ),
                 );
             }
-            TeamChangePhase::Selecting | TeamChangePhase::Restarting => {}
+            OrganizationChangePhase::Selecting | OrganizationChangePhase::Restarting => {}
         }
         Some(popover::modal(
-            "team-runtime-change-dialog",
+            "organization-runtime-change-dialog",
             viewport,
             card.into_any_element(),
         ))
     }
 
-    fn current_team_dialog_mode(&self) -> Option<TeamDialogKeyboardMode> {
-        if self.pending_team_change.is_some() {
-            return Some(TeamDialogKeyboardMode::Pending);
+    fn current_organization_dialog_mode(&self) -> Option<OrganizationDialogKeyboardMode> {
+        if self.pending_organization_change.is_some() {
+            return Some(OrganizationDialogKeyboardMode::Pending);
         }
-        match self.team_change.as_ref().map(|change| change.phase) {
-            Some(TeamChangePhase::SelectFailed) => Some(TeamDialogKeyboardMode::SelectFailed),
-            Some(TeamChangePhase::ReplaceFailed) => Some(TeamDialogKeyboardMode::ReplaceFailed),
-            Some(TeamChangePhase::Selecting | TeamChangePhase::Restarting) => {
-                Some(TeamDialogKeyboardMode::Progress)
+        match self.organization_change.as_ref().map(|change| change.phase) {
+            Some(OrganizationChangePhase::SelectFailed) => {
+                Some(OrganizationDialogKeyboardMode::SelectFailed)
+            }
+            Some(OrganizationChangePhase::ReplaceFailed) => {
+                Some(OrganizationDialogKeyboardMode::ReplaceFailed)
+            }
+            Some(OrganizationChangePhase::Selecting | OrganizationChangePhase::Restarting) => {
+                Some(OrganizationDialogKeyboardMode::Progress)
             }
             None => None,
         }
     }
 
-    fn sync_team_dialog_keyboard_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mode = self.current_team_dialog_mode();
-        if self.team_dialog_mode != mode {
-            self.team_dialog_mode = mode;
-            self.team_dialog_active = mode.map_or(0, TeamDialogKeyboardMode::default_active);
+    fn sync_organization_dialog_keyboard_state(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mode = self.current_organization_dialog_mode();
+        if self.organization_dialog_mode != mode {
+            self.organization_dialog_mode = mode;
+            self.organization_dialog_active =
+                mode.map_or(0, OrganizationDialogKeyboardMode::default_active);
         }
-        if mode.is_some() && !self.team_dialog_focus.is_focused(window) {
-            window.focus(&self.team_dialog_focus, cx);
+        if mode.is_some() && !self.organization_dialog_focus.is_focused(window) {
+            window.focus(&self.organization_dialog_focus, cx);
         }
     }
 
-    fn apply_team_dialog_command(
+    fn apply_organization_dialog_command(
         &mut self,
-        mode: TeamDialogKeyboardMode,
-        command: TeamDialogCommand,
+        mode: OrganizationDialogKeyboardMode,
+        command: OrganizationDialogCommand,
         cx: &mut Context<Self>,
     ) {
         match (mode, command) {
-            (_, TeamDialogCommand::None) => {}
-            (TeamDialogKeyboardMode::Pending, TeamDialogCommand::Cancel) => {
-                self.cancel_pending_team_change(cx)
+            (_, OrganizationDialogCommand::None) => {}
+            (OrganizationDialogKeyboardMode::Pending, OrganizationDialogCommand::Cancel) => {
+                self.cancel_pending_organization_change(cx)
             }
-            (TeamDialogKeyboardMode::Pending, TeamDialogCommand::Primary) => {
-                self.confirm_pending_team_change(cx)
+            (OrganizationDialogKeyboardMode::Pending, OrganizationDialogCommand::Primary) => {
+                self.confirm_pending_organization_change(cx)
             }
-            (TeamDialogKeyboardMode::SelectFailed, TeamDialogCommand::Cancel) => {
-                self.cancel_failed_team_selection(cx)
+            (OrganizationDialogKeyboardMode::SelectFailed, OrganizationDialogCommand::Cancel) => {
+                self.cancel_failed_organization_selection(cx)
             }
             (
-                TeamDialogKeyboardMode::SelectFailed | TeamDialogKeyboardMode::ReplaceFailed,
-                TeamDialogCommand::Primary,
-            ) => self.retry_team_change(cx),
-            (TeamDialogKeyboardMode::ReplaceFailed, TeamDialogCommand::Cancel) => {}
-            (TeamDialogKeyboardMode::Progress, _) => {}
+                OrganizationDialogKeyboardMode::SelectFailed
+                | OrganizationDialogKeyboardMode::ReplaceFailed,
+                OrganizationDialogCommand::Primary,
+            ) => self.retry_organization_change(cx),
+            (OrganizationDialogKeyboardMode::ReplaceFailed, OrganizationDialogCommand::Cancel) => {}
+            (OrganizationDialogKeyboardMode::Progress, _) => {}
         }
     }
 
-    fn move_team_dialog_action(&mut self, backwards: bool, cx: &mut Context<Self>) {
-        let Some(mode) = self.current_team_dialog_mode() else {
+    fn move_organization_dialog_action(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        let Some(mode) = self.current_organization_dialog_mode() else {
             cx.propagate();
             return;
         };
-        let (active, _) = reduce_team_dialog_key(mode, "tab", backwards, self.team_dialog_active);
-        self.team_dialog_active = active;
+        let (active, _) =
+            reduce_organization_dialog_key(mode, "tab", backwards, self.organization_dialog_active);
+        self.organization_dialog_active = active;
         cx.notify();
     }
 
-    fn team_dialog_key(
+    fn organization_dialog_key(
         &mut self,
         event: &gpui::KeyDownEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(mode) = self.current_team_dialog_mode() else {
+        let Some(mode) = self.current_organization_dialog_mode() else {
             return;
         };
         let key = event.keystroke.key.as_str();
         if !matches!(key, "enter" | "space" | "escape") {
             return;
         }
-        let (active, command) = reduce_team_dialog_key(mode, key, false, self.team_dialog_active);
-        self.team_dialog_active = active;
-        self.apply_team_dialog_command(mode, command, cx);
+        let (active, command) =
+            reduce_organization_dialog_key(mode, key, false, self.organization_dialog_active);
+        self.organization_dialog_active = active;
+        self.apply_organization_dialog_command(mode, command, cx);
         cx.stop_propagation();
         cx.notify();
     }
 
-    fn render_pending_team_change_overlay(
+    fn render_pending_organization_change_overlay(
         &mut self,
         viewport: gpui::Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let pending = self.pending_team_change.clone()?;
+        let pending = self.pending_organization_change.clone()?;
         let theme = Theme::of(cx).clone();
         let mut consequences = Vec::new();
         if pending.risk.live_runs > 0 {
@@ -6385,30 +6511,30 @@ impl Shell {
                 "interrupt a send that has not finished or been acknowledged".to_string()
             });
         }
-        let action = team_mutation_verb(pending.mutation.kind());
+        let action = organization_mutation_verb(pending.mutation.kind());
         let target = pending.mutation.label();
         let body = format!(
             "Continuing to {action} ({target}) will {}. Unsent text and staged attachments cannot be recovered after the runtime handoff.",
             consequences.join(", ")
         );
         let card = popover::dialog_card(&theme)
-            .id("team-handoff-risk-card")
-            .key_context("TeamDialog")
-            .track_focus(&self.team_dialog_focus)
+            .id("organization-handoff-risk-card")
+            .key_context("OrganizationDialog")
+            .track_focus(&self.organization_dialog_focus)
             .role(Role::Dialog)
-            .aria_label("Review work before changing Teams")
+            .aria_label("Review work before changing Organizations")
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                this.team_dialog_key(event, window, cx)
+                this.organization_dialog_key(event, window, cx)
             }))
             .on_action(cx.listener(|this, _: &FocusNextControl, _, cx| {
-                this.move_team_dialog_action(false, cx)
+                this.move_organization_dialog_action(false, cx)
             }))
             .on_action(cx.listener(|this, _: &FocusPreviousControl, _, cx| {
-                this.move_team_dialog_action(true, cx)
+                this.move_organization_dialog_action(true, cx)
             }))
             .child(popover::dialog_title(
                 &theme,
-                "Review work before changing Teams",
+                "Review work before changing Organizations",
             ))
             .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, body)))
             .child(
@@ -6419,44 +6545,48 @@ impl Shell {
                     .justify_end()
                     .gap(px(8.0))
                     .child(
-                        popover::btn_ghost(&theme, "Cancel", "team-live-runs-cancel")
-                            .id("team-live-runs-cancel")
+                        popover::btn_ghost(&theme, "Cancel", "organization-live-runs-cancel")
+                            .id("organization-live-runs-cancel")
                             .role(Role::Button)
-                            .aria_label("Cancel Team change")
+                            .aria_label("Cancel Organization change")
                             .border_1()
-                            .border_color(if self.team_dialog_active == 0 {
+                            .border_color(if self.organization_dialog_active == 0 {
                                 theme.border_strong
                             } else {
                                 theme.border_strong.opacity(0.0)
                             })
-                            .when(self.team_dialog_active == 0, |button| {
+                            .when(self.organization_dialog_active == 0, |button| {
                                 button.aria_active_descendant()
                             })
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.cancel_pending_team_change(cx)),
-                            ),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_pending_organization_change(cx)
+                            })),
                     )
                     .child(
                         popover::btn_danger(&theme, "Continue")
-                            .id("team-live-runs-continue")
+                            .id("organization-live-runs-continue")
                             .role(Role::Button)
-                            .aria_label("Continue Team change")
+                            .aria_label("Continue Organization change")
                             .border_1()
-                            .border_color(if self.team_dialog_active == 1 {
+                            .border_color(if self.organization_dialog_active == 1 {
                                 theme.border_strong
                             } else {
                                 theme.border_strong.opacity(0.0)
                             })
-                            .when(self.team_dialog_active == 1, |button| {
+                            .when(self.organization_dialog_active == 1, |button| {
                                 button.aria_active_descendant()
                             })
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.confirm_pending_team_change(cx)),
-                            ),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_pending_organization_change(cx)
+                            })),
                     ),
             )
             .into_any_element();
-        Some(popover::modal("team-handoff-risk-dialog", viewport, card))
+        Some(popover::modal(
+            "organization-handoff-risk-dialog",
+            viewport,
+            card,
+        ))
     }
 
     fn render_sync_overlay(
@@ -6465,7 +6595,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
-        let needs_org = matches!(
+        let needs_organization = matches!(
             self.state.read(cx).auth.as_ref(),
             Some(AuthState::NeedsOrganization { .. })
         );
@@ -6482,8 +6612,8 @@ impl Shell {
             "Quit Zeron"
         };
 
-        if self.sync_flow == SyncFlow::Enabling && needs_org {
-            return Some(self.render_org_gate(cx));
+        if self.sync_flow == SyncFlow::Enabling && needs_organization {
+            return Some(self.render_organization_gate(cx));
         }
 
         let signed_in_email: Option<SharedString> = match self.state.read(cx).auth.as_ref() {
@@ -6504,7 +6634,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Finish signing in in your browser. Zeron will keep using this local workspace until you quit and reopen.",
+                        "Finish signing in in your browser. Zeron will keep using this local profile until you quit and reopen.",
                     )),
                 )
                 .child(
@@ -6535,7 +6665,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Removing the partial sign-in before returning to your local workspace.",
+                        "Removing the partial sign-in before returning to your local profile.",
                     )),
                 )
                 .into_any_element(),
@@ -6544,18 +6674,18 @@ impl Shell {
                 let has_local_work = work_phrase.is_some();
                 let body: SharedString = match (&signed_in_email, &work_phrase) {
                     (Some(email), Some(phrase)) => format!(
-                        "You're signed in as {email}. Bring {phrase} from this device into your synced workspace, or start it fresh."
+                        "You're signed in as {email}. Bring {phrase} from this device into your organization data, or start it fresh."
                     )
                     .into(),
                     (Some(email), None) => format!(
-                        "You're signed in as {email}. Zeron can switch to your synced workspace now."
+                        "You're signed in as {email}. Zeron can switch to your organization profile now."
                     )
                     .into(),
                     (None, Some(phrase)) => format!(
-                        "Bring {phrase} from this device into your synced workspace, or start it fresh."
+                        "Bring {phrase} from this device into your organization data, or start it fresh."
                     )
                     .into(),
-                    (None, None) => "Zeron can switch to your synced workspace now.".into(),
+                    (None, None) => "Zeron can switch to your organization profile now.".into(),
                 };
                 let mut actions = div()
                     .mt(px(16.0))
@@ -6604,7 +6734,7 @@ impl Shell {
             SyncFlow::Switching { import } => popover::dialog_card(&theme)
                 .child(popover::dialog_title(
                     &theme,
-                    "Switching to your synced workspace…",
+                    "Switching to your organization profile…",
                 ))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(
                     &theme,
@@ -6664,9 +6794,9 @@ impl Shell {
             }
             SyncFlow::ImportDone { imported, skipped } => {
                 let body: SharedString = match (imported, skipped) {
-                    (0, 0) => "Your synced workspace is ready.".into(),
+                    (0, 0) => "Your organization data is ready.".into(),
                     (n, 0) => format!(
-                        "{n} session{} moved into your synced workspace.",
+                        "{n} session{} moved into your organization data.",
                         if n == 1 { "" } else { "s" },
                     )
                     .into(),
@@ -6744,9 +6874,9 @@ impl Shell {
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
                         if remote_engine {
-                            "Zeron is using a background daemon. Stop it and quit Zeron, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Zeron is using a background daemon. Stop it and quit Zeron, then reopen to start the organization profile. Existing local sessions stay on this device and will not be uploaded."
                         } else {
-                            "Quit and reopen Zeron to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Quit and reopen Zeron to start the organization profile. Existing local sessions stay on this device and will not be uploaded."
                         },
                     )),
                 )
@@ -6791,7 +6921,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Zeron will remove your credentials, close the synced workspace, and continue in local mode.",
+                        "Zeron will remove your credentials, close the organization profile, and continue with local data.",
                     )),
                 )
                 .child(
@@ -6823,7 +6953,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Removing account credentials and closing the synced workspace.",
+                        "Removing account credentials and closing the organization profile.",
                     )),
                 )
                 .into_any_element(),
@@ -7854,7 +7984,7 @@ impl Shell {
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(
-                        "Zeron removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
+                        "Zeron removed your credentials but could not finish closing the previous organization profile. Retry before continuing with local data.",
                     )),
             )
             .when_some(self.runtime_change_error.clone(), |card, error| {
@@ -8439,17 +8569,17 @@ impl Shell {
 
     /// Organization onboarding used by the synced gate and, for a local
     /// runtime, only after the user explicitly starts the sync opt-in.
-    fn render_org_gate(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        self.ensure_org_ui(cx);
+    fn render_organization_gate(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.ensure_organization_ui(cx);
         let theme = Theme::of(cx).clone();
-        let local_setup = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);
-        let Some(org) = self.org.as_ref() else {
+        let local_setup = self.state.read(cx).profile_scope == Some(ProfileScope::Local);
+        let Some(gate) = self.organization_gate.as_ref() else {
             return Empty.into_any_element();
         };
-        let submitting = org.submitting;
-        let error = org.error.clone();
-        let name_input = org.name_input.clone();
-        let orgs = org.orgs.clone();
+        let submitting = gate.submitting;
+        let error = gate.error.clone();
+        let name_input = gate.name_input.clone();
+        let organizations = gate.organizations.clone();
 
         let email: Option<SharedString> = self
             .state
@@ -8458,11 +8588,11 @@ impl Shell {
             .map(|u| u.email.clone().into());
 
         let memberships: AnyElement =
-            match &orgs {
+            match &organizations {
                 Loadable::Idle | Loadable::Loading => div()
                     .mt(px(24.0))
                     .child(popover::skeleton_rows(
-                        "org-skeleton",
+                        "organization-skeleton",
                         &theme,
                         2,
                         cx.entity_id(),
@@ -8474,7 +8604,7 @@ impl Shell {
                     .child(
                         popover::error_row(&theme, message).child(
                             div()
-                                .id("orgs-retry")
+                                .id("organizations-retry")
                                 .px(px(Theme::SPACE_SM))
                                 .py(px(3.0))
                                 .rounded(px(Theme::CONTROL_RADIUS))
@@ -8483,7 +8613,7 @@ impl Shell {
                                 .text_color(theme.text)
                                 .cursor_pointer()
                                 .hover(|s| s.bg(theme.glass_hover()))
-                                .on_click(cx.listener(|this, _, _, cx| this.load_orgs(cx)))
+                                .on_click(cx.listener(|this, _, _, cx| this.load_organizations(cx)))
                                 .child(SharedString::from("Retry")),
                         ),
                     )
@@ -8500,14 +8630,14 @@ impl Shell {
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted.opacity(0.6))
                             .child(SharedString::from(
-                                "Or continue in a workspace you belong to",
+                                "Or continue in an organization you belong to",
                             )),
                     )
                     .child(div().flex().flex_col().gap(px(4.0)).children(
                         rows.iter().enumerate().map(|(ix, row)| {
-                            let org_id = row.organization_id.clone();
+                            let organization_id = row.organization_id.clone();
                             div()
-                                .id(("org-row", ix))
+                                .id(("organization-row", ix))
                                 .px(px(12.0))
                                 .py(px(8.0))
                                 .rounded(px(8.0))
@@ -8520,7 +8650,7 @@ impl Shell {
                                 .cursor_pointer()
                                 .hover(|s| s.bg(crate::theme::wash(0.11)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_org(org_id.clone(), cx);
+                                    this.select_organization(organization_id.clone(), cx);
                                 }))
                                 .child(SharedString::from(row.name.clone()))
                         }),
@@ -8528,18 +8658,15 @@ impl Shell {
                     .into_any_element(),
             };
 
-        // zeron App.tsx OrgGate: w-400 card on the grid — logo, headline,
+        // zeron App.tsx OrganizationGate: w-400 card on the grid — logo, headline,
         // explainer (+ signed-in email), name form with a white Create button,
         // then existing memberships and the account escape hatch.
         let blurb: SharedString = match email {
             Some(email) => format!(
-                "Zeron is organized around workspaces — create one for yourself or your team. Signed in as {email}."
+                "Create an organization to share sessions and manage members. Signed in as {email}."
             )
             .into(),
-            None => {
-                "Zeron is organized around workspaces — create one for yourself or your team."
-                    .into()
-            }
+            None => "Create an organization to share sessions and manage members.".into(),
         };
         let card = div()
             .w(px(400.0))
@@ -8564,7 +8691,7 @@ impl Shell {
                     .text_size(px(18.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
-                    .child(SharedString::from("Create your workspace")),
+                    .child(SharedString::from("Create your organization")),
             )
             .child(
                 div()
@@ -8597,7 +8724,7 @@ impl Shell {
                     )
                     .child(
                         div()
-                            .id("create-org")
+                            .id("create-organization")
                             .h(px(36.0))
                             .px(px(16.0))
                             .flex()
@@ -8610,7 +8737,7 @@ impl Shell {
                             .when(submitting, |el| el.opacity(0.5))
                             .cursor_pointer()
                             .hover(|s| s.opacity(0.9))
-                            .on_click(cx.listener(|this, _, _, cx| this.create_org(cx)))
+                            .on_click(cx.listener(|this, _, _, cx| this.create_organization(cx)))
                             .child(SharedString::from(if submitting {
                                 "Creating…"
                             } else {
@@ -8632,7 +8759,7 @@ impl Shell {
             .child(
                 div().mt(px(24.0)).flex().flex_row().child(
                     div()
-                        .id("org-signout")
+                        .id("organization-signout")
                         .text_size(px(12.0))
                         .text_color(theme.text_muted.opacity(0.6))
                         .cursor_pointer()
@@ -8659,7 +8786,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(motion::fade_in("org-gate-card", card)),
+                    .child(motion::fade_in("organization-gate-card", card)),
             )
             .into_any_element()
     }
@@ -8984,20 +9111,20 @@ impl Render for Shell {
         // frost paints translucent — the sidebar and card margins read as
         // glass while the opaque card keeps text off it.
         let (frost, text, font) = (theme.glass(), theme.text, theme.font_sans.clone());
-        let (workspace_scope, auth) = {
+        let (profile_scope, auth) = {
             let state = self.state.read(cx);
-            (state.workspace_scope, state.auth.clone())
+            (state.profile_scope, state.auth.clone())
         };
-        if self.team_change.is_none() {
-            self.sync_flow = sync_flow_after_auth(self.sync_flow, workspace_scope, auth.as_ref());
+        if self.organization_change.is_none() {
+            self.sync_flow = sync_flow_after_auth(self.sync_flow, profile_scope, auth.as_ref());
         }
-        let restart_required =
-            self.team_change.is_none() && self.sync_flow == SyncFlow::SignedOutRestartRequired;
+        let restart_required = self.organization_change.is_none()
+            && self.sync_flow == SyncFlow::SignedOutRestartRequired;
         let gate = self
             .debug_gate
             .clone()
             .unwrap_or_else(|| self.state.read(cx).gate());
-        self.sync_team_dialog_keyboard_state(window, cx);
+        self.sync_organization_dialog_keyboard_state(window, cx);
 
         // Fullscreen hides the macOS traffic lights — reflow the control
         // cluster with a 200ms ease-out tween (§1.1). A fullscreen transition
@@ -9239,8 +9366,8 @@ impl Render for Shell {
                     .child(motion::fade_in("phase-app", page))
             }
             GatePhase::Loading => root, // splash overlay covers boot
-            GatePhase::OrgGate => {
-                let card = self.render_org_gate(cx);
+            GatePhase::OrganizationGate => {
+                let card = self.render_organization_gate(cx);
                 root.child(card)
             }
             phase @ (GatePhase::Failed(_) | GatePhase::SignIn) => {
@@ -9254,15 +9381,17 @@ impl Render for Shell {
         } else {
             root
         };
-        // Team handoff is shell-level, not Ready-page content. Keep its stable
+        // Organization handoff is shell-level, not Ready-page content. Keep its stable
         // progress/error surface visible while prepare_runtime_replacement()
         // intentionally moves the generic gate through Loading or Failed.
         let root = if let Some(confirm) =
-            self.render_pending_team_change_overlay(window.viewport_size(), cx)
+            self.render_pending_organization_change_overlay(window.viewport_size(), cx)
         {
             root.child(confirm)
-        } else if let Some(team) = self.render_team_change_overlay(window.viewport_size(), cx) {
-            root.child(team)
+        } else if let Some(organization) =
+            self.render_organization_change_overlay(window.viewport_size(), cx)
+        {
+            root.child(organization)
         } else {
             root
         };
@@ -9289,7 +9418,7 @@ impl Render for Shell {
         };
 
         // Caption controls are shell-level chrome, not Ready-page content:
-        // keep them above the splash and every auth/org/error gate as well as
+        // keep them above the splash and every auth/organization/error gate as well as
         // the full application. Gate pages also need a drag surface because
         // they do not render the unified tabs/settings titlebar — on Windows
         // the native `Drag` control area, on Linux the explicit
@@ -9323,36 +9452,36 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
 
-    fn org(id: &str, name: &str) -> OrgRow {
-        OrgRow {
+    fn organization(id: &str, name: &str) -> OrganizationRow {
+        OrganizationRow {
             organization_id: id.into(),
             name: name.into(),
             role: "member".into(),
         }
     }
 
-    fn signed_in_to(org_id: &str) -> AuthState {
-        signed_in_as("user-1", org_id)
+    fn signed_in_to(organization_id: &str) -> AuthState {
+        signed_in_as("user-1", organization_id)
     }
 
-    fn signed_in_as(user_id: &str, org_id: &str) -> AuthState {
+    fn signed_in_as(user_id: &str, organization_id: &str) -> AuthState {
         AuthState::SignedIn {
             user: zeron_proto::UserProfile {
                 id: user_id.into(),
                 email: "user@example.com".into(),
                 name: None,
             },
-            org_id: Some(org_id.into()),
+            organization_id: Some(organization_id.into()),
         }
     }
 
-    fn synced_engine_info(user_id: &str, org_id: &str) -> EngineInfo {
+    fn synced_engine_info(user_id: &str, organization_id: &str) -> EngineInfo {
         EngineInfo {
             device_id: "device-1".into(),
-            workspace_scope: WorkspaceScope::Synced,
-            profile: Some(zeron_proto::EngineProfileIdentity {
+            profile_scope: ProfileScope::Synced,
+            profile: Some(zeron_proto::ProfileIdentity {
                 user_id: user_id.into(),
-                organization_id: org_id.into(),
+                organization_id: organization_id.into(),
             }),
         }
     }
@@ -9363,21 +9492,21 @@ mod tests {
             ipc_port: 27901,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: None,
             default_harness: zeron_proto::HarnessId::Mock,
         }
     }
 
     #[test]
-    fn avatar_menu_keeps_current_team_first_and_only_once() {
+    fn avatar_menu_keeps_current_organization_first_and_only_once() {
         let sorted = sort_memberships(vec![
-            org("org-b", "Beta"),
-            org("org-a", "Alpha"),
-            org("org-c", "Gamma"),
-            org("org-b", "Zulu stale duplicate"),
+            organization("org-b", "Beta"),
+            organization("org-a", "Alpha"),
+            organization("org-c", "Gamma"),
+            organization("org-b", "Zulu stale duplicate"),
         ]);
-        let rows = teams_current_first(sorted, Some("org-c"));
+        let rows = organizations_current_first(sorted, Some("org-c"));
         let ids: Vec<&str> = rows
             .iter()
             .map(|row| row.organization_id.as_str())
@@ -9387,58 +9516,58 @@ mod tests {
     }
 
     #[test]
-    fn team_dialog_keyboard_navigation_wraps_and_respects_safe_escape() {
-        let pending = TeamDialogKeyboardMode::Pending;
+    fn organization_dialog_keyboard_navigation_wraps_and_respects_safe_escape() {
+        let pending = OrganizationDialogKeyboardMode::Pending;
         assert_eq!(pending.default_active(), 0, "Cancel is the safe default");
         assert_eq!(
-            reduce_team_dialog_key(pending, "tab", false, 0),
-            (1, TeamDialogCommand::None)
+            reduce_organization_dialog_key(pending, "tab", false, 0),
+            (1, OrganizationDialogCommand::None)
         );
         assert_eq!(
-            reduce_team_dialog_key(pending, "tab", false, 1),
-            (0, TeamDialogCommand::None)
+            reduce_organization_dialog_key(pending, "tab", false, 1),
+            (0, OrganizationDialogCommand::None)
         );
         assert_eq!(
-            reduce_team_dialog_key(pending, "tab", true, 0),
-            (1, TeamDialogCommand::None)
+            reduce_organization_dialog_key(pending, "tab", true, 0),
+            (1, OrganizationDialogCommand::None)
         );
         assert_eq!(
-            reduce_team_dialog_key(pending, "enter", false, 0),
-            (0, TeamDialogCommand::Cancel)
+            reduce_organization_dialog_key(pending, "enter", false, 0),
+            (0, OrganizationDialogCommand::Cancel)
         );
         assert_eq!(
-            reduce_team_dialog_key(pending, "space", false, 1),
-            (1, TeamDialogCommand::Primary)
+            reduce_organization_dialog_key(pending, "space", false, 1),
+            (1, OrganizationDialogCommand::Primary)
         );
         assert_eq!(
-            reduce_team_dialog_key(pending, "escape", false, 1),
-            (1, TeamDialogCommand::Cancel)
+            reduce_organization_dialog_key(pending, "escape", false, 1),
+            (1, OrganizationDialogCommand::Cancel)
         );
 
-        let replace_failed = TeamDialogKeyboardMode::ReplaceFailed;
+        let replace_failed = OrganizationDialogKeyboardMode::ReplaceFailed;
         assert_eq!(replace_failed.default_active(), 0);
         assert_eq!(
-            reduce_team_dialog_key(replace_failed, "escape", false, 0),
-            (0, TeamDialogCommand::None),
+            reduce_organization_dialog_key(replace_failed, "escape", false, 0),
+            (0, OrganizationDialogCommand::None),
             "the profile-isolation overlay must remain Retry-only"
         );
         assert_eq!(
-            reduce_team_dialog_key(replace_failed, "enter", false, 0),
-            (0, TeamDialogCommand::Primary)
+            reduce_organization_dialog_key(replace_failed, "enter", false, 0),
+            (0, OrganizationDialogCommand::Primary)
         );
 
-        let progress = TeamDialogKeyboardMode::Progress;
+        let progress = OrganizationDialogKeyboardMode::Progress;
         for key in ["tab", "enter", "space", "escape"] {
             assert_eq!(
-                reduce_team_dialog_key(progress, key, false, 0),
-                (0, TeamDialogCommand::None),
+                reduce_organization_dialog_key(progress, key, false, 0),
+                (0, OrganizationDialogCommand::None),
                 "progress dialogs must trap {key} without dispatching an action"
             );
         }
     }
 
     #[test]
-    fn team_switch_confirmation_counts_raw_live_chats_once() {
+    fn organization_switch_confirmation_counts_raw_live_chats_once() {
         let now = Utc::now();
         let session =
             |chat_id: &str,
@@ -9465,14 +9594,14 @@ mod tests {
         ];
 
         assert_eq!(
-            live_team_run_count(&sessions),
+            live_organization_run_count(&sessions),
             3,
             "a quiet Working row remains destructive even past the display TTL"
         );
     }
 
     #[gpui::test]
-    fn settings_team_mutation_sends_no_rpc_before_shared_preflight_confirmation(
+    fn settings_organization_mutation_sends_no_rpc_before_shared_preflight_confirmation(
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
@@ -9480,7 +9609,7 @@ mod tests {
         let state = cx.new(|_| {
             let mut state = AppState::new();
             state.auth = Some(signed_in_to("org-a"));
-            state.workspace_scope = Some(WorkspaceScope::Synced);
+            state.profile_scope = Some(ProfileScope::Synced);
             state.sessions.push(zeron_proto::Session {
                 chat_id: "quiet-run".into(),
                 device_id: "device-1".into(),
@@ -9497,8 +9626,8 @@ mod tests {
             shell
                 .composer
                 .update(cx, |composer, cx| composer.set_input_for_test("unsent", cx));
-            shell.request_team_mutation(
-                TeamMutation::Select {
+            shell.request_organization_mutation(
+                OrganizationMutation::Select {
                     organization_id: "org-b".into(),
                     label: "Beta".into(),
                 },
@@ -9506,21 +9635,24 @@ mod tests {
             );
 
             let pending = shell
-                .pending_team_change
+                .pending_organization_change
                 .as_ref()
                 .expect("risk must stop before the executor");
             assert_eq!(pending.risk.live_runs, 1);
             assert!(pending.risk.composer.current_input);
             assert_eq!(pending.risk.pending_sends, 1);
-            assert!(shell.team_change.is_none(), "RPC lifecycle has not begun");
+            assert!(
+                shell.organization_change.is_none(),
+                "RPC lifecycle has not begun"
+            );
             assert!(shell.runtime_change_task.is_none(), "no RPC task exists");
 
-            shell.confirm_pending_team_change(cx);
-            assert!(shell.pending_team_change.is_none());
+            shell.confirm_pending_organization_change(cx);
+            assert!(shell.pending_organization_change.is_none());
             assert!(matches!(
-                shell.team_change,
-                Some(TeamChange {
-                    phase: TeamChangePhase::SelectFailed,
+                shell.organization_change,
+                Some(OrganizationChange {
+                    phase: OrganizationChangePhase::SelectFailed,
                     ..
                 })
             ));
@@ -9528,30 +9660,30 @@ mod tests {
     }
 
     #[gpui::test]
-    fn no_risk_team_mutation_keeps_the_fast_path(cx: &mut TestAppContext) {
+    fn no_risk_organization_mutation_keeps_the_fast_path(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let state = cx.new(|_| {
             let mut state = AppState::new();
             state.auth = Some(signed_in_to("org-a"));
-            state.workspace_scope = Some(WorkspaceScope::Synced);
+            state.profile_scope = Some(ProfileScope::Synced);
             state
         });
         let shell = cx.new(|cx| Shell::new(state, test_boot(dir.path()), cx));
 
         shell.update(cx, |shell, cx| {
-            shell.request_team_mutation(
-                TeamMutation::Create {
-                    name: "New Team".into(),
+            shell.request_organization_mutation(
+                OrganizationMutation::Create {
+                    name: "New Organization".into(),
                 },
                 cx,
             );
 
-            assert!(shell.pending_team_change.is_none());
+            assert!(shell.pending_organization_change.is_none());
             assert!(matches!(
-                shell.team_change,
-                Some(TeamChange {
-                    phase: TeamChangePhase::SelectFailed,
-                    mutation: Some(TeamMutation::Create { .. }),
+                shell.organization_change,
+                Some(OrganizationChange {
+                    phase: OrganizationChangePhase::SelectFailed,
+                    mutation: Some(OrganizationMutation::Create { .. }),
                     ..
                 })
             ));
@@ -9559,150 +9691,162 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_team_mutations_keep_kind_and_original_error_for_feedback() {
+    fn ambiguous_organization_mutations_keep_kind_and_original_error_for_feedback() {
         for mutation in [
-            TeamMutation::Select {
+            OrganizationMutation::Select {
                 organization_id: "org-b".into(),
                 label: "Beta".into(),
             },
-            TeamMutation::Create {
-                name: "New Team".into(),
+            OrganizationMutation::Create {
+                name: "New Organization".into(),
             },
-            TeamMutation::Delete {
+            OrganizationMutation::Delete {
                 organization_id: "org-a".into(),
                 label: "Alpha".into(),
             },
         ] {
             let kind = mutation.kind();
-            let change = TeamChange {
+            let change = OrganizationChange {
                 organization_id: mutation.requested_organization_id().map(str::to_owned),
                 expected_user_id: None,
                 label: mutation.label(),
-                phase: TeamChangePhase::Restarting,
+                phase: OrganizationChangePhase::Restarting,
                 error: None,
                 mutation: Some(mutation),
                 original_error: Some("transport closed after commit was possible".into()),
                 selection_confirmed: false,
             };
-            let notice = team_outcome_unknown_notice(&change)
+            let notice = organization_outcome_unknown_notice(&change)
                 .expect("an ambiguous user mutation must remain visible")
                 .to_string();
-            assert!(notice.contains(team_mutation_verb(kind)));
+            assert!(notice.contains(organization_mutation_verb(kind)));
             assert!(notice.contains("transport closed after commit was possible"));
             assert!(notice.contains("outcome was unknown"));
-            assert!(notice.contains("Team list was refreshed"));
+            assert!(notice.contains("Organization list was refreshed"));
         }
     }
 
     #[test]
     fn confirmed_create_and_delete_require_proof_of_the_new_runtime_target() {
-        let create = TeamMutation::Create {
-            name: "New Team".into(),
+        let create = OrganizationMutation::Create {
+            name: "New Organization".into(),
         };
         assert_eq!(
-            confirmed_team_mutation_target(
+            confirmed_organization_mutation_target(
                 &create,
                 &serde_json::json!({ "organizationId": "org-new" })
             ),
             Ok(Some("org-new".into()))
         );
-        assert!(confirmed_team_mutation_target(&create, &serde_json::json!({})).is_err());
+        assert!(confirmed_organization_mutation_target(&create, &serde_json::json!({})).is_err());
 
-        let delete = TeamMutation::Delete {
+        let delete = OrganizationMutation::Delete {
             organization_id: "org-old".into(),
-            label: "Old Team".into(),
+            label: "Old Organization".into(),
         };
         assert_eq!(
-            confirmed_team_mutation_target(
+            confirmed_organization_mutation_target(
                 &delete,
                 &serde_json::json!({ "action": "switched", "organizationId": "org-next" })
             ),
             Ok(Some("org-next".into()))
         );
         assert_eq!(
-            confirmed_team_mutation_target(&delete, &serde_json::json!({ "action": "signedOut" })),
+            confirmed_organization_mutation_target(
+                &delete,
+                &serde_json::json!({ "action": "signedOut" })
+            ),
             Ok(None)
         );
         assert!(
-            confirmed_team_mutation_target(&delete, &serde_json::json!({ "action": "switched" }))
-                .is_err()
+            confirmed_organization_mutation_target(
+                &delete,
+                &serde_json::json!({ "action": "switched" })
+            )
+            .is_err()
         );
     }
 
     #[test]
-    fn team_runtime_handoff_waits_for_auth_and_rejects_wrong_profile() {
+    fn organization_runtime_handoff_waits_for_auth_and_rejects_wrong_profile() {
         assert_eq!(
-            validate_team_runtime_auth(None, TeamRuntimeExpectation::ExactOrg("org-b")),
+            validate_organization_runtime_auth(
+                None,
+                OrganizationRuntimeExpectation::ExactOrganization("org-b")
+            ),
             None
         );
         assert_eq!(
-            validate_team_runtime_auth(
+            validate_organization_runtime_auth(
                 Some(&signed_in_to("org-b")),
-                TeamRuntimeExpectation::ExactOrg("org-b")
+                OrganizationRuntimeExpectation::ExactOrganization("org-b")
             ),
             Some(Ok(()))
         );
-        let mismatch = validate_team_runtime_auth(
+        let mismatch = validate_organization_runtime_auth(
             Some(&signed_in_to("org-a")),
-            TeamRuntimeExpectation::ExactOrg("org-b"),
+            OrganizationRuntimeExpectation::ExactOrganization("org-b"),
         )
         .expect("auth frame is present")
-        .expect_err("the old Team must not be accepted");
+        .expect_err("the old Organization must not be accepted");
         assert!(mismatch.contains("org-b"), "{mismatch}");
         assert!(
-            validate_team_runtime_auth(
+            validate_organization_runtime_auth(
                 Some(&signed_in_as("user-2", "org-b")),
-                TeamRuntimeExpectation::ExactProfile {
+                OrganizationRuntimeExpectation::ExactProfile {
                     organization_id: "org-b",
                     user_id: "user-1",
                 },
             )
             .expect("auth frame is present")
             .is_err(),
-            "the same Team under a different account is a different runtime profile"
+            "the same Organization under a different account is a different runtime profile"
         );
         assert!(
-            validate_team_runtime_auth(
+            validate_organization_runtime_auth(
                 Some(&AuthState::SignedOut),
-                TeamRuntimeExpectation::SignedOut
+                OrganizationRuntimeExpectation::SignedOut
             ) == Some(Ok(())),
-            "deleting the final Team may legitimately reopen local mode"
+            "deleting the final Organization may legitimately reopen local mode"
         );
         assert!(
-            validate_team_runtime_auth(
+            validate_organization_runtime_auth(
                 Some(&signed_in_to("org-deleted")),
-                TeamRuntimeExpectation::SignedOut
+                OrganizationRuntimeExpectation::SignedOut
             )
             .expect("auth frame is present")
             .is_err(),
-            "a stale deleted-Team session must not pass the signed-out expectation"
+            "a stale deleted-Organization session must not pass the signed-out expectation"
         );
     }
 
     #[test]
-    fn ambiguous_team_handoff_separates_fail_closed_auth_from_an_open_team() {
-        assert!(team_selection_error_is_confirmed(Some("org-b"), "org-b"));
+    fn ambiguous_organization_handoff_separates_fail_closed_auth_from_an_open_organization() {
+        assert!(organization_selection_error_is_confirmed(
+            Some("org-b"),
+            "org-b"
+        ));
         assert!(
-            !team_selection_error_is_confirmed(Some("org-a"), "org-b"),
+            !organization_selection_error_is_confirmed(Some("org-a"), "org-b"),
             "an RPC error that beats AuthStatus must remain an ambiguous handoff"
         );
         assert_eq!(
-            classify_ambiguous_team_runtime(&signed_in_as("user-1", "org-b"), "org-b"),
-            AmbiguousTeamRuntimeOutcome::RequestedProfile(RuntimeProfileIdentity {
+            classify_ambiguous_organization_runtime(&signed_in_as("user-1", "org-b"), "org-b"),
+            AmbiguousOrganizationRuntimeOutcome::RequestedProfile(RuntimeProfileIdentity {
                 user_id: "user-1".into(),
                 organization_id: "org-b".into(),
             })
         );
         assert_eq!(
-            classify_ambiguous_team_runtime(&signed_in_as("user-1", "org-a"), "org-b"),
-            AmbiguousTeamRuntimeOutcome::OtherProfile(RuntimeProfileIdentity {
+            classify_ambiguous_organization_runtime(&signed_in_as("user-1", "org-a"), "org-b"),
+            AmbiguousOrganizationRuntimeOutcome::OtherProfile(RuntimeProfileIdentity {
                 user_id: "user-1".into(),
                 organization_id: "org-a".into(),
             })
         );
         assert_eq!(
-            classify_ambiguous_team_runtime(&AuthState::SignedOut, "org-b"),
-            AmbiguousTeamRuntimeOutcome::SignedOut,
+            classify_ambiguous_organization_runtime(&AuthState::SignedOut, "org-b"),
+            AmbiguousOrganizationRuntimeOutcome::SignedOut,
             "a delayed fail-closed AuthStatus must enter the explicit synced-to-local lifecycle"
         );
         let user = zeron_proto::UserProfile {
@@ -9711,59 +9855,65 @@ mod tests {
             name: None,
         };
         assert_eq!(
-            classify_ambiguous_team_runtime(
+            classify_ambiguous_organization_runtime(
                 &AuthState::NeedsOrganization { user: user.clone() },
                 "org-b"
             ),
-            AmbiguousTeamRuntimeOutcome::NeedsOrganization,
-            "an organization gate is not proof that the previous Team reopened"
+            AmbiguousOrganizationRuntimeOutcome::NeedsOrganization,
+            "an organization gate is not proof that the previous Organization reopened"
         );
         assert_eq!(
-            classify_ambiguous_team_runtime(&AuthState::SignedIn { user, org_id: None }, "org-b"),
-            AmbiguousTeamRuntimeOutcome::NeedsOrganization
+            classify_ambiguous_organization_runtime(
+                &AuthState::SignedIn {
+                    user,
+                    organization_id: None
+                },
+                "org-b"
+            ),
+            AmbiguousOrganizationRuntimeOutcome::NeedsOrganization
         );
     }
 
     #[test]
-    fn signed_out_team_handoff_reuses_local_and_only_replaces_synced_runtime() {
+    fn signed_out_organization_handoff_reuses_local_and_only_replaces_synced_runtime() {
         assert_eq!(
-            signed_out_team_runtime_action(Some(WorkspaceScope::Local)),
-            SignedOutTeamRuntimeAction::AlreadyLocal,
+            signed_out_organization_runtime_action(Some(ProfileScope::Local)),
+            SignedOutOrganizationRuntimeAction::AlreadyLocal,
             "the first fail-closed replacement should not reopen Local twice"
         );
         assert_eq!(
-            signed_out_team_runtime_action(Some(WorkspaceScope::Synced)),
-            SignedOutTeamRuntimeAction::ReplaceSyncedWithLocal,
+            signed_out_organization_runtime_action(Some(ProfileScope::Synced)),
+            SignedOutOrganizationRuntimeAction::ReplaceSyncedWithLocal,
             "a still-synced runtime needs the explicit local handoff"
         );
     }
 
     #[test]
-    fn another_viewports_team_selection_requires_a_runtime_handoff() {
+    fn another_viewports_organization_selection_requires_a_runtime_handoff() {
         let ready = ConnectionStatus::Ready;
         let connecting = ConnectionStatus::Connecting;
-        let team_a = signed_in_to("org-a");
-        let team_b = signed_in_to("org-b");
-        let account_b_same_team = signed_in_as("user-2", "org-a");
-        let baseline = runtime_profile_identity(Some(&team_a)).unwrap();
+        let organization_a = signed_in_to("org-a");
+        let organization_b = signed_in_to("org-b");
+        let account_b_same_organization = signed_in_as("user-2", "org-a");
+        let baseline = runtime_profile_identity(Some(&organization_a)).unwrap();
 
         assert_eq!(
-            external_team_replacement_target(
+            external_organization_replacement_target(
                 None,
                 &ready,
-                Some(WorkspaceScope::Synced),
-                Some(&team_a),
+                Some(ProfileScope::Synced),
+                Some(&organization_a),
                 false,
             ),
             None,
             "a missing immutable baseline cannot prove that a switch occurred"
         );
         assert_eq!(
-            external_team_replacement_target(
+            external_organization_replacement_target(
                 Some(&baseline),
                 &ready,
-                Some(WorkspaceScope::Synced),
-                Some(&team_b),
+                Some(ProfileScope::Synced),
+                Some(&organization_b),
                 false,
             ),
             Some(RuntimeProfileIdentity {
@@ -9773,57 +9923,57 @@ mod tests {
             "a shared AuthStatus change must make this viewport reattach"
         );
         assert_eq!(
-            external_team_replacement_target(
+            external_organization_replacement_target(
                 Some(&baseline),
                 &ready,
-                Some(WorkspaceScope::Synced),
-                Some(&team_a),
+                Some(ProfileScope::Synced),
+                Some(&organization_a),
                 false,
             ),
             None,
             "repeated frames for the same fixed profile are inert"
         );
         assert_eq!(
-            external_team_replacement_target(
+            external_organization_replacement_target(
                 Some(&baseline),
                 &ready,
-                Some(WorkspaceScope::Synced),
-                Some(&account_b_same_team),
+                Some(ProfileScope::Synced),
+                Some(&account_b_same_organization),
                 false,
             ),
             Some(RuntimeProfileIdentity {
                 user_id: "user-2".into(),
                 organization_id: "org-a".into(),
             }),
-            "same-org sign-in as another user is still a profile replacement"
+            "same-Organization sign-in as another user is still a profile replacement"
         );
         assert_eq!(
-            external_team_replacement_target(
+            external_organization_replacement_target(
                 Some(&baseline),
                 &ready,
-                Some(WorkspaceScope::Synced),
-                Some(&team_b),
+                Some(ProfileScope::Synced),
+                Some(&organization_b),
                 true,
             ),
             None,
-            "the explicit Team lifecycle owns its own auth change"
+            "the explicit Organization lifecycle owns its own auth change"
         );
         assert_eq!(
-            external_team_replacement_target(
+            external_organization_replacement_target(
                 Some(&baseline),
                 &connecting,
-                Some(WorkspaceScope::Synced),
-                Some(&team_b),
+                Some(ProfileScope::Synced),
+                Some(&organization_b),
                 false,
             ),
             None
         );
         assert_eq!(
-            external_team_replacement_target(
+            external_organization_replacement_target(
                 Some(&baseline),
                 &ready,
-                Some(WorkspaceScope::Local),
-                Some(&team_b),
+                Some(ProfileScope::Local),
+                Some(&organization_b),
                 false,
             ),
             None
@@ -9837,10 +9987,10 @@ mod tests {
             .expect("current EngineInfo has a fixed profile");
 
         assert_eq!(
-            external_team_replacement_target(
+            external_organization_replacement_target(
                 Some(&baseline),
                 &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Synced),
+                Some(ProfileScope::Synced),
                 Some(&signed_in_to("org-b")),
                 false,
             ),
@@ -9857,20 +10007,23 @@ mod tests {
         let old_runtime = synced_engine_info("user-1", "org-a");
         let target_auth = signed_in_to("org-b");
         assert_eq!(
-            validate_team_runtime_auth(
+            validate_organization_runtime_auth(
                 Some(&target_auth),
-                TeamRuntimeExpectation::ExactOrg("org-b")
+                OrganizationRuntimeExpectation::ExactOrganization("org-b")
             ),
             Some(Ok(())),
-            "the control plane alone already reports the requested Team"
+            "the control plane alone already reports the requested Organization"
         );
 
-        let error = validate_team_runtime_planes(&old_runtime, &target_auth)
+        let error = validate_organization_runtime_planes(&old_runtime, &target_auth)
             .expect_err("old data plane must not pass target auth validation");
         assert!(error.contains("different data profile"), "{error}");
         assert!(
-            validate_team_runtime_planes(&synced_engine_info("user-1", "org-b"), &target_auth,)
-                .is_ok(),
+            validate_organization_runtime_planes(
+                &synced_engine_info("user-1", "org-b"),
+                &target_auth,
+            )
+            .is_ok(),
             "handoff may finish only after EngineInfo and AuthStatus converge"
         );
     }
@@ -9890,7 +10043,7 @@ mod tests {
             ipc_port: 27901,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: None,
             default_harness: zeron_proto::HarnessId::Mock,
         };
@@ -9915,7 +10068,8 @@ mod tests {
             shell.delete_confirm = Some("old-chat".into());
             shell.delete_space_confirm = Some("old-space".into());
             shell.user_menu.open(());
-            shell.user_menu_orgs = Loadable::Ready(vec![org("old-org", "Old Team")]);
+            shell.user_menu_organizations =
+                Loadable::Ready(vec![organization("old-org", "Old Organization")]);
             shell.mutate_task = Some(Task::ready(()));
             shell.auth_task = Some(Task::ready(()));
             shell.import_task = Some(Task::ready(()));
@@ -9929,7 +10083,7 @@ mod tests {
                 .insert(3, cx.new(|cx| FileExplorer::new(state.clone(), cx)));
 
             shell.devices_page = Some(cx.new(|cx| DevicesPage::new(state.clone(), cx)));
-            shell.team_page = Some(cx.new(|cx| TeamPage::new(state.clone(), cx)));
+            shell.organization_page = Some(cx.new(|cx| OrganizationPage::new(state.clone(), cx)));
             shell.archived_page = Some(cx.new(|cx| ArchivedPage::new(state.clone(), cx)));
             shell.accounts_page = Some(cx.new(|cx| AccountsPage::new(state.clone(), cx)));
             shell.harnesses_page = Some(cx.new(|cx| HarnessesPage::new(state.clone(), cx)));
@@ -9956,15 +10110,15 @@ mod tests {
                 .insert("old-space".into(), vec!["old-chat".into()]);
             shell.settings.space_order.push("old-space".into());
 
-            shell.team_change = Some(TeamChange {
+            shell.organization_change = Some(OrganizationChange {
                 organization_id: Some("new-org".into()),
                 expected_user_id: None,
-                label: "New Team".into(),
-                phase: TeamChangePhase::Restarting,
+                label: "New Organization".into(),
+                phase: OrganizationChangePhase::Restarting,
                 error: None,
-                mutation: Some(TeamMutation::Select {
+                mutation: Some(OrganizationMutation::Select {
                     organization_id: "new-org".into(),
-                    label: "New Team".into(),
+                    label: "New Organization".into(),
                 }),
                 original_error: None,
                 selection_confirmed: true,
@@ -9995,14 +10149,14 @@ mod tests {
             assert!(shell.file_explorers.is_empty());
             assert_eq!(shell.file_explorer_seq, 0);
             assert!(shell.devices_page.is_none());
-            assert!(shell.team_page.is_none());
+            assert!(shell.organization_page.is_none());
             assert!(shell.archived_page.is_none());
             assert!(shell.accounts_page.is_none());
             assert!(shell.harnesses_page.is_none());
             assert!(shell.delete_confirm.is_none());
             assert!(shell.delete_space_confirm.is_none());
             assert!(!shell.user_menu.is_open());
-            assert!(matches!(shell.user_menu_orgs, Loadable::Idle));
+            assert!(matches!(shell.user_menu_organizations, Loadable::Idle));
             assert!(shell.mutate_task.is_none());
             assert!(shell.auth_task.is_none());
             assert!(shell.import_task.is_none());
@@ -10044,9 +10198,9 @@ mod tests {
             assert_eq!(shell.sync_flow, SyncFlow::Switching { import: false });
             assert_eq!(shell.fixed_runtime_profile, None);
             assert!(matches!(
-                shell.team_change,
-                Some(TeamChange {
-                    phase: TeamChangePhase::Restarting,
+                shell.organization_change,
+                Some(OrganizationChange {
+                    phase: OrganizationChangePhase::Restarting,
                     ..
                 })
             ));
@@ -10074,7 +10228,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("session.json"),
-            r#"{"refreshToken":"still-valid","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
+            r#"{"refreshToken":"still-valid","user":{"id":"user_1","email":"u@example.com"},"organizationId":"org_1"}"#,
         )
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10085,14 +10239,14 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: Some("client_test".into()),
             default_harness: zeron_proto::HarnessId::Mock,
         };
         let synced = crate::state::EngineHandle::bootstrap(boot.clone())
             .await
             .expect("saved session opens its synced profile");
-        assert_eq!(synced.engine_info().workspace_scope, WorkspaceScope::Synced);
+        assert_eq!(synced.engine_info().profile_scope, ProfileScope::Synced);
 
         synced
             .client()
@@ -10107,7 +10261,7 @@ mod tests {
         let local = crate::state::EngineHandle::bootstrap(boot)
             .await
             .expect("same process can continue locally");
-        assert_eq!(local.engine_info().workspace_scope, WorkspaceScope::Local);
+        assert_eq!(local.engine_info().profile_scope, ProfileScope::Local);
         local.shutdown().await;
     }
 
@@ -10183,17 +10337,17 @@ mod tests {
     }
 
     #[test]
-    fn account_actions_follow_the_attached_workspace_scope() {
+    fn account_actions_follow_the_attached_profile_scope() {
         assert_eq!(
-            account_menu_action(Some(WorkspaceScope::Local), SyncFlow::Idle),
+            account_menu_action(Some(ProfileScope::Local), SyncFlow::Idle),
             Some(AccountMenuAction::EnableSync)
         );
         assert_eq!(
-            account_menu_action(Some(WorkspaceScope::Synced), SyncFlow::Idle),
+            account_menu_action(Some(ProfileScope::Synced), SyncFlow::Idle),
             Some(AccountMenuAction::SignOut)
         );
         assert_eq!(
-            account_menu_action(Some(WorkspaceScope::Development), SyncFlow::Idle),
+            account_menu_action(Some(ProfileScope::Development), SyncFlow::Idle),
             None
         );
     }
@@ -10206,30 +10360,26 @@ mod tests {
                 email: "user@example.com".into(),
                 name: None,
             },
-            org_id: Some("org-1".into()),
+            organization_id: Some("org-1".into()),
         };
 
         assert_eq!(
             sync_flow_after_auth(
                 SyncFlow::Enabling,
-                Some(WorkspaceScope::Local),
+                Some(ProfileScope::Local),
                 Some(&signed_in),
             ),
             SyncFlow::SwitchOffer { notice_open: true }
         );
         assert_eq!(
-            sync_flow_after_auth(
-                SyncFlow::Idle,
-                Some(WorkspaceScope::Local),
-                Some(&signed_in),
-            ),
+            sync_flow_after_auth(SyncFlow::Idle, Some(ProfileScope::Local), Some(&signed_in),),
             SyncFlow::SwitchOffer { notice_open: true },
             "another viewport derives the pending switch from AuthStatus"
         );
         assert_eq!(
             sync_flow_after_auth(
                 SyncFlow::SwitchOffer { notice_open: false },
-                Some(WorkspaceScope::Local),
+                Some(ProfileScope::Local),
                 Some(&signed_in),
             ),
             SyncFlow::SwitchOffer { notice_open: false },
@@ -10238,7 +10388,7 @@ mod tests {
         assert_eq!(
             sync_flow_after_auth(
                 SyncFlow::RestartPending { notice_open: false },
-                Some(WorkspaceScope::Local),
+                Some(ProfileScope::Local),
                 Some(&signed_in),
             ),
             SyncFlow::RestartPending { notice_open: false },
@@ -10246,7 +10396,7 @@ mod tests {
         );
         assert_eq!(
             account_menu_action(
-                Some(WorkspaceScope::Local),
+                Some(ProfileScope::Local),
                 SyncFlow::SwitchOffer { notice_open: false },
             ),
             Some(AccountMenuAction::RestartPending)
@@ -10255,7 +10405,7 @@ mod tests {
             assert_eq!(
                 sync_flow_after_auth(
                     SyncFlow::SwitchOffer { notice_open },
-                    Some(WorkspaceScope::Local),
+                    Some(ProfileScope::Local),
                     Some(&AuthState::SignedOut),
                 ),
                 SyncFlow::Idle,
@@ -10318,13 +10468,13 @@ mod tests {
                 email: "user@example.com".into(),
                 name: None,
             },
-            org_id: Some("org-1".into()),
+            organization_id: Some("org-1".into()),
         };
 
         // "Later" postpones the failure notice; it must not evaporate.
         let dismissed = SyncFlow::ImportFailed { notice_open: false };
         assert_eq!(
-            sync_flow_after_auth(dismissed, Some(WorkspaceScope::Synced), Some(&signed_in)),
+            sync_flow_after_auth(dismissed, Some(ProfileScope::Synced), Some(&signed_in)),
             dismissed,
             "a postponed import failure survives auth/scope updates"
         );
@@ -10334,13 +10484,13 @@ mod tests {
         // no local runtime left to re-derive an offer from, so this menu row
         // is the only path back to the retry dialog.
         assert_eq!(
-            account_menu_action(Some(WorkspaceScope::Synced), dismissed),
+            account_menu_action(Some(ProfileScope::Synced), dismissed),
             Some(AccountMenuAction::RestartPending),
             "retry must remain reachable after dismissal"
         );
         assert_eq!(
             account_menu_action(
-                Some(WorkspaceScope::Synced),
+                Some(ProfileScope::Synced),
                 SyncFlow::ImportFailed { notice_open: true },
             ),
             Some(AccountMenuAction::RestartPending)
@@ -10348,7 +10498,7 @@ mod tests {
 
         // Resolving the failure restores the normal synced menu.
         assert_eq!(
-            account_menu_action(Some(WorkspaceScope::Synced), SyncFlow::Idle),
+            account_menu_action(Some(ProfileScope::Synced), SyncFlow::Idle),
             Some(AccountMenuAction::SignOut)
         );
     }
@@ -10361,7 +10511,7 @@ mod tests {
                 email: "user@example.com".into(),
                 name: None,
             },
-            org_id: Some("org-1".into()),
+            organization_id: Some("org-1".into()),
         };
         for flow in [
             SyncFlow::Switching { import: true },
@@ -10377,12 +10527,12 @@ mod tests {
             // (replacement runtime up): the driver owns these states — auth
             // and scope edges must never reset them.
             assert_eq!(
-                sync_flow_after_auth(flow, Some(WorkspaceScope::Local), Some(&signed_in)),
+                sync_flow_after_auth(flow, Some(ProfileScope::Local), Some(&signed_in)),
                 flow
             );
             assert_eq!(sync_flow_after_auth(flow, None, None), flow);
             assert_eq!(
-                sync_flow_after_auth(flow, Some(WorkspaceScope::Synced), Some(&signed_in)),
+                sync_flow_after_auth(flow, Some(ProfileScope::Synced), Some(&signed_in)),
                 flow
             );
         }
@@ -10396,13 +10546,13 @@ mod tests {
                 email: "other@example.com".into(),
                 name: None,
             },
-            org_id: Some("org-2".into()),
+            organization_id: Some("org-2".into()),
         };
 
         assert_eq!(
             sync_flow_after_auth(
                 SyncFlow::SigningOut,
-                Some(WorkspaceScope::Synced),
+                Some(ProfileScope::Synced),
                 Some(&AuthState::SignedOut),
             ),
             SyncFlow::SignedOutRestartRequired,
@@ -10411,7 +10561,7 @@ mod tests {
         assert_eq!(
             sync_flow_after_auth(
                 SyncFlow::Idle,
-                Some(WorkspaceScope::Synced),
+                Some(ProfileScope::Synced),
                 Some(&AuthState::SignedOut),
             ),
             SyncFlow::SignedOutRestartRequired,
@@ -10420,7 +10570,7 @@ mod tests {
         assert_eq!(
             sync_flow_after_auth(
                 SyncFlow::SignedOutRestartRequired,
-                Some(WorkspaceScope::Synced),
+                Some(ProfileScope::Synced),
                 Some(&signed_in_as_another_user),
             ),
             SyncFlow::SignedOutRestartRequired,

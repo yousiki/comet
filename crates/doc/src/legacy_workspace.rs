@@ -1,4 +1,4 @@
-//! Workspace doc schema over `loro` — the per-org entity index that replaces zeron's
+//! Legacy workspace doc schema over `loro` — the historical per-Organization entity index.
 //! residual entity sync (ARCHITECTURE.md §2.2). Lives in its own DO room (same
 //! SessionRoom class, doc id `ws/{orgId}`).
 //!
@@ -32,20 +32,20 @@ use zeron_proto::{Chat, ChatConfig, Device, Session, SessionStatus, Space};
 
 use crate::schema::DocError;
 
-/// Workspace doc schema version. v2 = the spaces overhaul (spaces container,
+/// Legacy workspace doc schema version. v2 = the spaces overhaul (spaces container,
 /// chat spaceId/lastSeenAt) — a destructive break shipped via a fresh doc/room
 /// (`workspace2` / `ws2/{orgId}`), so no v1 reader exists.
-pub const WORKSPACE_SCHEMA_VERSION: i64 = 2;
+pub const LEGACY_WORKSPACE_SCHEMA_VERSION: i64 = 2;
 
 /// Ephemeral presence key for a device (`presence/{deviceId}` → online timestamp).
 pub fn presence_key(device_id: &str) -> String {
     format!("presence/{device_id}")
 }
 
-/// Everything in the workspace doc, materialized (`read_all`).
+/// Everything in the legacy workspace doc, materialized (`read_all`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkspaceState {
+pub struct LegacyWorkspaceState {
     pub devices: Vec<Device>,
     pub spaces: Vec<Space>,
     pub chats: Vec<Chat>,
@@ -67,19 +67,19 @@ pub struct DeletedDevice {
     pub chat_ids: Vec<String>,
 }
 
-/// A workspace doc handle: typed access over a LoroDoc with the schema above.
-pub struct WorkspaceDoc {
+/// A legacy workspace doc handle: typed access over a LoroDoc with the schema above.
+pub struct LegacyWorkspaceDoc {
     doc: LoroDoc,
 }
 
-impl Default for WorkspaceDoc {
+impl Default for LegacyWorkspaceDoc {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl WorkspaceDoc {
-    /// Fresh, empty workspace doc.
+impl LegacyWorkspaceDoc {
+    /// Fresh, empty legacy workspace doc.
     pub fn new() -> Self {
         Self {
             doc: LoroDoc::new(),
@@ -461,8 +461,8 @@ impl WorkspaceDoc {
 
     // ── whole-doc read ──────────────────────────────────────────────────────
 
-    pub fn read_all(&self) -> Result<WorkspaceState, DocError> {
-        Ok(WorkspaceState {
+    pub fn read_all(&self) -> Result<LegacyWorkspaceState, DocError> {
+        Ok(LegacyWorkspaceState {
             devices: self.read_devices()?,
             spaces: self.read_spaces()?,
             chats: self.read_chats()?,
@@ -481,11 +481,11 @@ impl WorkspaceDoc {
             _ => None,
         };
         match current {
-            Some(v) if v >= WORKSPACE_SCHEMA_VERSION => Ok(v),
+            Some(v) if v >= LEGACY_WORKSPACE_SCHEMA_VERSION => Ok(v),
             _ => {
-                meta.insert("schemaVersion", WORKSPACE_SCHEMA_VERSION)?;
+                meta.insert("schemaVersion", LEGACY_WORKSPACE_SCHEMA_VERSION)?;
                 self.doc.commit();
-                Ok(WORKSPACE_SCHEMA_VERSION)
+                Ok(LEGACY_WORKSPACE_SCHEMA_VERSION)
             }
         }
     }
@@ -524,7 +524,7 @@ impl WorkspaceDoc {
             match serde_json::from_value::<T>(row) {
                 Ok(parsed) => out.push(parsed),
                 Err(err) => {
-                    tracing::warn!(container, row = %key, error = %err, "skipping malformed workspace row");
+                    tracing::warn!(container, row = %key, error = %err, "skipping malformed legacy workspace row");
                 }
             }
         }
@@ -779,7 +779,7 @@ mod tests {
         }
     }
 
-    fn cross_sync(a: &WorkspaceDoc, b: &WorkspaceDoc) {
+    fn cross_sync(a: &LegacyWorkspaceDoc, b: &LegacyWorkspaceDoc) {
         let a_update = a
             .doc()
             .export(ExportMode::updates(&b.doc().oplog_vv()))
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn set_chat_config_round_trips_and_ignores_missing_rows() {
-        let ws = WorkspaceDoc::new();
+        let ws = LegacyWorkspaceDoc::new();
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
         let mut options = serde_json::Map::new();
         options.insert(
@@ -818,7 +818,7 @@ mod tests {
 
     #[test]
     fn rows_round_trip() {
-        let ws = WorkspaceDoc::new();
+        let ws = LegacyWorkspaceDoc::new();
         ws.upsert_device(&device("dev-a", "laptop")).unwrap();
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
         ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
@@ -846,20 +846,20 @@ mod tests {
 
     #[test]
     fn snapshot_round_trips_between_docs() {
-        let ws = WorkspaceDoc::new();
+        let ws = LegacyWorkspaceDoc::new();
         ws.upsert_device(&device("dev-a", "laptop")).unwrap();
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
         let bytes = ws.export_snapshot().unwrap();
 
         let other = LoroDoc::new();
         other.import(&bytes).unwrap();
-        let restored = WorkspaceDoc::from_doc(other);
+        let restored = LegacyWorkspaceDoc::from_doc(other);
         assert_eq!(restored.read_all().unwrap(), ws.read_all().unwrap());
     }
 
     #[test]
     fn field_mutators_round_trip() {
-        let ws = WorkspaceDoc::new();
+        let ws = LegacyWorkspaceDoc::new();
         ws.upsert_device(&device("dev-a", "laptop")).unwrap();
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
 
@@ -888,7 +888,7 @@ mod tests {
 
     #[test]
     fn delete_chat_tombstones_row_and_session() {
-        let ws = WorkspaceDoc::new();
+        let ws = LegacyWorkspaceDoc::new();
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
         ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Idle))
             .unwrap();
@@ -900,8 +900,8 @@ mod tests {
 
     #[test]
     fn two_peers_converge_on_disjoint_rows() {
-        let a = WorkspaceDoc::new();
-        let b = WorkspaceDoc::new();
+        let a = LegacyWorkspaceDoc::new();
+        let b = LegacyWorkspaceDoc::new();
         // Writer discipline: each device writes its own rows, concurrently.
         a.upsert_device(&device("dev-a", "laptop")).unwrap();
         a.upsert_chat(&chat("chat-a", "dev-a")).unwrap();
@@ -928,7 +928,7 @@ mod tests {
 
     #[test]
     fn spaces_round_trip_and_mutate() {
-        let ws = WorkspaceDoc::new();
+        let ws = LegacyWorkspaceDoc::new();
         ws.upsert_space(&space("sp-1", "dev-a", "/home/u/project"))
             .unwrap();
         let row = ws.space("sp-1").unwrap().expect("row exists");
@@ -959,7 +959,7 @@ mod tests {
 
     #[test]
     fn delete_space_cascades_and_converges_across_peers() {
-        let a = WorkspaceDoc::new();
+        let a = LegacyWorkspaceDoc::new();
         a.upsert_space(&space("sp-1", "dev-a", "/tmp/one")).unwrap();
         a.upsert_space(&space("sp-2", "dev-a", "/tmp/two")).unwrap();
         let mut in_space = chat("chat-1", "dev-a");
@@ -971,7 +971,7 @@ mod tests {
         a.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
             .unwrap();
 
-        let b = WorkspaceDoc::from_doc({
+        let b = LegacyWorkspaceDoc::from_doc({
             let d = LoroDoc::new();
             d.import(&a.export_snapshot().unwrap()).unwrap();
             d
@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn chat_seen_is_monotonic_and_settles_lww() {
-        let a = WorkspaceDoc::new();
+        let a = LegacyWorkspaceDoc::new();
         a.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
         assert!(a.set_chat_seen("chat-1", ts(5_000)).unwrap());
         assert_eq!(
@@ -1028,7 +1028,7 @@ mod tests {
         assert!(!a.set_chat_seen("nope", ts(1)).unwrap());
 
         // Concurrent marks from two peers settle on the same winner.
-        let b = WorkspaceDoc::from_doc({
+        let b = LegacyWorkspaceDoc::from_doc({
             let d = LoroDoc::new();
             d.import(&a.export_snapshot().unwrap()).unwrap();
             d
@@ -1044,24 +1044,24 @@ mod tests {
 
     #[test]
     fn schema_version_stamp_is_idempotent() {
-        let ws = WorkspaceDoc::new();
+        let ws = LegacyWorkspaceDoc::new();
         assert_eq!(
             ws.ensure_schema_version().unwrap(),
-            WORKSPACE_SCHEMA_VERSION
+            LEGACY_WORKSPACE_SCHEMA_VERSION
         );
         let before = ws.doc().oplog_vv();
         assert_eq!(
             ws.ensure_schema_version().unwrap(),
-            WORKSPACE_SCHEMA_VERSION
+            LEGACY_WORKSPACE_SCHEMA_VERSION
         );
         assert_eq!(ws.doc().oplog_vv(), before);
     }
 
     #[test]
     fn concurrent_rename_settles_lww_on_both_peers() {
-        let a = WorkspaceDoc::new();
+        let a = LegacyWorkspaceDoc::new();
         a.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
-        let b = WorkspaceDoc::from_doc({
+        let b = LegacyWorkspaceDoc::from_doc({
             let d = LoroDoc::new();
             d.import(&a.export_snapshot().unwrap()).unwrap();
             d

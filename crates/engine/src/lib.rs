@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-pub use zeron_proto::{EngineInfo, EngineProfileIdentity, HarnessId, WorkspaceScope};
+pub use zeron_proto::{EngineInfo, HarnessId, ProfileIdentity, ProfileScope};
 use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use zeron_sync::DocsStore;
@@ -26,6 +26,7 @@ pub mod instance_lock;
 pub mod local_import;
 pub mod profile;
 pub mod registry;
+pub mod registry_host;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
@@ -35,10 +36,9 @@ pub mod spaces;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
-pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrganizationMembership};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
@@ -49,6 +49,10 @@ pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
+pub use registry_host::{
+    DEFAULT_ORGANIZATION_ID, DEFAULT_USER_ID, LEGACY_WORKSPACE_V2_DOC_ID, RegistryHost,
+    RegistryHostConfig,
+};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
@@ -62,9 +66,6 @@ pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
-pub use workspace_host::{
-    DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
-};
 
 pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";
 
@@ -94,8 +95,8 @@ pub(crate) fn new_id() -> String {
 }
 
 /// Token provider bound to one immutable engine profile. Authentication is
-/// intentionally mutable so WorkOS can refresh and select another Team, but
-/// an already-open runtime must never carry that new user or org bearer into
+/// intentionally mutable so WorkOS can refresh and select another Organization,
+/// but an already-open runtime must never carry that new user or organization bearer into
 /// its old stores, rooms, relay, or peer links during the shutdown handoff.
 struct ProfileTokenSource {
     source: Arc<dyn zeron_rpc::TokenSource>,
@@ -114,12 +115,6 @@ impl ProfileTokenSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProfileIdentity {
-    org_id: String,
-    user_id: String,
-}
-
 #[async_trait]
 impl zeron_rpc::TokenSource for ProfileTokenSource {
     async fn token(&self) -> Option<String> {
@@ -130,17 +125,17 @@ impl zeron_rpc::TokenSource for ProfileTokenSource {
         let actual = jwt_profile(&token);
         if actual.as_ref() != Some(expected) {
             tracing::warn!(
-                expected_org = expected.org_id,
+                expected_organization = expected.organization_id,
                 expected_user = expected.user_id,
-                actual_org = actual
+                actual_organization = actual
                     .as_ref()
-                    .map(|profile| profile.org_id.as_str())
+                    .map(|profile| profile.organization_id.as_str())
                     .unwrap_or("<missing>"),
                 actual_user = actual
                     .as_ref()
                     .map(|profile| profile.user_id.as_str())
                     .unwrap_or("<missing>"),
-                "blocked bearer outside the runtime's fixed user and Team profile"
+                "blocked bearer outside the runtime's fixed user and Organization profile"
             );
             return None;
         }
@@ -155,7 +150,8 @@ impl zeron_rpc::TokenSource for ProfileTokenSource {
 fn jwt_profile(token: &str) -> Option<ProfileIdentity> {
     #[derive(serde::Deserialize)]
     struct Claims {
-        org_id: Option<String>,
+        #[serde(rename = "org_id")]
+        organization_id: Option<String>,
         sub: Option<String>,
     }
 
@@ -166,7 +162,7 @@ fn jwt_profile(token: &str) -> Option<ProfileIdentity> {
         .ok()?;
     let claims = serde_json::from_slice::<Claims>(&bytes).ok()?;
     Some(ProfileIdentity {
-        org_id: claims.org_id?,
+        organization_id: claims.organization_id?,
         user_id: claims.sub?,
     })
 }
@@ -182,11 +178,12 @@ pub struct EngineConfig {
     pub edge_token: Option<String>,
     /// Localhost IPC port for the UI.
     pub ipc_port: u16,
-    /// Harness for doc-command runs on chats without a workspace `config` row.
+    /// Harness for doc-command runs on chats without a registry `config` row.
     pub default_harness: HarnessId,
-    /// Workspace-doc org (`ws/{orgId}` room). `None` = `$ZERON_ORG_ID` or the dev default.
-    /// In WorkOS mode the signed-in session's org wins.
-    pub org_id: Option<String>,
+    /// Organization that scopes the registry. `None` = `$ZERON_ORGANIZATION_ID` or the dev default.
+    /// `$ZERON_ORG_ID` remains a read-only legacy fallback.
+    /// In WorkOS mode the signed-in session's organization wins.
+    pub organization_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
     pub workos_client_id: Option<String>,
 }
@@ -196,8 +193,8 @@ pub struct EngineConfig {
 pub struct EngineCore {
     pub sessions: SessionsEngine,
     pub doc_host: DocHost,
-    pub workspace: WorkspaceHost,
-    pub registry: Arc<HarnessRegistry>,
+    pub registry: RegistryHost,
+    pub harness_registry: Arc<HarnessRegistry>,
     pub repos: Repos,
     pub terminals: Terminals,
     pub change_requests: CheckoutChangeRequests,
@@ -208,8 +205,8 @@ pub struct EngineCore {
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
-    workspace_scope: WorkspaceScope,
-    profile_identity: EngineProfileIdentity,
+    profile_scope: ProfileScope,
+    profile_identity: ProfileIdentity,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
@@ -224,38 +221,38 @@ pub struct EngineCore {
 }
 
 impl EngineCore {
-    /// Open stores under `data_dir`, wire sessions ⇄ doc host ⇄ workspace host, and
+    /// Open stores under `data_dir`, wire sessions ⇄ doc host ⇄ registry host, and
     /// recover stale journals from a previous crash. Identity comes from
-    /// `$ZERON_ORG_ID` / `$ZERON_USER_ID` (dev defaults `dev-org` / `dev-user`);
+    /// `$ZERON_ORGANIZATION_ID` / `$ZERON_USER_ID` (dev defaults `dev-org` / `dev-user`);
     /// use [`Self::assemble_with_identity`] to pass one explicitly.
     pub fn assemble(
         data_dir: &Path,
-        registry: Arc<HarnessRegistry>,
+        harness_registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
         edge: Option<EdgeConfig>,
     ) -> Result<Self, EngineError> {
-        let org_id = env_or("ZERON_ORG_ID", DEFAULT_ORG_ID);
+        let organization_id = organization_env_or(DEFAULT_ORGANIZATION_ID);
         let user_id = env_or("ZERON_USER_ID", DEFAULT_USER_ID);
-        let profile = EngineProfile::development(data_dir, &org_id, &user_id);
-        Self::assemble_with_profile(profile, registry, default_harness, edge)
+        let profile = EngineProfile::development(data_dir, &organization_id, &user_id);
+        Self::assemble_with_profile(profile, harness_registry, default_harness, edge)
     }
 
     pub fn assemble_with_identity(
         data_dir: &Path,
-        registry: Arc<HarnessRegistry>,
+        harness_registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
         edge: Option<EdgeConfig>,
-        org_id: &str,
+        organization_id: &str,
         user_id: &str,
     ) -> Result<Self, EngineError> {
-        let profile = EngineProfile::synced(data_dir, org_id, user_id);
-        Self::assemble_with_profile(profile, registry, default_harness, edge)
+        let profile = EngineProfile::synced(data_dir, organization_id, user_id);
+        Self::assemble_with_profile(profile, harness_registry, default_harness, edge)
     }
 
-    /// Assemble the engine against one resolved, immutable workspace profile.
+    /// Assemble the engine against one resolved, immutable registry profile.
     pub fn assemble_with_profile(
         profile: EngineProfile,
-        registry: Arc<HarnessRegistry>,
+        harness_registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
         edge: Option<EdgeConfig>,
     ) -> Result<Self, EngineError> {
@@ -265,7 +262,7 @@ impl EngineCore {
         // SQLite snapshots + journals. Taken before any store opens or the IPC
         // port binds; held (and kernel-released on crash) for the engine's life.
         let lock = InstanceLock::acquire(data_dir)?;
-        Self::assemble_with_profile_locked(profile, registry, default_harness, edge, lock)
+        Self::assemble_with_profile_locked(profile, harness_registry, default_harness, edge, lock)
     }
 
     /// Assemble against a pre-acquired [`InstanceLock`]. The headed app takes
@@ -273,14 +270,14 @@ impl EngineCore {
     /// data-dir owner cannot diverge when several viewports bootstrap at once.
     pub fn assemble_with_profile_locked(
         profile: EngineProfile,
-        registry: Arc<HarnessRegistry>,
+        harness_registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
         edge: Option<EdgeConfig>,
         lock: InstanceLock,
     ) -> Result<Self, EngineError> {
-        let profile_identity = EngineProfileIdentity {
+        let profile_identity = ProfileIdentity {
             user_id: profile.user_id().to_string(),
-            organization_id: profile.org_id().to_string(),
+            organization_id: profile.organization_id().to_string(),
         };
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
@@ -288,11 +285,11 @@ impl EngineCore {
         let device_id = load_or_create_device_id(data_dir)?;
         // This device's harness enablement (Settings → Agents) rides the
         // engine data dir — per-device, like the CLI installs it gates.
-        registry.load_prefs(data_dir);
+        harness_registry.load_prefs(data_dir);
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
-        let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        let sessions = SessionsEngine::new(device_id.clone(), journal, harness_registry.clone());
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -302,18 +299,18 @@ impl EngineCore {
                 edge: edge.clone(),
             },
         );
-        let workspace = WorkspaceHost::open(
+        let registry = RegistryHost::open(
             store,
-            WorkspaceHostConfig {
+            RegistryHostConfig {
                 device_id: device_id.clone(),
                 device_name: local_device_name(&device_id),
                 platform: std::env::consts::OS.to_string(),
-                org_id: profile.org_id().to_string(),
+                organization_id: profile.organization_id().to_string(),
                 user_id: profile.user_id().to_string(),
                 edge: edge.clone(),
             },
         )?;
-        doc_host.set_workspace(workspace.clone());
+        doc_host.set_registry(registry.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
         match sessions.recover_stale() {
@@ -333,45 +330,48 @@ impl EngineCore {
         // A recorded local→synced import grants this account the local
         // profile's uploads root read-only — transcripts imported earlier
         // embed absolute paths under it (same shape as the legacy adoption).
-        if profile.scope() != WorkspaceScope::Local
-            && let Some(root) =
-                local_import::marker_grants_read_root(data_dir, profile.org_id(), profile.user_id())
+        if profile.scope() != ProfileScope::Local
+            && let Some(root) = local_import::marker_grants_read_root(
+                data_dir,
+                profile.organization_id(),
+                profile.user_id(),
+            )
         {
             uploads.add_read_only_root(&root);
         }
         // Queued-attachment support: the doc host resolves `pending://` refs
         // against this store and pushes staged bytes to remote hosts.
         doc_host.set_uploads(uploads.clone());
-        let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
+        let local_import = (profile.scope() == ProfileScope::Synced).then(|| {
             local_import::LocalImporter::new(
                 data_dir,
                 &device_id,
-                profile.org_id(),
+                profile.organization_id(),
                 profile.user_id(),
                 store_for_import.clone(),
                 profile.store_root().join("journals"),
-                workspace.clone(),
+                registry.clone(),
                 uploads.clone(),
             )
         });
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
         sessions.set_titles(TitleGenerator::new(
-            workspace.clone(),
             registry.clone(),
+            harness_registry.clone(),
             repos.clone(),
         ));
-        let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
+        let diff_sync = CheckoutDiffSync::start(repos.clone(), registry.clone(), &device_id, edge);
         // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
         let turn_diff = diff_sync.clone();
         sessions.set_turn_listener(Arc::new(move |chat_id, cwd| {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
-        let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        let spaces_sync = SpacesSync::start(repos.clone(), registry.clone(), &device_id);
         Ok(Self {
             sessions,
             doc_host,
-            workspace,
             registry,
+            harness_registry,
             repos,
             terminals,
             change_requests,
@@ -381,7 +381,7 @@ impl EngineCore {
             agent_accounts,
             device_id,
             local_import,
-            workspace_scope: profile.scope(),
+            profile_scope: profile.scope(),
             profile_identity,
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -391,8 +391,8 @@ impl EngineCore {
         })
     }
 
-    pub fn workspace_scope(&self) -> WorkspaceScope {
-        self.workspace_scope
+    pub fn profile_scope(&self) -> ProfileScope {
+        self.profile_scope
     }
 
     /// Attach the auth service (before building the RPC service / relays).
@@ -503,15 +503,15 @@ impl EngineCore {
         let mut rpc = EngineRpc::new(
             self.sessions.clone(),
             self.doc_host.clone(),
-            self.workspace.clone(),
             self.registry.clone(),
+            self.harness_registry.clone(),
             self.repos.clone(),
             self.terminals.clone(),
             self.change_requests.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
-            self.workspace_scope,
+            self.profile_scope,
         )
         .with_profile_identity(self.profile_identity.clone())
         .with_auth(self.auth());
@@ -535,11 +535,11 @@ impl EngineCore {
             links.disconnect_all();
         }
         self.doc_host.disconnect_edge();
-        self.workspace.disconnect_edge();
+        self.registry.disconnect_edge();
     }
 
     /// Graceful teardown: settle live runs (streaming entries stamped `aborted`),
-    /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
+    /// kill live PTYs, stamp our registry `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
         self.sessions.shutdown().await;
@@ -570,7 +570,7 @@ impl EngineCore {
         self.spaces_sync.shutdown().await;
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
-        self.workspace.shutdown();
+        self.registry.shutdown();
         // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
         // actually be freed once the last handle drops.
         self.sessions.clear_doc_host();
@@ -620,8 +620,8 @@ impl EngineRuntime {
         &self.core
     }
 
-    pub fn workspace_scope(&self) -> WorkspaceScope {
-        self.core.workspace_scope()
+    pub fn profile_scope(&self) -> ProfileScope {
+        self.core.profile_scope()
     }
 
     pub fn disconnect_edge(&self) {
@@ -678,14 +678,14 @@ impl Engine {
         Auth::new(auth_config)
     }
 
-    /// Capture the workspace boundary once, before refresh or sign-in can mutate auth.
-    pub fn initial_workspace_scope(auth: &Auth) -> WorkspaceScope {
+    /// Capture the registry boundary once, before refresh or sign-in can mutate auth.
+    pub fn initial_profile_scope(auth: &Auth) -> ProfileScope {
         if !auth.workos_enabled() {
-            WorkspaceScope::Development
+            ProfileScope::Development
         } else if auth.loaded_workos_session() {
-            WorkspaceScope::Synced
+            ProfileScope::Synced
         } else {
-            WorkspaceScope::Local
+            ProfileScope::Local
         }
     }
 
@@ -695,42 +695,42 @@ impl Engine {
     pub fn resolve_profile(
         config: &EngineConfig,
         auth: &Auth,
-        scope: WorkspaceScope,
+        scope: ProfileScope,
     ) -> Result<Option<EngineProfile>, EngineError> {
         match scope {
-            WorkspaceScope::Local => EngineProfile::local(&config.data_dir).map(Some),
-            WorkspaceScope::Development => {
-                let dev_token_org = config
+            ProfileScope::Local => EngineProfile::local(&config.data_dir).map(Some),
+            ProfileScope::Development => {
+                let dev_token_organization = config
                     .edge_token
                     .as_deref()
                     .and_then(|token| token.split_once('@'))
-                    .map(|(_, org)| org.to_string())
-                    .filter(|org| !org.is_empty());
-                let org_id = dev_token_org
-                    .or(config.org_id.clone())
-                    .unwrap_or_else(|| env_or("ZERON_ORG_ID", DEFAULT_ORG_ID));
+                    .map(|(_, organization)| organization.to_string())
+                    .filter(|organization| !organization.is_empty());
+                let organization_id = dev_token_organization
+                    .or(config.organization_id.clone())
+                    .unwrap_or_else(|| organization_env_or(DEFAULT_ORGANIZATION_ID));
                 let user_id = auth
                     .user_id()
                     .unwrap_or_else(|| env_or("ZERON_USER_ID", DEFAULT_USER_ID));
                 Ok(Some(EngineProfile::development(
                     &config.data_dir,
-                    &org_id,
+                    &organization_id,
                     &user_id,
                 )))
             }
-            WorkspaceScope::Synced => {
+            ProfileScope::Synced => {
                 let state = auth.state();
                 let Some(user) = state.user() else {
                     return Err(EngineError::Other(
                         "captured synced session no longer exposes its user identity".into(),
                     ));
                 };
-                let Some(org_id) = state.org_id() else {
+                let Some(organization_id) = state.organization_id() else {
                     return Ok(None);
                 };
                 Ok(Some(EngineProfile::synced(
                     &config.data_dir,
-                    org_id,
+                    organization_id,
                     &user.id,
                 )))
             }
@@ -740,9 +740,9 @@ impl Engine {
     /// Resolve the one-shot identity served before profile stores are available.
     pub fn engine_info(
         config: &EngineConfig,
-        workspace_scope: WorkspaceScope,
+        profile_scope: ProfileScope,
     ) -> Result<EngineInfo, EngineError> {
-        Self::engine_info_for_profile(config, workspace_scope, None)
+        Self::engine_info_for_profile(config, profile_scope, None)
     }
 
     /// Resolve engine identity with the immutable profile, when bootstrap has
@@ -750,16 +750,16 @@ impl Engine {
     /// run before profile onboarding remain source-compatible and fail closed.
     pub fn engine_info_for_profile(
         config: &EngineConfig,
-        workspace_scope: WorkspaceScope,
+        profile_scope: ProfileScope,
         profile: Option<&EngineProfile>,
     ) -> Result<EngineInfo, EngineError> {
         std::fs::create_dir_all(&config.data_dir)?;
         Ok(EngineInfo {
             device_id: load_or_create_device_id(&config.data_dir)?,
-            workspace_scope,
-            profile: profile.map(|profile| EngineProfileIdentity {
+            profile_scope,
+            profile: profile.map(|profile| ProfileIdentity {
                 user_id: profile.user_id().to_string(),
-                organization_id: profile.org_id().to_string(),
+                organization_id: profile.organization_id().to_string(),
             }),
         })
     }
@@ -794,8 +794,8 @@ impl Engine {
         lock: Option<InstanceLock>,
     ) -> anyhow::Result<EngineRuntime> {
         let edge_enabled = match profile.scope() {
-            WorkspaceScope::Local => false,
-            WorkspaceScope::Synced => {
+            ProfileScope::Local => false,
+            ProfileScope::Synced => {
                 // Validate the persisted session in the BACKGROUND: the probe
                 // still transitions auth to SignedOut on definitive revocation
                 // (and warms the single-flight refresh every first dial waits
@@ -812,13 +812,13 @@ impl Engine {
             // token, including when WorkOS was merely disabled with
             // ZERON_WORKOS_CLIENT_ID="". Only an explicitly configured,
             // non-empty bearer opts this runtime into Edge rooms and relays.
-            WorkspaceScope::Development => config
+            ProfileScope::Development => config
                 .edge_token
                 .as_deref()
                 .is_some_and(|token| !token.trim().is_empty()),
         };
-        let fixed_profile = (profile.scope() == WorkspaceScope::Synced).then(|| ProfileIdentity {
-            org_id: profile.org_id().to_string(),
+        let fixed_profile = (profile.scope() == ProfileScope::Synced).then(|| ProfileIdentity {
+            organization_id: profile.organization_id().to_string(),
             user_id: profile.user_id().to_string(),
         });
         let profile_token: Arc<dyn zeron_rpc::TokenSource> = Arc::new(ProfileTokenSource::new(
@@ -882,20 +882,20 @@ impl Engine {
 
         let host_relay = edge.as_ref().map(|edge| {
             // Keep the fork's profile-scoped token source: a synced profile
-            // must dial peers as its own (org, user), not as whatever identity
+            // must dial peers as its own (Organization, user), not as whatever identity
             // the shared auth handle currently holds.
             let mut link_config =
                 zeron_rpc::LinkCacheConfig::new(edge.url.clone(), profile_token.clone());
             // Registry-dark dial gate: devices with no recent presence fail
             // fast with zero dials; presence returning un-parks them (the
             // peer-alive hook below clears any cooldown at the same moment).
-            let workspace_for_liveness = core.workspace.clone();
+            let registry_for_liveness = core.registry.clone();
             link_config.liveness = Some(Arc::new(move |device_id: &str| {
-                workspace_for_liveness.peer_liveness(device_id)
+                registry_for_liveness.peer_liveness(device_id)
             }));
             let links = zeron_rpc::LinkCache::new(link_config);
             let links_for_presence = links.clone();
-            core.workspace
+            core.registry
                 .set_peer_alive_hook(Arc::new(move |device_id: &str| {
                     links_for_presence.reset_cooldown(device_id);
                 }));
@@ -919,19 +919,19 @@ impl Engine {
         std::fs::create_dir_all(&config.data_dir)?;
         let auth = Self::build_auth(&config).await;
         let mut auth_state = auth.watch_state();
-        let workspace_scope = Self::initial_workspace_scope(&auth);
-        let mut profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
+        let profile_scope = Self::initial_profile_scope(&auth);
+        let mut profile = Self::resolve_profile(&config, &auth, profile_scope)?;
         let _refresh_loop = auth.spawn_refresh_loop();
 
         // A captured cloud session without an organization must finish onboarding
         // before its profile can open. A clean signed-out install is local and never
         // enters the terminal sign-in flow.
-        if workspace_scope == WorkspaceScope::Synced && profile.is_none() {
+        if profile_scope == ProfileScope::Synced && profile.is_none() {
             terminal_sign_in(&auth).await?;
-            profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
+            profile = Self::resolve_profile(&config, &auth, profile_scope)?;
         }
         let profile = profile
-            .ok_or_else(|| EngineError::Other("synced workspace profile is not ready".into()))?;
+            .ok_or_else(|| EngineError::Other("synced registry profile is not ready".into()))?;
 
         let runtime = Self::assemble_runtime(&config, auth, profile).await?;
 
@@ -955,7 +955,7 @@ impl Engine {
                     tracing::info!("headless shutdown requested over IPC");
                 }
             }
-            _ = wait_for_signed_out(&mut auth_state), if workspace_scope == WorkspaceScope::Synced => {
+            _ = wait_for_signed_out(&mut auth_state), if profile_scope == ProfileScope::Synced => {
                 // Edge transports observe the same auth signal and close at
                 // once. Leave a brief reply window for a SignOut RPC before
                 // the localhost server itself is aborted.
@@ -1022,9 +1022,9 @@ pub async fn serve_ipc(
     )))
 }
 
-/// Block until the WorkOS session is signed in AND org-scoped. On a TTY, print the
+/// Block until the WorkOS session is signed in and Organization-scoped. On a TTY, print the
 /// headless (paste-code) sign-in URL, read the pasted `state.code` from stdin, and
-/// run workspace onboarding (create / auto-join / numbered picker). Off a TTY this
+/// run Organization onboarding (create / auto-join / numbered picker). Off a TTY this
 /// errors immediately — a daemon under systemd/launchd must load the session that
 /// `zeron login` persisted, never wait on a prompt nobody can see.
 pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
@@ -1032,12 +1032,15 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
     let interactive = std::io::stdin().is_terminal();
     let mut state_rx = auth.watch_state();
     let mut stdin_reader: Option<tokio::task::JoinHandle<()>> = None;
-    let mut org_reader: Option<tokio::task::JoinHandle<()>> = None;
+    let mut organization_reader: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         let state = state_rx.borrow().clone();
         match state {
-            AuthState::SignedIn { user, org_id } => {
-                tracing::info!(email = %user.email, org = org_id.as_deref().unwrap_or("<none>"),
+            AuthState::SignedIn {
+                user,
+                organization_id,
+            } => {
+                tracing::info!(email = %user.email, organization = organization_id.as_deref().unwrap_or("<none>"),
                     "auth: session ready");
                 break;
             }
@@ -1046,16 +1049,17 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
                     // No reader tasks have been spawned on this path (both spawns
                     // are TTY-gated), so an early return leaks nothing.
                     return Err(EngineError::Other(format!(
-                        "signed in as {} but no workspace is selected — run `zeron login` on this machine to pick one",
+                        "signed in as {} but no Organization is selected — run `zeron login` on this machine to pick one",
                         user.email
                     )));
                 }
-                if org_reader.is_none() {
-                    // Workspace onboarding on the TTY (old zeron's
+                if organization_reader.is_none() {
+                    // Organization onboarding on the TTY (old zeron's
                     // `backend login` flow): create if none, auto-join a
                     // single membership, numbered picker otherwise.
                     println!("Signed in as {}.", user.email);
-                    org_reader = Some(tokio::spawn(run_org_onboarding(auth.clone())));
+                    organization_reader =
+                        Some(tokio::spawn(run_organization_onboarding(auth.clone())));
                 }
             }
             AuthState::SignedOut => {
@@ -1094,7 +1098,7 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
     if let Some(reader) = stdin_reader {
         reader.abort();
     }
-    if let Some(reader) = org_reader {
+    if let Some(reader) = organization_reader {
         reader.abort();
     }
     Ok(())
@@ -1114,31 +1118,31 @@ async fn read_stdin_line() -> Option<String> {
     .flatten()
 }
 
-/// TTY workspace onboarding for an org-less session (ports old zeron's
+/// TTY Organization onboarding for a session without an Organization (ports old zeron's
 /// `backend login` flow): no memberships → prompt a name and create; exactly
 /// one → auto-join; several → numbered picker. Success flips the auth state to
 /// `SignedIn`, which ends [`wait_for_sign_in`]'s wait (and aborts this task).
-async fn run_org_onboarding(auth: Auth) {
-    // Zero memberships → a personal workspace is minted automatically; the
+async fn run_organization_onboarding(auth: Auth) {
+    // Zero memberships → a personal Organization is minted automatically; the
     // prompts below then only handle the pick-one / create-another cases.
-    if let Err(err) = auth.ensure_default_org().await {
-        tracing::warn!(error = %err, "default workspace creation failed; falling back to prompt");
+    if let Err(err) = auth.ensure_default_organization().await {
+        tracing::warn!(error = %err, "default Organization creation failed; falling back to prompt");
     }
     if auth.state().is_signed_in() {
-        return; // ensure_default_org created + selected the personal org
+        return; // ensure_default_organization created and selected the personal Organization
     }
-    let orgs = match auth.list_orgs().await {
-        Ok(orgs) => orgs,
+    let organizations = match auth.list_organizations().await {
+        Ok(organizations) => organizations,
         Err(err) => {
             println!(
-                "Could not list workspaces ({err}) — create or select one from the Zeron UI to continue."
+                "Could not list organizations ({err}) — create or select one from the Zeron UI to continue."
             );
             return;
         }
     };
-    match orgs.len() {
+    match organizations.len() {
         0 => {
-            println!("No workspaces yet — name your new workspace and press enter:");
+            println!("No organizations yet — name your new organization and press enter:");
             loop {
                 let Some(line) = read_stdin_line().await else {
                     return;
@@ -1147,25 +1151,25 @@ async fn run_org_onboarding(auth: Auth) {
                 if name.is_empty() {
                     continue;
                 }
-                match auth.create_org(name).await {
+                match auth.create_organization(name).await {
                     Ok(_) => return,
-                    Err(err) => println!("Creating workspace failed: {err}"),
+                    Err(err) => println!("Creating organization failed: {err}"),
                 }
             }
         }
         1 => {
-            let only = &orgs[0];
-            println!("Joining workspace \"{}\"…", only.name);
-            if let Err(err) = auth.select_org(&only.organization_id).await {
-                println!("Joining workspace failed: {err}");
+            let only = &organizations[0];
+            println!("Joining organization \"{}\"…", only.name);
+            if let Err(err) = auth.select_organization(&only.organization_id).await {
+                println!("Joining organization failed: {err}");
             }
         }
         _ => {
-            println!("\nYour workspaces:");
-            for (index, org) in orgs.iter().enumerate() {
-                println!("  {}. {}", index + 1, org.name);
+            println!("\nYour organizations:");
+            for (index, organization) in organizations.iter().enumerate() {
+                println!("  {}. {}", index + 1, organization.name);
             }
-            println!("Pick a workspace [1-{}]:", orgs.len());
+            println!("Pick an organization [1-{}]:", organizations.len());
             loop {
                 let Some(line) = read_stdin_line().await else {
                     return;
@@ -1175,14 +1179,17 @@ async fn run_org_onboarding(auth: Auth) {
                     .parse::<usize>()
                     .ok()
                     .and_then(|n| n.checked_sub(1))
-                    .and_then(|index| orgs.get(index));
-                let Some(org) = choice else {
-                    println!("Pick a workspace [1-{}]:", orgs.len());
+                    .and_then(|index| organizations.get(index));
+                let Some(organization) = choice else {
+                    println!("Pick an organization [1-{}]:", organizations.len());
                     continue;
                 };
-                match auth.select_org(&org.organization_id).await {
+                match auth
+                    .select_organization(&organization.organization_id)
+                    .await
+                {
                     Ok(()) => return,
-                    Err(err) => println!("Joining workspace failed: {err}"),
+                    Err(err) => println!("Joining organization failed: {err}"),
                 }
             }
         }
@@ -1254,8 +1261,8 @@ mod profile_token_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    fn jwt_with_user(org_id: &str, user_id: Option<&str>) -> String {
-        let mut claims = serde_json::json!({ "org_id": org_id });
+    fn jwt_with_user(organization_id: &str, user_id: Option<&str>) -> String {
+        let mut claims = serde_json::json!({ "org_id": organization_id });
         if let Some(user_id) = user_id {
             claims["sub"] = serde_json::json!(user_id);
         }
@@ -1264,13 +1271,13 @@ mod profile_token_tests {
         format!("header.{payload}.signature")
     }
 
-    fn jwt(org_id: &str, user_id: &str) -> String {
-        jwt_with_user(org_id, Some(user_id))
+    fn jwt(organization_id: &str, user_id: &str) -> String {
+        jwt_with_user(organization_id, Some(user_id))
     }
 
-    fn profile(org_id: &str, user_id: &str) -> ProfileIdentity {
+    fn profile(organization_id: &str, user_id: &str) -> ProfileIdentity {
         ProfileIdentity {
-            org_id: org_id.into(),
+            organization_id: organization_id.into(),
             user_id: user_id.into(),
         }
     }
@@ -1311,7 +1318,7 @@ mod profile_token_tests {
     }
 
     #[tokio::test]
-    async fn fixed_profile_rechecks_team_and_user_on_one_mutable_source() {
+    async fn fixed_profile_rechecks_organization_and_user_on_one_mutable_source() {
         let original = jwt("org-a", "user-a");
         let backing = Arc::new(MutableToken::new(original.clone()));
         let source = ProfileTokenSource::new(backing.clone(), Some(profile("org-a", "user-a")));
@@ -1325,12 +1332,12 @@ mod profile_token_tests {
 
         backing.set(jwt("org-b", "user-a"));
         // The fence is independent of the async shutdown notification: no
-        // caller can obtain the new Team bearer during that handoff window.
+        // caller can obtain the new Organization bearer during that handoff window.
         assert_eq!(zeron_rpc::TokenSource::token(&source).await, None);
         backing.notify();
         tokio::time::timeout(Duration::from_secs(1), changes.changed())
             .await
-            .expect("Team switch notification")
+            .expect("Organization switch notification")
             .expect("token epoch stays open");
         assert_eq!(zeron_rpc::TokenSource::token(&source).await, None);
 
@@ -1464,6 +1471,20 @@ fn env_or(key: &str, default: &str) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// Canonical Organization env lookup with the historical abbreviation as a
+/// read-only compatibility fallback.
+pub(crate) fn organization_env_or(default: &str) -> String {
+    for key in ["ZERON_ORGANIZATION_ID", "ZERON_ORG_ID"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+    }
+    default.to_string()
 }
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.

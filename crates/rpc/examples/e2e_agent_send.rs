@@ -1,6 +1,6 @@
 //! Agent-to-agent send e2e driver (`scripts/e2e-agent-send.sh` runs it).
 //!
-//! Two engines (different users, same org), a chat on each. Spawns the real
+//! Two engines (different users, same Organization), a chat on each. Spawns the real
 //! `zeron mcp-bridge` subprocess as chat X's agent would see it (env-wired to
 //! engine A) and drives one MCP `tools/call send_to_session` over stdio at
 //! chat Y (hosted on engine B). Then proves on B that Y's transcript gained a

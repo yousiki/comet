@@ -9,7 +9,7 @@ use gpui::{
 };
 use std::time::Duration;
 
-use zeron_proto::WorkspaceScope;
+use zeron_proto::ProfileScope;
 use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -45,12 +45,14 @@ pub fn format_last_seen(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) ->
 }
 
 /// Scope-aware copy: a local registry describes only the active local
-/// workspace and must not imply that account device metadata is already live.
-pub fn devices_subtitle(scope: Option<WorkspaceScope>) -> &'static str {
+/// profile and must not imply that organization device metadata is already live.
+pub fn devices_subtitle(scope: Option<ProfileScope>) -> &'static str {
     match scope {
-        Some(WorkspaceScope::Local) => "Manage device details stored in this local workspace.",
-        Some(WorkspaceScope::Synced) => "Manage device names and inspect synced device metadata.",
-        Some(WorkspaceScope::Development) | None => "Manage device names for this workspace.",
+        Some(ProfileScope::Local) => "Manage device details stored in this local profile.",
+        Some(ProfileScope::Synced) => {
+            "Manage device names and inspect organization device metadata."
+        }
+        Some(ProfileScope::Development) | None => "Manage device names for this profile.",
     }
 }
 
@@ -236,7 +238,7 @@ impl DevicesPage {
                     .text_size(px(13.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(format!(
-                        "Removes \u{201c}{}\u{201d} from this team, along with its projects \
+                        "Removes \u{201c}{}\u{201d} from this Organization, along with its projects \
                          and their chats. A device that is still in use re-registers on its \
                          next start.",
                         dialog.name
@@ -295,12 +297,12 @@ impl Render for DevicesPage {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
-        let (devices, local_id, workspace_scope) = {
+        let (devices, local_id, profile_scope) = {
             let state = self.state.read(cx);
             (
                 state.devices.clone(),
                 state.local_device_id.clone(),
-                state.workspace_scope,
+                state.profile_scope,
             )
         };
         let copied = self.copied.clone();
@@ -314,10 +316,10 @@ impl Render for DevicesPage {
         let shared = local_id
             .as_deref()
             .is_some_and(|id| devices.iter().any(|d| d.id == id));
-        // Only org-shared registries have a sharing decision to make.
+        // Only Organization-shared registries have a sharing decision to make.
         let share_card = matches!(
-            workspace_scope,
-            Some(WorkspaceScope::Synced) | Some(WorkspaceScope::Development)
+            profile_scope,
+            Some(ProfileScope::Synced) | Some(ProfileScope::Development)
         )
         .then(|| {
             widgets::section_card(&theme).child(
@@ -335,7 +337,7 @@ impl Render for DevicesPage {
                                 vec![
                                     div()
                                         .child(SharedString::from(
-                                            "Register this device with the team so members can \
+                                            "Register this device with the Organization so members can \
                                              see it and run agents here. Off: your projects and \
                                              chats stay, but nobody can target this machine.",
                                         ))
@@ -474,7 +476,7 @@ impl Render for DevicesPage {
                                 .flex_none()
                                 .text_size(px(10.5))
                                 .text_color(theme.text_muted)
-                                .child(if workspace_scope == Some(WorkspaceScope::Local) {
+                                .child(if profile_scope == Some(ProfileScope::Local) {
                                     "Local only"
                                 } else {
                                     "This device"
@@ -564,7 +566,7 @@ impl Render for DevicesPage {
                     ))
                     .child(widgets::page_subtitle(
                         &theme,
-                        devices_subtitle(workspace_scope),
+                        devices_subtitle(profile_scope),
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
@@ -624,8 +626,8 @@ mod tests {
 
     #[test]
     fn local_subtitle_does_not_claim_synced_metadata() {
-        let copy = devices_subtitle(Some(WorkspaceScope::Local));
-        assert!(copy.contains("local workspace"));
+        let copy = devices_subtitle(Some(ProfileScope::Local));
+        assert!(copy.contains("local profile"));
         assert!(!copy.contains("synced"));
     }
 }

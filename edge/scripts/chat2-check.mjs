@@ -280,7 +280,7 @@ const ckpt = new Uint8Array(randomBytes(300 * 1024));
   q.ws.close();
   const stats = await (await http(`/chat2/${chat}/stats`)).json();
   // Attribution keys are `{userId}:{device}` — two users on one device string
-  // must never share a ledger row (org-shared rooms).
+  // must never share a ledger row (Organization-shared rooms).
   check("stats: pushOutcomes attribution", stats.pushOutcomes?.[`${userA}:devQ`]?.ok === 300 && stats.pushOutcomes?.[`${userA}:devQ`]?.rejected >= 1 && stats.pushOutcomes?.[`${userA}:devA`]?.ok >= 5, JSON.stringify(stats.pushOutcomes ?? {}));
   check("stats: presence + sockets present", typeof stats.connectedSockets === "number" && typeof stats.presence === "object");
 }

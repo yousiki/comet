@@ -727,7 +727,7 @@ impl Drop for DeviceLink {
 // Link cache
 // ---------------------------------------------------------------------------
 
-/// A dial-gate verdict on a peer device from the workspace layer (registry
+/// A dial-gate verdict on a peer device from the registry layer (registry
 /// presence). Only a definitive `Dark` parks dials; every ambiguous state
 /// stays `Unknown` so a dead registry room (rows down, relay fine — the
 /// 2026-08-18 03:45 incident shape) never blocks the relay.
@@ -753,7 +753,7 @@ pub struct LinkCacheConfig {
     /// Optional dial gate: a `Dark` verdict fails the call fast with NO dial.
     /// Without it, retrying callers hot-dialed devices that had been offline
     /// for days in 3-dial bursts every ~60s for the life of the app. Un-park
-    /// is presence-driven: the workspace's peer-alive hook fires the moment
+    /// is presence-driven: the registry's peer-alive hook fires the moment
     /// heartbeats return, and the next call passes the gate.
     pub liveness: Option<PeerLivenessProbe>,
 }
@@ -893,7 +893,7 @@ impl LinkCache {
         let dial_lock = {
             let mut locks = lock(&self.dial_locks);
             // The map only ever grew (one entry per peer ever dialed); prune
-            // idle locks once it's clearly beyond any real org's device count.
+            // idle locks once it's clearly beyond any real Organization's device count.
             if locks.len() > 64 {
                 locks.retain(|_, l| Arc::strong_count(l) > 1);
             }
@@ -951,7 +951,7 @@ impl LinkCache {
     }
 
     /// Data-driven cooldown reset: called when out-of-band evidence says the
-    /// peer is alive again (fresh workspace presence heartbeat). The next call
+    /// peer is alive again (fresh registry presence heartbeat). The next call
     /// dials immediately instead of waiting out the backoff window.
     pub fn reset_cooldown(&self, device_id: &str) {
         if lock(&self.dial_state).remove(device_id).is_some() {

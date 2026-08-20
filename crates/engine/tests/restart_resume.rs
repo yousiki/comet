@@ -192,7 +192,7 @@ fn complete_assistant_count(core: &EngineCore) -> usize {
 
 fn stored_harness_session(core: &EngineCore) -> Option<(String, Option<String>)> {
     let chat = core
-        .workspace
+        .registry
         .chat(CHAT)
         .expect("read chat row")
         .expect("chat row exists");
@@ -204,13 +204,13 @@ fn stored_harness_session(core: &EngineCore) -> Option<(String, Option<String>)>
 /// harness request after a completed exchange on an UNTITLED chat) stays out
 /// of the recorded request log.
 fn pre_title(core: &EngineCore) {
-    core.workspace
+    core.registry
         .create_space("space-restart", &core.device_id, "/tmp", None, false)
         .expect("create space row");
-    core.workspace
+    core.registry
         .create_chat(CHAT, Some("space-restart"), None, None, None)
         .expect("create chat row");
-    core.workspace
+    core.registry
         .rename_chat(CHAT, "Pre-titled")
         .expect("rename chat");
 }
@@ -267,7 +267,7 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
 
     // Sidebar state survived: the chat row is back with its cwd, preview, and
     // the stored harness session (cwd-scoped).
-    let chats = core.workspace.read_chats().expect("read chats");
+    let chats = core.registry.read_chats().expect("read chats");
     assert_eq!(chats.len(), 1, "chat row survives restart: {chats:#?}");
     assert_eq!(chats[0].id, CHAT);
     assert_eq!(chats[0].cwd.as_deref(), Some("/tmp"));
@@ -329,7 +329,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     // Manufacture the on-disk state a kill -9 mid-run leaves behind:
     // - a chat doc snapshot whose assistant entry is still `streaming`;
     // - a journal whose last event is NOT `Done` (run died mid-stream), holding
-    //   the only copy of the harness session id (the debounced workspace-row
+    //   the only copy of the harness session id (the debounced registry-row
     //   write never landed).
     {
         let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
@@ -943,7 +943,7 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
     run_one_turn_and_shutdown(&dir, &requests, "hs-steer").await;
 
     // Relaunch: no live run, no in-process `last_request`. A steer must fall
-    // back to a new turn built from the chat's workspace row, resuming the
+    // back to a new turn built from the chat's registry row, resuming the
     // prior harness conversation.
     let core = assemble(
         &dir,

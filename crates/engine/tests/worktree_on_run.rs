@@ -187,7 +187,7 @@ async fn run_with_worktree_spec_materializes_on_host_and_reuses() {
         .await
         .expect("createChat");
     // Pre-title so the auto-titler's harness request stays out of the flow.
-    core.workspace
+    core.registry
         .rename_chat(CHAT, "Pre-titled")
         .expect("rename chat");
 
@@ -214,7 +214,7 @@ async fn run_with_worktree_spec_materializes_on_host_and_reuses() {
     // The chat row follows: cwd repointed at the worktree, branch stamped
     // with the actual zeron/<name> (the composer only knew the base).
     let chat = core
-        .workspace
+        .registry
         .chat(CHAT)
         .expect("read chat row")
         .expect("chat row exists");

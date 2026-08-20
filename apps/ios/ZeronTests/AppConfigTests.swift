@@ -7,7 +7,7 @@ final class AppConfigTests: XCTestCase {
             edgeURL: URL(string: "https://edge.example/base")!,
             mode: .dev,
             userId: "user-1",
-            orgId: "org-1",
+            organizationId: "org-1",
             deviceId: "device-1",
             deviceName: "Phone",
             devBearer: "dev-token")

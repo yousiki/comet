@@ -1,16 +1,22 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { decodeFrame, FRAME, type Frame } from "../../src/chat-frames";
-import { AUTH_USER_HEADER, ROOM_KIND_HEADER } from "../../src/env";
+import {
+  AUTH_USER_HEADER,
+  LEGACY_ORGANIZATION_CHAT_ROOM_KIND,
+  ROOM_KIND_HEADER
+} from "../../src/env";
 
 const request = (
   path: string,
   userId: string,
   method: "GET" | "POST",
-  options: { orgChat?: boolean; body?: Uint8Array } = {}
+  options: { organizationSharedRoom?: boolean; body?: Uint8Array } = {}
 ): Request => {
   const headers = new Headers({ [AUTH_USER_HEADER]: userId });
-  if (options.orgChat) headers.set(ROOM_KIND_HEADER, "org-chat");
+  if (options.organizationSharedRoom) {
+    headers.set(ROOM_KIND_HEADER, LEGACY_ORGANIZATION_CHAT_ROOM_KIND);
+  }
   return new Request(`https://room.test${path}`, {
     method,
     headers,
@@ -74,8 +80,8 @@ describe("ChatRoom HTTP rows authorization", () => {
     expect((await pushFirst.fetch(request("/rows", "bob", "GET"))).status).toBe(403);
   });
 
-  it("lets verified org members pull and push chat3 rows without a host claim", async () => {
-    const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("org-rows-members"));
+  it("lets verified Organization members pull and push chat3 rows without a host claim", async () => {
+    const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("organization-rows-members"));
 
     for (const [userId, batchId, byte] of [
       ["alice", "alice-1", 1],
@@ -83,7 +89,7 @@ describe("ChatRoom HTTP rows authorization", () => {
     ] as const) {
       const pushed = await stub.fetch(
         request(`/rows?device=${userId}-dev&batchId=${batchId}`, userId, "POST", {
-          orgChat: true,
+          organizationSharedRoom: true,
           body: new Uint8Array([byte])
         })
       );
@@ -91,15 +97,21 @@ describe("ChatRoom HTTP rows authorization", () => {
     }
 
     expect(
-      (await stub.fetch(request("/rows?after=0", "carol", "GET", { orgChat: true }))).status
+      (
+        await stub.fetch(
+          request("/rows?after=0", "carol", "GET", { organizationSharedRoom: true })
+        )
+      ).status
     ).toBe(200);
-    const stats = await stub.fetch(request("/stats", "carol", "GET", { orgChat: true }));
+    const stats = await stub.fetch(
+      request("/stats", "carol", "GET", { organizationSharedRoom: true })
+    );
     expect(stats.status).toBe(200);
     expect((await stats.json()) as { rowCount: number }).toMatchObject({ rowCount: 2 });
   });
 
   it("isolates HTTP push quota and outcomes by user even when device ids collide", async () => {
-    const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("org-rows-attribution"));
+    const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("organization-rows-attribution"));
 
     for (const [userId, device, batchId, byte] of [
       ["alice", "shared-device", "shared-a", 1],
@@ -110,14 +122,16 @@ describe("ChatRoom HTTP rows authorization", () => {
       const deviceQuery = device === "" ? "" : `&device=${device}`;
       const response = await stub.fetch(
         request(`/rows?batchId=${batchId}${deviceQuery}`, userId, "POST", {
-          orgChat: true,
+          organizationSharedRoom: true,
           body: new Uint8Array([byte])
         })
       );
       expect(response.status).toBe(200);
     }
 
-    const stats = await stub.fetch(request("/stats", "alice", "GET", { orgChat: true }));
+    const stats = await stub.fetch(
+      request("/stats", "alice", "GET", { organizationSharedRoom: true })
+    );
     const { pushOutcomes } = (await stats.json()) as {
       pushOutcomes: Record<string, { ok: number; rejected: number }>;
     };
@@ -133,21 +147,23 @@ describe("ChatRoom HTTP rows authorization", () => {
 
   it("never excludes a chat3 member row just because its raw device id collides", async () => {
     const sharedDevice = "same-device";
-    const orgStub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("org-rows-exclude-own"));
+    const organizationStub = env.CHAT_ROOM.get(
+      env.CHAT_ROOM.idFromName("organization-rows-exclude-own")
+    );
     expect(
       (
-        await orgStub.fetch(
+        await organizationStub.fetch(
           request(`/rows?device=${sharedDevice}&batchId=bob-row`, "bob", "POST", {
-            orgChat: true,
+            organizationSharedRoom: true,
             body: new Uint8Array([7])
           })
         )
       ).status
     ).toBe(200);
     const orgFrames = await decodeRowsBody(
-      await orgStub.fetch(
+      await organizationStub.fetch(
         request(`/rows?after=0&device=${sharedDevice}&excludeOwn=1`, "alice", "GET", {
-          orgChat: true
+          organizationSharedRoom: true
         })
       )
     );

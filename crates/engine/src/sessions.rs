@@ -109,10 +109,10 @@ struct Inner {
     statuses: Mutex<HashMap<String, Session>>,
     sessions_tx: watch::Sender<Vec<Session>>,
     /// Last dispatched request per chat — the steer→new-turn fallback re-derives its
-    /// run config from this (chat config rows land with the workspace doc in M4).
+    /// run config from this (chat config rows land with the registry doc in M4).
     last_requests: Mutex<HashMap<String, RunRequest>>,
     /// Harness-native session ids per chat (resume continuity across turns) —
-    /// the live-process cache over the durable copy on the workspace chat row
+    /// the live-process cache over the durable copy on the registry chat row
     /// (zeron kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
@@ -339,7 +339,7 @@ impl SessionsEngine {
                 handle.write_user_message(&user_id, &request.prompt, now_ms(), None)?;
                 if self.is_live(chat_id, &run_id) {
                     // Working BEFORE the lastMessageAt bump: both ride the
-                    // workspace doc from this one peer, so causal order makes it
+                    // registry doc from this one peer, so causal order makes it
                     // impossible for an observer to hold [new message, old status]
                     // — that gap read as unseen-with-no-live-run = a phantom
                     // "completed" flash on every remote send (2026-07-31).
@@ -635,7 +635,7 @@ impl SessionsEngine {
             }
             let handle = self.doc_handle(&chat_id)?;
             // Harness continuity first: the crashed run's session id may only
-            // exist in the journal (the debounced workspace-row write may
+            // exist in the journal (the debounced registry-row write may
             // never have landed) — remember it so the revived run resumes the
             // same harness conversation (zeron recoverDraft, sessions.ts:538).
             if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
@@ -703,7 +703,7 @@ impl SessionsEngine {
                     .last_request(&chat_id)
                     .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
                     // Last resort: the journal's own cwd (zeron's draft config)
-                    // — a crash can predate the debounced workspace-row write.
+                    // — a crash can predate the debounced registry-row write.
                     .or_else(|| {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                         Some(RunRequest {
@@ -749,7 +749,7 @@ impl SessionsEngine {
     pub async fn shutdown(&self) {
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         // Arm every run's three-second settle deadline in the same poll turn.
-        // Awaiting them serially made a Team switch cost N × the per-run
+        // Awaiting them serially made an Organization switch cost N × the per-run
         // grace window even though the runs are independent.
         let outcomes = futures::future::join_all(
             chats
@@ -798,7 +798,7 @@ impl Inner {
     /// transition. Long silent-LOOKING stretches (thinking heartbeats, a big
     /// tool input being generated) still carry events — the UI's 45s
     /// staleness gate must not flip "Working" off mid-run. Throttled: a
-    /// workspace-doc mirror per delta would be far too chatty.
+    /// registry-doc mirror per delta would be far too chatty.
     fn touch_session(&self, chat_id: &str) {
         const TOUCH_THROTTLE_MS: i64 = 10_000;
         let now = Utc::now();
@@ -820,7 +820,7 @@ impl Inner {
             self.sessions_tx.send_replace(list);
             session
         };
-        if let Some(ws) = self.workspace() {
+        if let Some(ws) = self.registry() {
             ws.record_session(&session);
         }
     }
@@ -867,9 +867,9 @@ impl Inner {
             self.sessions_tx.send_replace(list);
             session
         };
-        // Mirror the transition into the workspace doc's session-status row so
+        // Mirror the transition into the registry doc's session-status row so
         // remote devices' sidebars show this run (staleness-checked client-side).
-        if let Some(ws) = self.workspace() {
+        if let Some(ws) = self.registry() {
             ws.record_session(&session);
         }
     }
@@ -879,22 +879,22 @@ impl Inner {
         lock(&self.doc_host).clone()
     }
 
-    fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {
-        self.doc_host().and_then(|host| host.workspace().cloned())
+    fn registry(&self) -> Option<crate::registry_host::RegistryHost> {
+        self.doc_host().and_then(|host| host.registry().cloned())
     }
 
-    /// Sidebar freshness: push a message-persist preview into the chat's workspace row.
+    /// Sidebar freshness: push a message-persist preview into the chat's registry row.
     fn note_message(&self, chat_id: &str, text: &str) {
         if text.is_empty() {
             return;
         }
-        if let Some(ws) = self.workspace() {
+        if let Some(ws) = self.registry() {
             ws.note_message(chat_id, text);
         }
     }
 
     /// Record the chat's harness-native session id (and its cwd): live-process
-    /// cache plus the durable workspace chat row — the row is what survives an
+    /// cache plus the durable registry chat row — the row is what survives an
     /// engine restart (zeron sessions.ts:1039).
     fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
         if session_id.is_empty() {
@@ -907,7 +907,7 @@ impl Inner {
                 cwd: cwd.to_string(),
             },
         );
-        if let Some(ws) = self.workspace() {
+        if let Some(ws) = self.registry() {
             ws.set_chat_harness_session(chat_id, session_id, cwd);
         }
     }
@@ -921,7 +921,7 @@ impl Inner {
 
     /// The session id to resume for a run in `chat_id` launching from `cwd`
     /// (zeron sessions.ts:736, looked up on every dispatch):
-    /// live-process cache → workspace chat row → journal scan (the crash path
+    /// live-process cache → registry chat row → journal scan (the crash path
     /// where the debounced row write never landed — SessionStarted/Done events
     /// are journaled per event, flushed immediately). Cwd-gated throughout:
     /// harness session stores are keyed by cwd, so a session created elsewhere
@@ -933,7 +933,7 @@ impl Inner {
             return (!known.session_id.is_empty() && cwd_ok(&known.cwd))
                 .then_some(known.session_id);
         }
-        if let Some(ws) = self.workspace()
+        if let Some(ws) = self.registry()
             && let Some((session_id, session_cwd)) = ws.chat_harness_session(chat_id)
         {
             return (!session_id.is_empty() && cwd_ok(session_cwd.as_deref().unwrap_or("")))
@@ -1191,7 +1191,7 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
         .collect()
 }
 
-/// The persisted assistant text of a folded segment (workspace preview source).
+/// The persisted assistant text of a folded segment (registry preview source).
 fn folded_text(parts: &[MessagePart]) -> String {
     parts
         .iter()

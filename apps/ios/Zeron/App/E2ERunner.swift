@@ -1,6 +1,6 @@
 // Headless e2e rig — launch with `-e2e` (plus a local wrangler dev edge and a
 // `zeron headless` engine in dev mode) and the app exercises the full live
-// stack with no taps: workspace room backfill, device-relay RPCs, space/chat
+// stack with no taps: Organization registry backfill, device-relay RPCs, space/chat
 // creation, the command plane, and session-room streaming. Results append to
 // Documents/e2e.log for the harness to read via simctl.
 
@@ -29,30 +29,30 @@ enum E2ERunner {
         try? FileManager.default.removeItem(at: logURL)
         log("start")
         model.signInDev(edgeURL: URL(string: "http://localhost:8787")!,
-                        userId: "devuser", orgId: "dev-org")
+                        userId: "devuser", organizationId: "dev-org")
 
-        // 1. Workspace room: wait for connection + the engine's device row.
-        guard let workspace = model.workspace else {
-            log("FAIL no workspace store")
+        // 1. Registry: wait for connection + the engine's device row.
+        guard let registry = model.registry else {
+            log("FAIL no registry store")
             return
         }
         // Warm-start probe: rows visible BEFORE any network = disk hydration.
-        log("warm-start devices=\(workspace.devices.count) chats=\(workspace.chats.count)")
-        let device = await poll(timeout: 15, label: "workspace device") {
-            workspace.connected ? workspace.devices.first { $0.platform != "ios" } : nil
+        log("warm-start devices=\(registry.devices.count) chats=\(registry.chats.count)")
+        let device = await poll(timeout: 15, label: "registry device") {
+            registry.connected ? registry.devices.first { $0.platform != "ios" } : nil
         }
         guard let device else {
-            log("FAIL workspace: connected=\(workspace.connected) devices=\(workspace.devices.map(\.id))")
+            log("FAIL registry: connected=\(registry.connected) devices=\(registry.devices.map(\.id))")
             return
         }
-        log("OK workspace synced; engine device \(device.id) (\(device.name))")
+        log("OK registry synced; engine device \(device.id) (\(device.name))")
 
         // 2. Device relay: ListFolders on every engine device (stale rig
-        // devices linger in the dev workspace doc — report each).
+        // devices linger in the development registry — report each).
         var listing: FolderListing?
-        for candidate in workspace.devices where candidate.platform != "ios" {
+        for candidate in registry.devices where candidate.platform != "ios" {
             do {
-                let l = try await workspace.listFoldersDetailed(deviceId: candidate.id, path: nil)
+                let l = try await registry.listFoldersDetailed(deviceId: candidate.id, path: nil)
                 log("OK relay ListFolders[\(candidate.name)/\(candidate.id.prefix(8))]: \(l.path) → \(l.entries.count) entries")
                 listing = l
             } catch {
@@ -61,25 +61,25 @@ enum E2ERunner {
         }
 
         // 2b. Live model catalog over the relay.
-        let models = await workspace.listModels(deviceId: device.id, harness: "mock")
+        let models = await registry.listModels(deviceId: device.id, harness: "mock")
         log(models != nil ? "OK relay ListModels: \(models!.map(\.id))" : "FAIL relay ListModels nil")
 
         // 3. Space + chat + first run through the command plane (mock harness).
-        let spaceId = await workspace.createSpace(deviceId: device.id,
+        let spaceId = await registry.createSpace(deviceId: device.id,
                                                   path: listing?.path ?? "/tmp", gitDetected: false)
         log("space created \(spaceId)")
         // Relay-created spaces land via doc sync — eventually consistent.
         let space = await poll(timeout: 10, label: "space row sync") {
-            workspace.spaces.first { $0.id == spaceId }
+            registry.spaces.first { $0.id == spaceId }
         }
         guard let space else {
             log("FAIL space row never synced")
             return
         }
-        let chatId = workspace.createChat(
+        let chatId = registry.createChat(
             space: space,
             config: ChatConfig(harness: "mock", model: nil, reasoning: nil, sandbox: "workspace-write"))
-        guard let chat = workspace.chats.first(where: { $0.id == chatId }),
+        guard let chat = registry.chats.first(where: { $0.id == chatId }),
               let store = model.sessionStore(for: chat) else {
             log("FAIL chat/session store")
             return
@@ -135,36 +135,36 @@ enum E2ERunner {
 
 extension E2ERunner {
     /// Live-relay probe: runs inside the user's real signed-in session and
-    /// interrogates every engine device — workspace presence, the device
+    /// interrogates every engine device — registry presence, the device
     /// room's host attachment, and a real ListFolders with the exact error.
     @MainActor
     static func runLive(model: AppModel) async {
         try? FileManager.default.removeItem(at: logURL)
-        log("live start edge=\(model.edgeURLString) mode=\(model.authModeRaw) user=\(model.storedUserId.prefix(18)) org=\(model.storedOrgId.prefix(18))")
-        let workspace = await poll(timeout: 25, label: "workspace connect") {
-            model.workspace?.connected == true ? model.workspace : nil
+        log("live start edge=\(model.edgeURLString) mode=\(model.authModeRaw) user=\(model.storedUserId.prefix(18)) organization=\(model.storedOrganizationId.prefix(18))")
+        let registry = await poll(timeout: 25, label: "registry connect") {
+            model.registry?.connected == true ? model.registry : nil
         }
-        guard let workspace else {
-            log("FAIL workspace never connected: store=\(model.workspace != nil) "
+        guard let registry else {
+            log("FAIL registry never connected: store=\(model.registry != nil) "
                 + "userId=\(model.storedUserId.isEmpty ? "EMPTY" : "set") "
-                + "orgId=\(model.storedOrgId.isEmpty ? "EMPTY" : "set") "
+                + "organizationId=\(model.storedOrganizationId.isEmpty ? "EMPTY" : "set") "
                 + "access=\(Keychain.load(key: "accessToken") != nil) "
                 + "refresh=\(Keychain.load(key: "refreshToken") != nil) "
                 + "mode=\(model.authModeRaw)")
             return
         }
-        log("devices: " + workspace.devices.map {
-            "\($0.name)[\($0.platform)] id=\($0.id) presence=\(workspace.deviceOnline($0.id))"
+        log("devices: " + registry.devices.map {
+            "\($0.name)[\($0.platform)] id=\($0.id) presence=\(registry.deviceOnline($0.id))"
         }.joined(separator: ", "))
         guard let config = model.diagnosticsConfig else {
             log("FAIL no config")
             return
         }
-        for device in workspace.devices where device.platform != "ios" {
+        for device in registry.devices where device.platform != "ios" {
             let status = await config.deviceStatus(deviceId: device.id)
             log("\(device.name) /status → \(status)")
             do {
-                let listing = try await workspace.listFoldersDetailed(deviceId: device.id, path: nil)
+                let listing = try await registry.listFoldersDetailed(deviceId: device.id, path: nil)
                 log("OK \(device.name) ListFolders → \(listing.path) (\(listing.entries.count) entries)")
             } catch {
                 log("FAIL \(device.name) ListFolders → \(error.localizedDescription)")

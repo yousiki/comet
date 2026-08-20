@@ -25,7 +25,7 @@ zeron daemon start|stop|restart|status
 
 ## Optional multi-device sync
 
-Sign in only when you want to open your account's synced workspace. Authentication changes the profile selected by the next engine start, so stop the daemon before changing it:
+Sign in only when you want to open an Organization's synced data. Authentication changes the profile selected by the next engine start, so stop the daemon before changing it:
 
 ```bash
 zeron daemon stop

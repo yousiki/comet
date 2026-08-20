@@ -374,7 +374,7 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
             None => path.clone(),
         },
         ToolCall::EditFile { path, .. } => path.clone(),
-        ToolCall::ApplyPatch { path } => path.clone().unwrap_or_else(|| "workspace".into()),
+        ToolCall::ApplyPatch { path } => path.clone().unwrap_or_else(|| "working directory".into()),
         ToolCall::Search { pattern, path } => match path {
             Some(path) => format!("{pattern} in {path}"),
             None => pattern.clone(),
@@ -512,7 +512,7 @@ pub enum RowKind {
         badges: Arc<Vec<crate::badges::MessageBadge>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
-        /// Authoring user from the doc entry (org-shared sessions; None on
+        /// Authoring user from the doc entry (Organization-shared sessions; None on
         /// pre-attribution rows). `agent:{chatId}` marks agent-to-agent
         /// sends. Rendered as a chip when it differs from the local user.
         author: Option<SharedString>,
@@ -3086,8 +3086,8 @@ impl Transcript {
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
-                // Author chip (org-shared sessions): shown when the entry
-                // names a user other than the signed-in one — a teammate or
+                // Author chip (Organization-shared sessions): shown when the entry
+                // names a user other than the signed-in one — another member or
                 // an `agent:{chatId}` send. Informational, muted, above the
                 // bubble.
                 let author_chip = author.clone().filter(|a| {
@@ -5397,7 +5397,7 @@ mod tests {
         );
         assert_eq!(
             tool_chip_content(&ToolCall::ApplyPatch { path: None }),
-            ("Patch", "workspace".to_string())
+            ("Patch", "working directory".to_string())
         );
         assert_eq!(
             tool_chip_content(&ToolCall::Mcp {

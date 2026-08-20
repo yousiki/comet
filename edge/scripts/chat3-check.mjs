@@ -1,5 +1,5 @@
-// chat3 (org-shared session rooms) E2E against a deployed worker
-// (AUTH_MODE=dev). Covers what chat3 CHANGES over chat2 — org gating, member
+// `chat3` legacy namespace (Organization-shared sessions) E2E against a deployed worker.
+// Covers what chat3 changes over chat2: Organization gating, member
 // open access, host-user discipline, shared blob keyspace — and leans on
 // chat2-check.mjs for the shared frame-protocol details (same DO code).
 // Usage: node chat3-check.mjs <baseUrl>
@@ -8,11 +8,11 @@ import { randomUUID, randomBytes } from "node:crypto";
 const base = process.argv[2];
 if (!base) throw new Error("usage: node chat3-check.mjs <baseUrl>");
 const wsBase = base.replace(/^http/, "ws");
-// Dev tokens: `user@org` carries a fake org claim (edge/src/auth.ts).
+// Legacy development tokens: `user@organization` carries a fake Organization claim.
 const alice = "e3-alice@e3-org1"; // host user
-const bob = "e3-bob@e3-org1"; // same-org member
-const carol = "e3-carol@e3-org2"; // different org
-const noOrg = "e3-dave"; // no org claim at all
+const bob = "e3-bob@e3-org1"; // same-Organization member
+const carol = "e3-carol@e3-org2"; // different Organization
+const noOrganization = "e3-dave"; // no Organization claim
 const chat = `e3-${randomUUID().slice(0, 13)}`;
 
 // ── frame codec (mirror of chat-frames.ts) ──────────────────────────────────
@@ -80,18 +80,18 @@ const check = (name, cond, detail = "") => {
 const eqBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 
 // ════════════════════════════════════════════════════════════════════════════
-// 1. Worker org gates
+// 1. Worker Organization gates
 {
-  const none = await http(`/chat3/${chat}/stats`, { user: noOrg });
-  check("no org claim → 403", none.status === 403, `got ${none.status}`);
+  const none = await http(`/chat3/${chat}/stats`, { user: noOrganization });
+  check("no Organization claim → 403", none.status === 403, `got ${none.status}`);
   const cross = await http(`/chat3/${chat}/stats`, { user: carol });
-  // carol routes to HER org's room `chat3/e3-org2/{chat}` — a different DO
+  // Carol routes to her Organization's room — a different DO
   // whose log is empty and unclaimed. Isolation, not an error: nothing of
-  // org1's is readable.
-  check("cross-org stats hits a disjoint room (isolation)", cross.status === 200, `got ${cross.status}`);
+  // where none of Organization 1's data is readable.
+  check("cross-Organization stats hits a disjoint room (isolation)", cross.status === 200, `got ${cross.status}`);
 }
 
-// 2. Host claims; same-org members join and relay
+// 2. Host claims; same-Organization members join and relay
 const host = new Client("devHostA", alice, { host: true });
 await host.connect();
 const member = new Client("devBobB", bob);
@@ -145,21 +145,21 @@ await member.connect();
   check("member tail GET → 200", (await tail.text()) === "{\"t\":1}" && tail.status === 200, `got ${tail.status}`);
 }
 
-// 5. Shared blob keyspace (org-scoped) + legacy fallback
+// 5. Shared blob keyspace (Organization-scoped) + legacy fallback
 {
   const put = await http(`/blob/${chat}/p-1`, { method: "PUT", user: alice, body: "shared tool output" });
-  check("PUT blob as org member", put.status === 200, `got ${put.status}`);
-  const sameOrg = await http(`/blob/${chat}/p-1`, { user: bob });
-  check("same-org member reads the blob", sameOrg.status === 200 && (await sameOrg.text()) === "shared tool output", `got ${sameOrg.status}`);
-  const crossOrg = await http(`/blob/${chat}/p-1`, { user: carol });
-  check("cross-org blob GET → 404", crossOrg.status === 404, `got ${crossOrg.status}`);
+  check("PUT blob as Organization member", put.status === 200, `got ${put.status}`);
+  const sameOrganization = await http(`/blob/${chat}/p-1`, { user: bob });
+  check("same-Organization member reads the blob", sameOrganization.status === 200 && (await sameOrganization.text()) === "shared tool output", `got ${sameOrganization.status}`);
+  const crossOrganization = await http(`/blob/${chat}/p-1`, { user: carol });
+  check("cross-Organization blob GET → 404", crossOrganization.status === 404, `got ${crossOrganization.status}`);
   // Legacy fallback: a pre-migration blob under the per-user key must keep
-  // resolving for its owner once they carry an org claim. Dev tokens share
-  // the userId: `e3-dave` (no org, legacy key) vs `e3-dave@e3-org1`.
-  const legacyPut = await http(`/blob/${chat}/p-legacy`, { method: "PUT", user: noOrg, body: "pre-migration output" });
-  check("org-less PUT lands on legacy key", legacyPut.status === 200, `got ${legacyPut.status}`);
+  // resolving for its owner once they carry an Organization claim. Legacy
+  // development tokens share the user id across scoped/unscoped forms.
+  const legacyPut = await http(`/blob/${chat}/p-legacy`, { method: "PUT", user: noOrganization, body: "pre-migration output" });
+  check("Organization-less PUT lands on legacy key", legacyPut.status === 200, `got ${legacyPut.status}`);
   const fallback = await http(`/blob/${chat}/p-legacy`, { user: "e3-dave@e3-org1" });
-  check("org token falls back to own legacy key", fallback.status === 200 && (await fallback.text()) === "pre-migration output", `got ${fallback.status}`);
+  check("Organization token falls back to own legacy key", fallback.status === 200 && (await fallback.text()) === "pre-migration output", `got ${fallback.status}`);
   const notOwn = await http(`/blob/${chat}/p-legacy`, { user: alice });
   check("legacy fallback is per-owner only", notOwn.status === 404, `got ${notOwn.status}`);
 }

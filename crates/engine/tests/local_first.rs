@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
-use zeron_engine::{AuthState, Engine, EngineConfig, EngineInfo, HarnessId, WorkspaceScope};
+use zeron_engine::{AuthState, Engine, EngineConfig, EngineInfo, HarnessId, ProfileScope};
 use zeron_rpc::{connect_ws, memory_client, methods};
 
 fn config(
@@ -26,7 +26,7 @@ fn config(
         edge_token: edge_token.map(str::to_string),
         ipc_port: 0,
         default_harness: HarnessId::Mock,
-        org_id: None,
+        organization_id: None,
         workos_client_id: workos_client_id.map(str::to_string),
     }
 }
@@ -256,12 +256,12 @@ async fn signed_out_workos_boot_serves_local_data_without_dev_identity() {
         None,
     );
     let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
+    let scope = Engine::initial_profile_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
         .unwrap()
         .expect("local profile is ready without auth");
 
-    assert_eq!(scope, WorkspaceScope::Local);
+    assert_eq!(scope, ProfileScope::Local);
     let runtime = Engine::assemble_runtime(&config, auth, profile)
         .await
         .unwrap();
@@ -270,7 +270,7 @@ async fn signed_out_workos_boot_serves_local_data_without_dev_identity() {
         .call_as(methods::ENGINE_INFO, serde_json::json!({}))
         .await
         .unwrap();
-    assert_eq!(info.workspace_scope, WorkspaceScope::Local);
+    assert_eq!(info.profile_scope, ProfileScope::Local);
     assert!(
         client
             .call(methods::LIST_HARNESSES, serde_json::json!({}))
@@ -293,10 +293,7 @@ async fn clean_local_auth_construction_does_not_probe_edge_health() {
 
     let auth = Engine::build_auth(&config).await;
 
-    assert_eq!(
-        Engine::initial_workspace_scope(&auth),
-        WorkspaceScope::Local
-    );
+    assert_eq!(Engine::initial_profile_scope(&auth), ProfileScope::Local);
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     edge_task.abort();
 }
@@ -307,7 +304,7 @@ async fn local_runtime_does_not_start_the_edge_updater() {
     let (edge_url, requests, edge_task) = rejecting_edge().await;
     let config = config(dir.path(), edge_url, Some("client_test"), None);
     let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
+    let scope = Engine::initial_profile_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
         .unwrap()
         .expect("local profile is ready");
@@ -316,7 +313,7 @@ async fn local_runtime_does_not_start_the_edge_updater() {
         .await
         .unwrap();
 
-    assert_eq!(scope, WorkspaceScope::Local);
+    assert_eq!(scope, ProfileScope::Local);
     assert!(runtime.core().links().is_none());
     assert!(
         runtime.core().updater().is_none(),
@@ -339,13 +336,13 @@ async fn revoked_captured_session_stays_on_its_synced_cache() {
     let (edge_url, requests, edge_task) = rejecting_edge().await;
     let config = config(dir.path(), edge_url, Some("client_test"), None);
     let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
+    let scope = Engine::initial_profile_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
         .unwrap()
         .expect("persisted org resolves before refresh");
 
     assert!(auth.loaded_workos_session());
-    assert_eq!(scope, WorkspaceScope::Synced);
+    assert_eq!(scope, ProfileScope::Synced);
     let runtime = Engine::assemble_runtime(&config, auth.clone(), profile)
         .await
         .unwrap();
@@ -361,7 +358,7 @@ async fn revoked_captured_session_stays_on_its_synced_cache() {
     }
     assert_eq!(auth.state(), AuthState::SignedOut);
     assert!(auth.loaded_workos_session());
-    assert_eq!(runtime.workspace_scope(), WorkspaceScope::Synced);
+    assert_eq!(runtime.profile_scope(), ProfileScope::Synced);
     assert!(dir.path().join("orgs/org_1/user_1").is_dir());
     assert!(!dir.path().join("profiles/local").exists());
     assert!(requests.load(Ordering::SeqCst) >= 1);
@@ -384,7 +381,7 @@ async fn transient_refresh_failure_keeps_synced_recovery_supervisors_alive() {
         None,
     );
     let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
+    let scope = Engine::initial_profile_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
         .unwrap()
         .expect("persisted org resolves while Edge is unavailable");
@@ -393,7 +390,7 @@ async fn transient_refresh_failure_keeps_synced_recovery_supervisors_alive() {
         .await
         .unwrap();
 
-    assert_eq!(scope, WorkspaceScope::Synced);
+    assert_eq!(scope, ProfileScope::Synced);
     assert!(
         auth.state().is_signed_in(),
         "network errors are not revocation"
@@ -415,18 +412,18 @@ async fn development_without_an_explicit_bearer_stays_offline() {
     let (edge_url, requests, edge_task) = rejecting_edge().await;
     let config = config(dir.path(), edge_url, None, None);
     let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
+    let scope = Engine::initial_profile_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
         .unwrap()
         .expect("development profile is ready");
 
-    assert_eq!(scope, WorkspaceScope::Development);
+    assert_eq!(scope, ProfileScope::Development);
     assert_eq!(auth.access_token().await.as_deref(), Some("dev-user"));
     let runtime = Engine::assemble_runtime(&config, auth, profile)
         .await
         .unwrap();
 
-    assert_eq!(runtime.workspace_scope(), WorkspaceScope::Development);
+    assert_eq!(runtime.profile_scope(), ProfileScope::Development);
     assert!(
         runtime.core().links().is_none(),
         "the synthetic dev identity must not enable Edge"
@@ -446,7 +443,7 @@ async fn explicit_dev_bearer_keeps_online_routing_enabled() {
         Some("dev-user@dev-org"),
     );
     let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
+    let scope = Engine::initial_profile_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
         .unwrap()
         .expect("development profile is ready");
@@ -455,7 +452,7 @@ async fn explicit_dev_bearer_keeps_online_routing_enabled() {
         .await
         .unwrap();
 
-    assert_eq!(runtime.workspace_scope(), WorkspaceScope::Development);
+    assert_eq!(runtime.profile_scope(), ProfileScope::Development);
     assert!(runtime.core().links().is_some());
     assert!(dir.path().join("orgs/dev-org/dev-user").is_dir());
     runtime.shutdown().await;
@@ -578,7 +575,7 @@ async fn online_runtime_shutdown_stops_edge_workers_and_retires_the_graph() {
     let (edge_url, requests, edge_task) = rejecting_edge().await;
     let config = config(dir.path(), edge_url, None, Some("dev-user@dev-org"));
     let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
+    let scope = Engine::initial_profile_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
         .unwrap()
         .expect("development profile is ready");

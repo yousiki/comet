@@ -108,8 +108,8 @@ pub struct UiConfig {
     pub edge_url: String,
     /// Edge bearer; `None` runs offline.
     pub edge_token: Option<String>,
-    /// Workspace org override for explicit dev-mode runs.
-    pub org_id: Option<String>,
+    /// Organization override for explicit development-profile runs.
+    pub organization_id: Option<String>,
     /// WorkOS client id; `Some` makes the embedded headed engine require a
     /// production session before opening identity-scoped stores.
     pub workos_client_id: Option<String>,
@@ -124,7 +124,7 @@ impl UiConfig {
             ipc_port: self.ipc_port,
             edge_url: self.edge_url.clone(),
             edge_token: self.edge_token.clone(),
-            org_id: self.org_id.clone(),
+            organization_id: self.organization_id.clone(),
             workos_client_id: self.workos_client_id.clone(),
             default_harness: self.default_harness,
         }

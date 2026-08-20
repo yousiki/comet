@@ -139,12 +139,12 @@ async fn projectless_chat_runs_from_home_and_mints_no_space() {
         .await
         .expect("createChat without a space");
     // Pre-title so the auto-titler's own harness request stays out of the log.
-    core.workspace
+    core.registry
         .rename_chat(CHAT, "Pre-titled")
         .expect("rename chat");
 
     let chat = core
-        .workspace
+        .registry
         .chat(CHAT)
         .expect("read chat row")
         .expect("chat row exists");
@@ -188,7 +188,7 @@ async fn projectless_chat_runs_from_home_and_mints_no_space() {
     assert_eq!(cwds, vec![home], "run spawns from the expanded home dir");
 
     // And no phantom project: the flow must not mint any space row.
-    let spaces = core.workspace.read_spaces().expect("read spaces");
+    let spaces = core.registry.read_spaces().expect("read spaces");
     assert!(
         spaces.is_empty(),
         "project-less chat minted a space: {spaces:?}"

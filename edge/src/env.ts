@@ -1,8 +1,8 @@
 export interface Env {
   SESSION_ROOMS: DurableObjectNamespace;
   DEVICE_ROOMS: DurableObjectNamespace;
-  /** Per-user workspace registries (`reg1/{orgId}/{userId}`) — the row-table
-   * replacement for the Loro workspace doc (docs/registry-sync.md). */
+  /** Organization registries. `reg1/{organizationId}/{userId}` and `reg2/*`
+   * are retained legacy Durable Object namespaces. */
   REGISTRY_ROOMS: DurableObjectNamespace;
   /** chat2 session rooms (`chat2/{chatId}`) — dumb authenticated log relays
    * replacing SessionRoom's loro-aware s2 rooms (docs/chat2-sync.md). */
@@ -18,7 +18,7 @@ export interface Env {
   WORKOS_ISSUER?: string;
   WORKOS_JWKS_URL?: string;
   /** WorkOS secret API key (wrangler secret) — powers the absorbed /auth/*
-   * routes (code exchange, refresh, orgs). Unset ⇒ those routes answer 501,
+   * routes (code exchange, refresh, Organizations). Unset ⇒ those routes answer 501,
    * matching the old apps/server dev-mode behavior. */
   WORKOS_API_KEY?: string;
 }
@@ -28,15 +28,18 @@ export interface Env {
  * the Worker (design §2: "DO never sees an unauthenticated frame"). */
 export const AUTH_USER_HEADER = "x-zeron-auth-user";
 
-/** Header the Worker stamps on requests forwarded into workspace-doc rooms
- * (`ws/{orgId}`) and org-shared chat rooms (`chat3/{orgId}/{chatId}`).
- * Membership (JWT org claim == orgId) is enforced at the Worker; the DO sees
- * "workspace" (SessionRoom skips per-chat ownership) or "org-chat" (ChatRoom
- * uses host-user discipline instead of single-owner). */
+/** Header the Worker stamps on requests forwarded into legacy workspace-doc
+ * rooms (`ws/{organizationId}`) and Organization-shared legacy `chat3` rooms.
+ * Its values are historical wire protocol and must remain stable. */
 export const ROOM_KIND_HEADER = "x-zeron-room-kind";
+export const LEGACY_WORKSPACE_ROOM_KIND = "workspace";
+export const LEGACY_ORGANIZATION_CHAT_ROOM_KIND = "org-chat";
+export type RoomKind =
+  | typeof LEGACY_WORKSPACE_ROOM_KIND
+  | typeof LEGACY_ORGANIZATION_CHAT_ROOM_KIND;
 
-/** Header the Worker stamps with the caller's verified WorkOS org claim on
- * forwards that need an org-scoped decision inside the DO (device-room nudge
- * gate). Same trust rule as AUTH_USER_HEADER: Worker-controlled, deleted from
- * inbound requests before being set. */
-export const AUTH_ORG_HEADER = "x-zeron-auth-org";
+/** Header the Worker stamps with the caller's verified Organization id.
+ * The `x-zeron-auth-org` value is a legacy internal wire name and must remain
+ * stable. Same trust rule as AUTH_USER_HEADER: Worker-controlled and scrubbed
+ * from inbound requests before being set. */
+export const AUTH_ORGANIZATION_HEADER = "x-zeron-auth-org";

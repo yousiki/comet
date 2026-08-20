@@ -22,7 +22,7 @@ async fn seed_local(data_dir: &std::path::Path) -> (String, String, String) {
     let device = local.device_id.clone();
 
     local
-        .workspace
+        .registry
         .create_space(
             "space-1",
             &device,
@@ -32,15 +32,15 @@ async fn seed_local(data_dir: &std::path::Path) -> (String, String, String) {
         )
         .expect("create space");
     local
-        .workspace
+        .registry
         .create_chat("chat-doc", Some("space-1"), None, None, None)
         .expect("create chat with doc");
     local
-        .workspace
+        .registry
         .rename_chat("chat-doc", "Fix the flaky test")
         .expect("title");
     local
-        .workspace
+        .registry
         .create_chat("chat-bare", Some("space-1"), None, None, None)
         .expect("create bare chat");
 
@@ -137,7 +137,7 @@ async fn local_work_imports_into_synced_profile_once() {
 
     // Rows landed with chat2 lineage and their content intact.
     let row = synced
-        .workspace
+        .registry
         .chat(&chat_doc)
         .expect("read chat")
         .expect("imported chat row");
@@ -146,7 +146,7 @@ async fn local_work_imports_into_synced_profile_once() {
     assert_eq!(row.space_id.as_deref(), Some("space-1"));
     assert!(
         synced
-            .workspace
+            .registry
             .chat(&chat_bare)
             .expect("read bare")
             .is_some(),
@@ -154,7 +154,7 @@ async fn local_work_imports_into_synced_profile_once() {
     );
     assert!(
         synced
-            .workspace
+            .registry
             .space("space-1")
             .expect("read space")
             .is_some()
@@ -202,7 +202,7 @@ async fn local_work_imports_into_synced_profile_once() {
     );
     assert!(
         marker_grants_read_root(dir.path(), "org1", "other-user").is_none(),
-        "grants are per (org, user)"
+        "grants are per (organization, user)"
     );
 
     // Second run: structural idempotence — everything is skipped.
@@ -239,6 +239,27 @@ async fn import_without_local_profile_is_a_clean_no_op() {
     let (imported_chats, imported_spaces, ..) = summary(&events);
     assert_eq!((imported_chats, imported_spaces), (0, 0));
 
+    synced.shutdown().await;
+}
+
+#[tokio::test]
+async fn previous_import_local_workspace_wire_method_remains_accepted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    let client = zeron_rpc::memory_client(synced.rpc_service());
+    let mut events = client
+        .subscribe(
+            zeron_rpc::methods::LEGACY_IMPORT_LOCAL_PROFILE,
+            serde_json::json!({}),
+        )
+        .await
+        .expect("legacy import stream");
+
+    let mut last = None;
+    while let Some(event) = events.recv().await {
+        last = Some(event);
+    }
+    assert_eq!(last.expect("summary")["kind"], "summary");
     synced.shutdown().await;
 }
 
@@ -289,7 +310,7 @@ async fn per_item_failures_surface_in_the_summary_and_leave_the_row_retryable() 
     // retry pick it up again instead of skipping a half-imported chat.
     assert!(
         synced
-            .workspace
+            .registry
             .chat(&chat_doc)
             .expect("read chat")
             .is_none(),
@@ -297,7 +318,7 @@ async fn per_item_failures_surface_in_the_summary_and_leave_the_row_retryable() 
     );
     assert!(
         synced
-            .workspace
+            .registry
             .chat(&chat_bare)
             .expect("read chat")
             .is_some()
@@ -367,7 +388,7 @@ async fn spaces_only_profile_imports_its_spaces() {
     let local = assemble(EngineProfile::local(dir.path()).expect("local profile"));
     let device = local.device_id.clone();
     local
-        .workspace
+        .registry
         .create_space(
             "space-only",
             &device,
@@ -402,7 +423,7 @@ async fn spaces_only_profile_imports_its_spaces() {
     }
     assert!(
         synced
-            .workspace
+            .registry
             .space("space-only")
             .expect("read space")
             .is_some()
@@ -444,7 +465,7 @@ async fn later_local_work_imports_as_a_delta() {
     // A later signed-out stretch creates one more local chat…
     let local = assemble(EngineProfile::local(dir.path()).expect("local profile"));
     local
-        .workspace
+        .registry
         .create_chat("chat-later", None, Some(&device), None, Some("/tmp".into()))
         .expect("create later chat");
     local.shutdown().await;

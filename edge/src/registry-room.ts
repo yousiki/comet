@@ -1,7 +1,7 @@
 /**
- * RegistryRoom — one Durable Object per per-user workspace registry
- * (`reg1/{orgId}/{userId}`), the wedge-proof replacement for the Loro
- * workspace doc (docs/registry-sync.md).
+ * RegistryRoom — one Durable Object per Organization registry. `reg1` and
+ * `reg2` are retained legacy namespaces; this replaces the legacy Loro
+ * workspace document (docs/registry-sync.md).
  *
  * The DO is the authority: it stores CURRENT row state in its SQLite (no
  * update log, no replay, no wasm), applies pushed ops with per-field LWW
@@ -147,7 +147,7 @@ export class RegistryRoom implements DurableObject {
     return out;
   }
 
-  // ── HTTP surface (only reachable through the authed Worker; org membership
+  // ── HTTP surface (only reachable through the authed Worker; Organization membership
   //    and the per-user room name were enforced there) ──────────────────────
 
   async fetch(request: Request): Promise<Response> {

@@ -899,7 +899,7 @@ fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
 
 /// Derive the model list a `session/new` response advertises. The `model`
 /// config option's choices come FIRST, the legacy first-class `models` state
-/// is only a fallback: the org adapters enumerate one `availableModels` entry
+/// is only a fallback: the Organization-maintained adapters enumerate one `availableModels` entry
 /// per model × effort combination on that deprecated surface (Zed dropped it
 /// entirely), while their `configOptions` carry base model ids with effort as
 /// a separate `thought_level` option. `[1m]`-suffixed long-context variants
@@ -1286,7 +1286,7 @@ fn initialize_params(_harness: HarnessId) -> Value {
 }
 
 /// `initialize._meta.steering.supported` — the `_session/steering` extension
-/// both org-maintained adapters advertise (not part of the v1 spec).
+/// both Organization-maintained adapters advertise (not part of the v1 spec).
 fn steering_supported(init: &Value) -> bool {
     init.get("_meta")
         .and_then(|m| m.get("steering"))

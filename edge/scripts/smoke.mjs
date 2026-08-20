@@ -8,8 +8,8 @@
  *   5. ephemeral (%EPH) presence relays between peers
  *   6. device room relays client↔host frames and serves sidecar slots
  *   7. R2 attachments: PUT (hash verified) then GET
- *   8. workspace room (`ws3/{orgId}/{userId}`): one user's devices converge;
- *      teammates in the same org are isolated (per-user docs); wrong org 403
+ *   8. legacy workspace room: one user's devices converge; Organization
+ *      members remain isolated (per-user docs); wrong Organization gets 403
  *   9. absorbed /auth routes: 501 without WORKOS_API_KEY; cli callback page
  *
  * Usage: node scripts/smoke.mjs [baseUrl]   (default http://127.0.0.1:27640)
@@ -24,7 +24,7 @@ const wsBase = base.replace(/^http/, "ws");
 const token = "smoke-user";
 const chatId = `smoke-${randomUUID().slice(0, 8)}`;
 const deviceId = `smokedev-${randomUUID().slice(0, 8)}`;
-const orgId = `org-smoke-${randomUUID().slice(0, 8)}`;
+const organizationId = `org-smoke-${randomUUID().slice(0, 8)}`;
 
 const fail = (msg) => {
   console.error(`✗ ${msg}`);
@@ -137,14 +137,14 @@ await new Promise((r) => setTimeout(r, 100));
   ok("ephemeral presence relay");
 }
 
-// ── workspace room: per-user docs — one user's devices converge, teammates
-//    in the same org are isolated ─────────────────────────────────────────
+// ── Legacy workspace room: per-user docs — one user's devices converge;
+//    members in the same Organization remain isolated ────────────────────
 {
-  // Dev-mode org claim: token `userId@orgId`. The room id is derived at the
-  // edge from the caller's OWN user claim: `ws3/{orgId}/{userId}`.
-  const roomA = `ws3/${orgId}/alice`;
+  // The legacy development token is `userId@organizationId`; `ws3` is also a
+  // retained historical room namespace.
+  const roomA = `ws3/${organizationId}/alice`;
   const deviceA1 = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${orgId}/ws?token=alice@${orgId}`
+    url: `${wsBase}/workspace/${organizationId}/ws?token=alice@${organizationId}`
   });
   await deviceA1.waitConnected();
   const wsAdaptorA1 = new LoroAdaptor();
@@ -157,43 +157,50 @@ await new Promise((r) => setTimeout(r, 100));
   // A SECOND DEVICE of the same user joins the same per-user room and
   // backfills.
   const deviceA2 = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${orgId}/ws?token=alice@${orgId}`
+    url: `${wsBase}/workspace/${organizationId}/ws?token=alice@${organizationId}`
   });
   await deviceA2.waitConnected();
   const wsAdaptorA2 = new LoroAdaptor();
   await deviceA2.join({ roomId: roomA, crdtAdaptor: wsAdaptorA2 });
   await until(
     () => wsAdaptorA2.getDoc().getMap("chats").get("chat-1") !== undefined,
-    "workspace second-device backfill"
+    "legacy workspace second-device backfill"
   );
-  ok("workspace room: one user's devices converge");
+  ok("legacy workspace room: one user's devices converge");
 
-  // A TEAMMATE (same org, different user) lands in their OWN empty room —
+  // Another Organization member lands in their own empty per-user room —
   // alice's spaces/sessions must be invisible to bob.
   const memberB = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${orgId}/ws?token=bob@${orgId}`
+    url: `${wsBase}/workspace/${organizationId}/ws?token=bob@${organizationId}`
   });
   await memberB.waitConnected();
   const wsAdaptorB = new LoroAdaptor();
-  await memberB.join({ roomId: `ws3/${orgId}/bob`, crdtAdaptor: wsAdaptorB });
+  await memberB.join({ roomId: `ws3/${organizationId}/bob`, crdtAdaptor: wsAdaptorB });
   await new Promise((resolve) => setTimeout(resolve, 400)); // any (wrong) backfill gets a beat
   if (wsAdaptorB.getDoc().getMap("chats").get("chat-1") !== undefined) {
-    fail("teammate must NOT see another user's workspace doc");
+    fail("Organization member must not see another user's legacy workspace document");
   }
-  ok("workspace room: teammates isolated (per-user docs)");
+  ok("legacy workspace room: Organization members isolated by user");
   memberB.close();
   deviceA2.close();
 
-  // Wrong org claim rejected at the Worker.
-  const wrongOrg = await fetch(`${base}/workspace/${orgId}/tail?token=mallory@org-other`);
-  if (wrongOrg.status !== 403) fail(`wrong-org tail expected 403, got ${wrongOrg.status}`);
-  // No org claim at all is rejected too.
-  const noOrg = await fetch(`${base}/workspace/${orgId}/tail?token=${token}`);
-  if (noOrg.status !== 403) fail(`no-org tail expected 403, got ${noOrg.status}`);
-  // A member can read the workspace tail (empty messages — shape only).
-  const memberTail = await fetch(`${base}/workspace/${orgId}/tail?token=alice@${orgId}`);
-  if (memberTail.status !== 200) fail(`member workspace tail ${memberTail.status}`);
-  ok("workspace room: org membership enforced (403 for outsiders)");
+  // Wrong or missing Organization claims are rejected at the Worker.
+  const wrongOrganization = await fetch(
+    `${base}/workspace/${organizationId}/tail?token=mallory@org-other`
+  );
+  if (wrongOrganization.status !== 403) {
+    fail(`wrong-Organization tail expected 403, got ${wrongOrganization.status}`);
+  }
+  const noOrganization = await fetch(`${base}/workspace/${organizationId}/tail?token=${token}`);
+  if (noOrganization.status !== 403) {
+    fail(`missing-Organization tail expected 403, got ${noOrganization.status}`);
+  }
+  // A member can read the legacy workspace tail (empty messages — shape only).
+  const memberTail = await fetch(
+    `${base}/workspace/${organizationId}/tail?token=alice@${organizationId}`
+  );
+  if (memberTail.status !== 200) fail(`member legacy workspace tail ${memberTail.status}`);
+  ok("legacy workspace room: Organization membership enforced");
 
   deviceA1.close();
 }

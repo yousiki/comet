@@ -28,15 +28,19 @@ const testEnv = (): Env =>
     WORKOS_CLIENT_ID: "client"
   }) as Env;
 
-const member = (id: string, orgId: string, role: "admin" | "member"): WireMembership => ({
+const member = (
+  id: string,
+  organizationId: string,
+  role: "admin" | "member"
+): WireMembership => ({
   id,
-  organization_id: orgId,
+  organization_id: organizationId,
   user_id: id === "m-caller" ? "caller" : `user-${id}`,
   role: { slug: role }
 });
 
 const stubWorkOs = (
-  membersByOrg: Readonly<Record<string, readonly WireMembership[]>>,
+  membersByOrganization: Readonly<Record<string, readonly WireMembership[]>>,
   options: { readonly rejectAdminAdd?: boolean } = {}
 ): WorkOsCall[] => {
   const calls: WorkOsCall[] = [];
@@ -50,20 +54,20 @@ const stubWorkOs = (
     calls.push({ method, url, body });
 
     if (url.pathname === "/user_management/organization_memberships" && method === "GET") {
-      const orgId = url.searchParams.get("organization_id") ?? "";
+      const organizationId = url.searchParams.get("organization_id") ?? "";
       if (url.searchParams.has("user_id")) {
         return jsonResponse({
           data: [
             {
               id: "m-caller",
-              organization_id: orgId,
+              organization_id: organizationId,
               user_id: "caller",
               role: { slug: "admin" }
             }
           ]
         });
       }
-      const members = membersByOrg[orgId] ?? [];
+      const members = membersByOrganization[organizationId] ?? [];
       const after = url.searchParams.get("after");
       const offset = after?.startsWith("cursor-") ? Number(after.slice("cursor-".length)) : 0;
       const end = Math.min(offset + 100, members.length);
@@ -84,6 +88,24 @@ const stubWorkOs = (
           }
         ]
       });
+    }
+
+    if (url.pathname.startsWith("/user_management/users/") && method === "GET") {
+      const userId = url.pathname.slice("/user_management/users/".length);
+      return jsonResponse({
+        id: userId,
+        email: `${userId}@example.com`,
+        first_name: "Example",
+        last_name: "Member"
+      });
+    }
+
+    if (url.pathname === "/organizations" && method === "POST") {
+      return jsonResponse({ id: "org-created" }, 201);
+    }
+
+    if (url.pathname.startsWith("/organizations/") && method === "DELETE") {
+      return jsonResponse({});
     }
 
     if (url.pathname === "/user_management/organization_memberships" && method === "POST") {
@@ -108,7 +130,7 @@ const stubWorkOs = (
 
 const callRoute = async (
   path: string,
-  method: "POST" | "DELETE",
+  method: "GET" | "POST" | "DELETE",
   body?: Record<string, unknown>
 ): Promise<Response> => {
   const url = new URL(`https://edge.example${path}`);
@@ -136,15 +158,135 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("organization member auth routes", () => {
-  it("cannot promote a membership that belongs to another organization", async () => {
+describe("Organization auth contract", () => {
+  it("returns the canonical organizations payload from /auth/organizations", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          data: [
+            {
+              id: "membership-a",
+              organization_id: "org-a",
+              organization_name: "Example Organization",
+              user_id: "caller",
+              role: { slug: "admin" }
+            }
+          ],
+          list_metadata: { after: null }
+        })
+      )
+    );
+
+    const response = await callRoute("/auth/organizations", "GET");
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      organizations: [
+        {
+          id: "membership-a",
+          organizationId: "org-a",
+          name: "Example Organization",
+          role: "admin"
+        }
+      ]
+    });
+  });
+
+  it("preserves the legacy orgs list payload at /auth/orgs", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          data: [
+            {
+              id: "membership-a",
+              organization_id: "org-a",
+              organization_name: "Example Organization",
+              user_id: "caller",
+              role: { slug: "admin" }
+            }
+          ],
+          list_metadata: { after: null }
+        })
+      )
+    );
+
+    const response = await callRoute("/auth/orgs", "GET");
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      orgs: [
+        {
+          id: "membership-a",
+          organizationId: "org-a",
+          name: "Example Organization",
+          role: "admin"
+        }
+      ]
+    });
+  });
+
+  it("keeps create, roster, member mutations, and delete available through /auth/orgs", async () => {
+    const members = {
+      "org-a": [member("m-caller", "org-a", "admin"), member("m-local", "org-a", "member")]
+    };
+
+    let calls = stubWorkOs(members);
+    const created = await callRoute("/auth/orgs", "POST", { name: "Legacy client" });
+    expect(created.status).toBe(200);
+    expect(await created.json()).toEqual({ organizationId: "org-created" });
+    expect(calls.some((call) => call.method === "POST" && call.url.pathname === "/organizations"))
+      .toBe(true);
+
+    calls = stubWorkOs(members);
+    const roster = await callRoute("/auth/orgs/org-a/members", "GET");
+    expect(roster.status).toBe(200);
+    expect((await roster.json()) as { members: unknown[] }).toMatchObject({
+      members: [{ membershipId: "m-caller" }, { membershipId: "m-local" }]
+    });
+
+    calls = stubWorkOs(members);
+    const invited = await callRoute("/auth/orgs/org-a/members", "POST", {
+      email: "invitee@example.com",
+      role: "member"
+    });
+    expect(invited.status).toBe(200);
+    expect(await invited.json()).toEqual({ added: true, invited: false });
+
+    calls = stubWorkOs(members);
+    const promoted = await callRoute("/auth/orgs/org-a/members/m-local", "POST", {
+      role: "admin"
+    });
+    expect(promoted.status).toBe(200);
+    expect(await promoted.json()).toEqual({ ok: true });
+
+    calls = stubWorkOs(members);
+    const removed = await callRoute("/auth/orgs/org-a/members/m-local", "DELETE");
+    expect(removed.status).toBe(200);
+    expect(await removed.json()).toEqual({ ok: true });
+
+    calls = stubWorkOs(members);
+    const deleted = await callRoute("/auth/orgs/org-a", "DELETE");
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toEqual({ ok: true });
+    expect(
+      calls.some(
+        (call) => call.method === "DELETE" && call.url.pathname === "/organizations/org-a"
+      )
+    ).toBe(true);
+  });
+});
+
+describe("Organization member auth routes", () => {
+  it("cannot promote a membership that belongs to another Organization", async () => {
     const calls = stubWorkOs({
       "org-a": [member("m-caller", "org-a", "admin"), member("m-local", "org-a", "member")],
       "org-b": [member("m-other-org", "org-b", "member")]
     });
 
     const response = await callRoute(
-      "/auth/orgs/org-a/members/m-other-org",
+      "/auth/organizations/org-a/members/m-other-org",
       "POST",
       { role: "admin" }
     );
@@ -167,7 +309,7 @@ describe("organization member auth routes", () => {
       "org-a": [member("m-caller", "org-a", "admin"), member("m-local", "org-a", "member")]
     });
 
-    const response = await callRoute("/auth/orgs/org-a/members/m-missing", "POST", {
+    const response = await callRoute("/auth/organizations/org-a/members/m-missing", "POST", {
       role: "admin"
     });
 
@@ -181,7 +323,7 @@ describe("organization member auth routes", () => {
       const calls = stubWorkOs({ "org-a": [member("m-caller", "org-a", "admin")] });
 
       const response = await callRoute(
-        "/auth/orgs/org-a/members/m-caller",
+        "/auth/organizations/org-a/members/m-caller",
         operation === "demote" ? "POST" : "DELETE",
         operation === "demote" ? { role: "member" } : undefined
       );
@@ -194,12 +336,12 @@ describe("organization member auth routes", () => {
     });
   }
 
-  it("promotes a member only after finding it in the URL organization", async () => {
+  it("promotes a member only after finding it in the URL Organization", async () => {
     const calls = stubWorkOs({
       "org-a": [member("m-caller", "org-a", "admin"), member("m-local", "org-a", "member")]
     });
 
-    const response = await callRoute("/auth/orgs/org-a/members/m-local", "POST", {
+    const response = await callRoute("/auth/organizations/org-a/members/m-local", "POST", {
       role: "admin"
     });
 
@@ -221,7 +363,7 @@ describe("organization member auth routes", () => {
       ]
     });
 
-    const response = await callRoute("/auth/orgs/org-a/members/m-caller", "POST", {
+    const response = await callRoute("/auth/organizations/org-a/members/m-caller", "POST", {
       role: "member"
     });
 
@@ -250,7 +392,7 @@ describe("organization member auth routes", () => {
       { rejectAdminAdd: true }
     );
 
-    const response = await callRoute("/auth/orgs/org-a/members", "POST", {
+    const response = await callRoute("/auth/organizations/org-a/members", "POST", {
       email: "invitee@example.com",
       role: "admin"
     });
@@ -272,7 +414,7 @@ describe("organization member auth routes", () => {
   it("rejects unknown invite roles instead of silently treating them as member", async () => {
     const calls = stubWorkOs({ "org-a": [member("m-caller", "org-a", "admin")] });
 
-    const response = await callRoute("/auth/orgs/org-a/members", "POST", {
+    const response = await callRoute("/auth/organizations/org-a/members", "POST", {
       email: "invitee@example.com",
       role: "owner"
     });
@@ -407,7 +549,7 @@ describe("WorkOS failure protocol", () => {
       })
     );
 
-    const response = await callRoute("/auth/orgs/org-a", "DELETE");
+    const response = await callRoute("/auth/organizations/org-a", "DELETE");
 
     expect(response.status).toBe(502);
     expect(await response.json()).toEqual({
@@ -440,7 +582,7 @@ describe("WorkOS failure protocol", () => {
       })
     );
 
-    const response = await callRoute("/auth/orgs/org-a", "DELETE");
+    const response = await callRoute("/auth/organizations/org-a", "DELETE");
 
     expect(response.status).toBe(502);
     expect(await response.json()).toEqual({
@@ -472,7 +614,7 @@ describe("WorkOS failure protocol", () => {
       })
     );
 
-    const response = await callRoute("/auth/orgs/org-a", "DELETE");
+    const response = await callRoute("/auth/organizations/org-a", "DELETE");
 
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({

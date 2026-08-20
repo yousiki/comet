@@ -20,7 +20,7 @@ use crate::doc_host::EdgeConfig;
 
 /// Minimum synchronized-room epoch. Values below 2 are legacy fat/s2 docs;
 /// values at or above 2 identify the room generation whose cursor is stored
-/// beside the thin snapshot (2 = chat2, 3 = org-shared chat3).
+/// beside the thin snapshot (2 = chat2, 3 = organization-shared chat3).
 pub const CHAT2_DOC_EPOCH: u32 = 2;
 
 /// [`ChatDocSink`] over a live [`SessionDoc`] + the cursor-bearing store.
@@ -309,7 +309,7 @@ pub struct EdgeCheckpointFetcher {
     http: reqwest::Client,
     edge: EdgeConfig,
     chat_id: String,
-    /// 2 = `/chat2/...`, 3 = org-shared `/chat3/...`.
+    /// 2 = `/chat2/...`, 3 = organization-shared `/chat3/...`.
     room_gen: u32,
 }
 
@@ -412,14 +412,14 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
 }
 
 /// Plain-HTTPS chat pull/push (the airplane-wifi transport): GET/POST
-/// `/chat2/{id}/rows` for legacy rooms or `/chat3/{id}/rows` for org-shared
+/// `/chat2/{id}/rows` for legacy rooms or `/chat3/{id}/rows` for organization-shared
 /// rooms, with the same bearer auth the checkpoint fetcher uses.
 pub struct EdgeChatTransport {
     http: reqwest::Client,
     edge: EdgeConfig,
     chat_id: String,
     device_id: String,
-    /// 2 = `/chat2/...`, 3 = org-shared `/chat3/...`.
+    /// 2 = `/chat2/...`, 3 = organization-shared `/chat3/...`.
     room_gen: u32,
 }
 
@@ -589,7 +589,7 @@ mod frontier_tests {
     }
 
     #[test]
-    fn edge_transport_routes_org_rooms_to_chat3_rows() {
+    fn edge_transport_routes_organization_rooms_to_chat3_rows() {
         let edge = EdgeConfig::with_static_token("https://edge.example/", "token");
         let legacy = EdgeChatTransport::new(
             reqwest::Client::new(),
@@ -598,15 +598,15 @@ mod frontier_tests {
             "device-id",
             2,
         );
-        let org_shared =
+        let organization_shared =
             EdgeChatTransport::new(reqwest::Client::new(), edge, "chat-id", "device-id", 3);
 
         assert_eq!(legacy.rows_url(), "https://edge.example/chat2/chat-id/rows");
         assert_eq!(
-            org_shared.rows_url(),
+            organization_shared.rows_url(),
             "https://edge.example/chat3/chat-id/rows"
         );
-        assert!(!org_shared.rows_url().contains("/chat2/"));
+        assert!(!organization_shared.rows_url().contains("/chat2/"));
     }
 
     #[test]

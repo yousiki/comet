@@ -32,9 +32,11 @@ use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
     AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
-    EngineInfo, EngineProfileIdentity, HarnessId, Session, Space, WorkspaceScope,
+    EngineInfo, HarnessId, ProfileIdentity, ProfileScope, Session, Space,
 };
-use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+use zeron_rpc::{
+    RpcClient, RpcError, RpcReply, RpcService, RpcSubscription, connect_ws, memory_client, methods,
+};
 
 use crate::change_requests::{
     ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
@@ -55,8 +57,8 @@ pub struct EngineBootConfig {
     pub edge_url: String,
     /// Bearer for edge room joins; `None` runs offline.
     pub edge_token: Option<String>,
-    /// Workspace org override for explicit dev-mode runs.
-    pub org_id: Option<String>,
+    /// Organization override for explicit development-profile runs.
+    pub organization_id: Option<String>,
     /// WorkOS client id for production authentication.
     pub workos_client_id: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
@@ -248,7 +250,7 @@ impl EngineHandle {
             edge_token: config.edge_token,
             ipc_port: config.ipc_port,
             default_harness: config.default_harness,
-            org_id: config.org_id,
+            organization_id: config.organization_id,
             workos_client_id: config.workos_client_id,
         };
 
@@ -275,12 +277,12 @@ impl EngineHandle {
         };
 
         let auth = Engine::build_auth(&engine_config).await;
-        let workspace_scope = Engine::initial_workspace_scope(&auth);
-        let initial_profile = Engine::resolve_profile(&engine_config, &auth, workspace_scope)?;
+        let profile_scope = Engine::initial_profile_scope(&auth);
+        let initial_profile = Engine::resolve_profile(&engine_config, &auth, profile_scope)?;
         let profile_is_resolved = initial_profile.is_some();
         let engine_info = Arc::new(std::sync::RwLock::new(Engine::engine_info_for_profile(
             &engine_config,
-            workspace_scope,
+            profile_scope,
             initial_profile.as_ref(),
         )?));
         let refresh_task = auth.spawn_refresh_loop();
@@ -328,32 +330,34 @@ impl EngineHandle {
                     let mut auth_state = auth.watch_state();
                     while !auth_state.borrow().is_signed_in() {
                         // First sign-in with zero memberships: mint the
-                        // personal workspace so the org gate never appears on
+                        // personal organization so the organization gate never appears on
                         // the solo path (idempotent; the gate stays as the
                         // fallback if this fails).
-                        let needs_org = matches!(
+                        let needs_organization = matches!(
                             &*auth_state.borrow(),
                             zeron_engine::AuthState::NeedsOrganization { .. }
                         );
-                        if needs_org && let Err(err) = auth.ensure_default_org().await {
+                        if needs_organization
+                            && let Err(err) = auth.ensure_default_organization().await
+                        {
                             tracing::warn!(error = %err,
-                                "default workspace creation failed; org gate remains");
+                                "default organization creation failed; organization gate remains");
                         }
                         if auth_state.borrow().is_signed_in() {
                             break;
                         }
                         if auth_state.changed().await.is_err() {
                             state_tx.send_replace(DeferredEngineState::Failed(
-                                "authentication state closed before workspace onboarding".into(),
+                                "authentication state closed before organization onboarding".into(),
                             ));
                             return;
                         }
                     }
-                    match Engine::resolve_profile(&engine_config, &auth, workspace_scope) {
+                    match Engine::resolve_profile(&engine_config, &auth, profile_scope) {
                         Ok(Some(profile)) => profile,
                         Ok(None) => {
                             state_tx.send_replace(DeferredEngineState::Failed(
-                                "workspace onboarding completed without an organization".into(),
+                                "organization onboarding completed without an organization".into(),
                             ));
                             return;
                         }
@@ -364,9 +368,9 @@ impl EngineHandle {
                     }
                 }
             };
-            let profile_identity = EngineProfileIdentity {
+            let profile_identity = ProfileIdentity {
                 user_id: profile.user_id().to_string(),
-                organization_id: profile.org_id().to_string(),
+                organization_id: profile.organization_id().to_string(),
             };
 
             match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
@@ -555,11 +559,51 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
                 .await?;
             Ok(EngineInfo {
                 device_id: legacy.device_id,
-                workspace_scope: WorkspaceScope::Synced,
+                profile_scope: ProfileScope::Synced,
                 profile: None,
             })
         }
         Err(err) => Err(err),
+    }
+}
+
+/// Call a canonical RPC method, retrying its legacy spelling only when the
+/// connected engine explicitly reports that the canonical method is unknown.
+///
+/// In particular, transport, timeout, and application failures must not replay
+/// mutations whose first attempt may already have committed.
+pub(crate) async fn call_with_legacy_method(
+    client: &RpcClient,
+    canonical_method: &'static str,
+    legacy_method: &'static str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, RpcError> {
+    match client.call(canonical_method, params.clone()).await {
+        Err(RpcError::UnknownMethod(method)) if method == canonical_method => {
+            client.call(legacy_method, params).await
+        }
+        result => result,
+    }
+}
+
+/// Subscribe through a renamed RPC method with the same UnknownMethod-only
+/// fallback contract as [`call_with_legacy_method`]. A checked subscription is
+/// required so an old engine's rejection is observable before the stream is
+/// handed to the caller.
+pub(crate) async fn subscribe_with_legacy_method(
+    client: &RpcClient,
+    canonical_method: &'static str,
+    legacy_method: &'static str,
+    params: serde_json::Value,
+) -> Result<RpcSubscription, RpcError> {
+    match client
+        .subscribe_checked(canonical_method, params.clone())
+        .await
+    {
+        Err(RpcError::UnknownMethod(method)) if method == canonical_method => {
+            client.subscribe_checked(legacy_method, params).await
+        }
+        result => result,
     }
 }
 
@@ -578,17 +622,17 @@ pub use zeron_proto::view::{
 };
 
 // ---------------------------------------------------------------------------
-// Org gate (pure)
+// Organization gate (pure)
 // ---------------------------------------------------------------------------
 
-/// One org membership row (tolerant local mirror of the engine's ListOrgs
-/// reply — `{orgs: [{id, organizationId, name, role}]}`).
+/// One Organization membership row (local mirror of the engine's
+/// `ListOrganizations` reply — `{organizations: [...]}`).
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OrgRow {
+pub struct OrganizationRow {
     pub organization_id: String,
     pub name: String,
-    /// The caller's role in this org; absent on pre-role engines.
+    /// The caller's role in this Organization.
     #[serde(default = "default_member_role")]
     pub role: String,
 }
@@ -597,21 +641,25 @@ fn default_member_role() -> String {
     "member".into()
 }
 
-/// Parse a ListOrgs reply tolerantly (accepts a bare array too).
-pub fn parse_orgs(value: &serde_json::Value) -> Vec<OrgRow> {
-    let list = value.get("orgs").unwrap_or(value);
-    serde_json::from_value(list.clone()).unwrap_or_default()
+/// Parse a canonical `ListOrganizations` reply, with read compatibility for
+/// the legacy `{orgs: [...]}` envelope and the oldest bare-array response.
+pub fn parse_organizations(value: &serde_json::Value) -> Vec<OrganizationRow> {
+    let organizations = value
+        .get("organizations")
+        .or_else(|| value.get("orgs"))
+        .unwrap_or(value);
+    serde_json::from_value(organizations.clone()).unwrap_or_default()
 }
 
-/// Workspace names must be non-empty (trimmed) and reasonably short.
-pub fn org_name_valid(name: &str) -> bool {
+/// Organization names must be non-empty (trimmed) and reasonably short.
+pub fn organization_name_valid(name: &str) -> bool {
     let trimmed = name.trim();
     !trimmed.is_empty() && trimmed.chars().count() <= 64
 }
 
 /// Memberships sorted by name (case-insensitive), deduped by organization id.
-pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
-    orgs.sort_by(|a, b| {
+pub fn sort_memberships(mut organizations: Vec<OrganizationRow>) -> Vec<OrganizationRow> {
+    organizations.sort_by(|a, b| {
         a.name
             .to_lowercase()
             .cmp(&b.name.to_lowercase())
@@ -621,8 +669,8 @@ pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
     // from different cache generations. `dedup_by` only removes adjacent
     // entries, which name sorting does not guarantee, so retain by identity.
     let mut seen = std::collections::HashSet::new();
-    orgs.retain(|org| seen.insert(org.organization_id.clone()));
-    orgs
+    organizations.retain(|organization| seen.insert(organization.organization_id.clone()));
+    organizations
 }
 
 // ---------------------------------------------------------------------------
@@ -672,32 +720,32 @@ pub(crate) enum ProfileCacheNamespace {
 
 impl ProfileCacheNamespace {
     fn for_engine(engine_info: &EngineInfo, data_dir: Option<&PathBuf>) -> Self {
-        match (engine_info.workspace_scope, engine_info.profile.as_ref()) {
-            (WorkspaceScope::Synced, Some(profile)) => Self::Synced {
+        match (engine_info.profile_scope, engine_info.profile.as_ref()) {
+            (ProfileScope::Synced, Some(profile)) => Self::Synced {
                 user_id: profile.user_id.clone(),
                 organization_id: profile.organization_id.clone(),
             },
-            (WorkspaceScope::Development, Some(profile)) => Self::Development {
+            (ProfileScope::Development, Some(profile)) => Self::Development {
                 user_id: profile.user_id.clone(),
                 organization_id: profile.organization_id.clone(),
             },
-            (WorkspaceScope::Local, _) => Self::Local {
+            (ProfileScope::Local, _) => Self::Local {
                 data_dir: data_dir.cloned().unwrap_or_default(),
                 device_id: engine_info.device_id.clone(),
             },
             // A legacy daemon or first-run synced engine may not announce a
-            // resolved profile. Never substitute mutable AuthStatus: a Team
+            // resolved profile. Never substitute mutable AuthStatus: an Organization
             // selection can publish there while this runtime still owns the
             // previous profile's stores. A viewport-unique namespace is the
             // safe fallback (at the cost of cache sharing only).
-            (WorkspaceScope::Synced | WorkspaceScope::Development, None) => {
+            (ProfileScope::Synced | ProfileScope::Development, None) => {
                 Self::Pending(uuid::Uuid::new_v4().to_string())
             }
         }
     }
 }
 
-const MISSING_FIXED_SYNCED_PROFILE_ERROR: &str = "This engine does not announce its fixed Team profile. Stop or upgrade the old engine, then retry; the app will not open Team data against a mutable authentication identity.";
+const MISSING_FIXED_SYNCED_PROFILE_ERROR: &str = "This engine does not announce its fixed Organization profile. Stop or upgrade the old engine, then retry; the app will not open Organization data against a mutable authentication identity.";
 
 fn missing_fixed_synced_profile_error(
     engine_info: Option<&EngineInfo>,
@@ -705,16 +753,16 @@ fn missing_fixed_synced_profile_error(
     auth: Option<&AuthState>,
 ) -> Option<&'static str> {
     let engine_info = engine_info?;
-    let signed_in_with_team = matches!(
+    let signed_in_with_organization = matches!(
         auth,
         Some(AuthState::SignedIn {
-            org_id: Some(_),
+            organization_id: Some(_),
             ..
         })
     );
     (lifecycle_ready
-        && signed_in_with_team
-        && engine_info.workspace_scope == WorkspaceScope::Synced
+        && signed_in_with_organization
+        && engine_info.profile_scope == ProfileScope::Synced
         && engine_info.profile.is_none())
     .then_some(MISSING_FIXED_SYNCED_PROFILE_ERROR)
 }
@@ -727,12 +775,12 @@ fn fixed_synced_profile_gate(
     let engine_info = engine_info?;
     let Some(AuthState::SignedIn {
         user,
-        org_id: Some(organization_id),
+        organization_id: Some(organization_id),
     }) = auth
     else {
         return None;
     };
-    if engine_info.workspace_scope != WorkspaceScope::Synced {
+    if engine_info.profile_scope != ProfileScope::Synced {
         return None;
     }
     match engine_info.profile.as_ref() {
@@ -741,9 +789,9 @@ fn fixed_synced_profile_gate(
         {
             None
         }
-        // A valid old profile plus new AuthStatus is the normal Team-handoff
+        // A valid old profile plus new AuthStatus is the normal Organization-handoff
         // window. The shell owns the replacement UI, while this lower-level
-        // gate guarantees no old Team rows paint before that observer runs.
+        // gate guarantees no old Organization rows paint before that observer runs.
         Some(_) => Some(GatePhase::Loading),
         None if lifecycle_ready => Some(GatePhase::Failed(
             MISSING_FIXED_SYNCED_PROFILE_ERROR.to_string(),
@@ -769,7 +817,7 @@ pub struct AppState {
     pub connection: ConnectionStatus,
     /// Fixed data boundary of the attached engine. Authentication may change
     /// in place, but changing this scope requires assembling a new runtime.
-    pub workspace_scope: Option<WorkspaceScope>,
+    pub profile_scope: Option<ProfileScope>,
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
     pub devices: Vec<Device>,
@@ -849,7 +897,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             connection: ConnectionStatus::Connecting,
-            workspace_scope: None,
+            profile_scope: None,
             auth: None,
             devices: Vec::new(),
             connectivity: zeron_proto::Connectivity::default(),
@@ -1018,10 +1066,10 @@ impl AppState {
     }
 
     pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
-        // A local-only workspace has no remote device identity to distinguish.
+        // A local-only profile has no remote device identity to distinguish.
         // Keep the engine's legacy sentinel out of the UI while preserving real
         // hostnames and user-assigned device names.
-        if self.workspace_scope == Some(WorkspaceScope::Local)
+        if self.profile_scope == Some(ProfileScope::Local)
             && let Some(local_id) = self.local_device_id.as_deref()
             && let Some(device) = devices.iter_mut().find(|device| device.id == local_id)
             && device.name == "unknown-device"
@@ -1496,7 +1544,7 @@ impl AppState {
                 return gate;
             }
         }
-        gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
+        gate_phase(&self.connection, self.profile_scope, self.auth.as_ref())
     }
 
     pub fn engine(&self) -> Option<&EngineHandle> {
@@ -1513,7 +1561,7 @@ impl AppState {
         self.change_request_tasks.clear();
         self.change_requests = ChangeRequestClientState::default();
         self.connection = ConnectionStatus::Connecting;
-        self.workspace_scope = None;
+        self.profile_scope = None;
         self.auth = None;
         self.devices.clear();
         self.spaces.clear();
@@ -1548,7 +1596,7 @@ impl AppState {
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
-            s.workspace_scope = None;
+            s.profile_scope = None;
             s.auth = None;
             s.data_dir = Some(data_dir);
             s.profile_cache_namespace =
@@ -1579,10 +1627,10 @@ impl AppState {
 
     /// Wire the connected engine: mark Ready and start the standing watches.
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
-    /// workspace doc in M4) fail their subscribe and are skipped gracefully.
+    /// registry doc in M4) fail their subscribe and are skipped gracefully.
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
         let engine_info = handle.engine_info();
-        self.workspace_scope = Some(engine_info.workspace_scope);
+        self.profile_scope = Some(engine_info.profile_scope);
         self.local_device_id = Some(engine_info.device_id.clone());
         self.profile_cache_namespace =
             ProfileCacheNamespace::for_engine(&engine_info, self.data_dir.as_ref());
@@ -1738,7 +1786,7 @@ impl AppState {
     /// (idempotence — no mutate spam), stamps the local row optimistically so
     /// the LWW round-trip is invisible, and fire-and-forgets the mutate.
     /// Window-focus liveness sweep: ask the engine to probe every open room
-    /// (workspace + chat docs). Fire-and-forget; each room ignores the hint
+    /// (registry + chat docs). Fire-and-forget; each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so spamming is harmless.
     pub fn probe_sync(&mut self, cx: &mut Context<Self>) {
         let Some(handle) = self.engine.clone() else {
@@ -1798,7 +1846,7 @@ fn spawn_deferred_engine_watch(
                     if !is_current {
                         return;
                     }
-                    state.workspace_scope = Some(engine_info.workspace_scope);
+                    state.profile_scope = Some(engine_info.profile_scope);
                     state.local_device_id = Some(engine_info.device_id.clone());
                     state.profile_cache_namespace =
                         ProfileCacheNamespace::for_engine(&engine_info, state.data_dir.as_ref());
@@ -2200,6 +2248,7 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use chrono::TimeDelta;
+    use futures::StreamExt as _;
     use gpui::{AppContext as _, TestAppContext};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zeron_engine::{EngineCore, default_registry};
@@ -2220,6 +2269,7 @@ mod tests {
             "exp": 4_100_000_000_i64,
         });
         if let Some(organization_id) = organization_id {
+            // WorkOS JWTs canonically expose the external claim as `org_id`.
             claims["org_id"] = serde_json::json!(organization_id);
         }
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -2270,6 +2320,33 @@ mod tests {
     }
 
     struct LegacyIdentityRpc;
+
+    struct RenamedMethodRpc {
+        calls: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    #[async_trait]
+    impl RpcService for RenamedMethodRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((method.to_string(), params));
+            match method {
+                "Canonical" | "CanonicalStream" => Err(RpcError::UnknownMethod(method.into())),
+                "Legacy" => RpcReply::value(&serde_json::json!({ "source": "legacy" })),
+                "LegacyStream" => Ok(RpcReply::Stream(
+                    futures::stream::iter([serde_json::json!({ "done": 1 })]).boxed(),
+                )),
+                "RejectedMutation" => Err(RpcError::Failed("rejected".into())),
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
 
     #[async_trait]
     impl RpcService for LegacyIdentityRpc {
@@ -2327,14 +2404,88 @@ mod tests {
         let info = query_engine_info(&client).await.unwrap();
 
         assert_eq!(info.device_id, "legacy-device");
-        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+        assert_eq!(info.profile_scope, ProfileScope::Synced);
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
-                Some(info.workspace_scope),
+                Some(info.profile_scope),
                 Some(&AuthState::SignedOut),
             ),
             GatePhase::SignIn
+        );
+    }
+
+    #[tokio::test]
+    async fn renamed_unary_method_retries_only_an_explicit_unknown_method() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = memory_client(Arc::new(RenamedMethodRpc {
+            calls: calls.clone(),
+        }));
+        let params = serde_json::json!({ "organizationId": "org-target" });
+
+        let value = call_with_legacy_method(&client, "Canonical", "Legacy", params.clone())
+            .await
+            .expect("legacy spelling succeeds");
+        assert_eq!(value, serde_json::json!({ "source": "legacy" }));
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                ("Canonical".into(), params.clone()),
+                ("Legacy".into(), params.clone()),
+            ]
+        );
+
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let error = call_with_legacy_method(&client, "RejectedMutation", "Legacy", params)
+            .await
+            .expect_err("application rejection must be returned");
+        assert!(matches!(error, RpcError::Failed(message) if message == "rejected"));
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[(
+                "RejectedMutation".into(),
+                serde_json::json!({ "organizationId": "org-target" })
+            )],
+            "a non-UnknownMethod mutation error must never replay the legacy RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn renamed_stream_method_uses_checked_unknown_method_fallback() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = memory_client(Arc::new(RenamedMethodRpc {
+            calls: calls.clone(),
+        }));
+
+        let mut subscription = subscribe_with_legacy_method(
+            &client,
+            "CanonicalStream",
+            "LegacyStream",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("legacy stream spelling succeeds");
+        assert_eq!(
+            subscription.recv().await,
+            Some(serde_json::json!({ "done": 1 }))
+        );
+        assert_eq!(subscription.recv().await, None);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            ["CanonicalStream", "LegacyStream"]
         );
     }
 
@@ -2352,7 +2503,7 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
@@ -2382,7 +2533,7 @@ mod tests {
             ipc_port: free_port().await,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
-            org_id: None,
+            organization_id: None,
             workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
@@ -2420,7 +2571,7 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: Some("client_test".into()),
             default_harness: HarnessId::Mock,
         })
@@ -2463,7 +2614,7 @@ mod tests {
             Arc::new(DeferredIdentityRpc {
                 engine_info: Arc::new(std::sync::RwLock::new(EngineInfo {
                     device_id: "owner-device".into(),
-                    workspace_scope: WorkspaceScope::Local,
+                    profile_scope: ProfileScope::Local,
                     profile: None,
                 })),
                 state: state_rx,
@@ -2476,7 +2627,7 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
@@ -2511,7 +2662,7 @@ mod tests {
         let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
         let engine_info = Arc::new(std::sync::RwLock::new(EngineInfo {
             device_id: "owner-device".into(),
-            workspace_scope: WorkspaceScope::Synced,
+            profile_scope: ProfileScope::Synced,
             profile: None,
         }));
         let server = tokio::spawn(zeron_rpc::serve_ws_listener(
@@ -2528,7 +2679,7 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
@@ -2536,7 +2687,7 @@ mod tests {
         .expect("remote viewport attaches during onboarding");
         assert_eq!(handle.engine_info().profile, None);
 
-        let expected = Some(EngineProfileIdentity {
+        let expected = Some(ProfileIdentity {
             user_id: "user-1".into(),
             organization_id: "org-target".into(),
         });
@@ -2575,7 +2726,7 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
-            org_id: None,
+            organization_id: None,
             workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
@@ -2617,7 +2768,7 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
-            org_id: None,
+            organization_id: None,
             workos_client_id: None,
             default_harness: HarnessId::Mock,
         };
@@ -2677,7 +2828,7 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
@@ -2704,14 +2855,14 @@ mod tests {
             ipc_port: free_port().await,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: Some("client_test".into()),
             default_harness: HarnessId::Mock,
         })
         .await
         .unwrap();
 
-        assert_eq!(handle.engine_info().workspace_scope, WorkspaceScope::Local);
+        assert_eq!(handle.engine_info().profile_scope, ProfileScope::Local);
         let info: EngineInfo = handle
             .client()
             .call_as(methods::ENGINE_INFO, serde_json::json!({}))
@@ -2734,6 +2885,7 @@ mod tests {
             .await
             .expect("local data RPC is immediately available");
         assert!(harnesses.as_array().is_some_and(|items| !items.is_empty()));
+        // The `orgs/` directory is the preserved legacy on-disk storage identity.
         assert!(
             !dir.path().join("orgs/dev-org/dev-user").exists(),
             "production boot must not create dev-user data"
@@ -2755,7 +2907,7 @@ mod tests {
             ipc_port: free_port().await,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: Some("client_test".into()),
             default_harness: HarnessId::Mock,
         })
@@ -2776,7 +2928,7 @@ mod tests {
             .call_as(methods::ENGINE_INFO, serde_json::json!({}))
             .await
             .expect("EngineInfo bypasses deferred cloud stores");
-        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+        assert_eq!(info.profile_scope, ProfileScope::Synced);
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(100),
@@ -2788,38 +2940,39 @@ mod tests {
             .is_err(),
             "cloud data waits for organization onboarding"
         );
+        // The legacy `orgs/` storage root must remain unopened during onboarding.
         assert!(!dir.path().join("orgs").exists());
         handle.shutdown().await;
     }
 
     #[tokio::test]
-    async fn deferred_team_selection_promotes_engine_info_before_ready() {
+    async fn deferred_organization_selection_promotes_engine_info_before_ready() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock edge");
         let edge_url = format!("http://{}", listener.local_addr().expect("edge addr"));
-        let (orgs_seen_tx, orgs_seen_rx) = tokio::sync::oneshot::channel();
+        let (organizations_seen_tx, organizations_seen_rx) = tokio::sync::oneshot::channel();
         let edge = tokio::spawn(async move {
-            let mut orgs_seen_tx = Some(orgs_seen_tx);
+            let mut organizations_seen_tx = Some(organizations_seen_tx);
             for _ in 0..3 {
                 let (mut stream, _) = listener.accept().await.expect("accept edge request");
                 let request = read_http_request(&mut stream).await;
                 let first_line = request.lines().next().unwrap_or_default();
                 let body = if first_line.starts_with("POST /auth/refresh ") {
-                    let target = request.contains("\"organizationId\":\"org_target\"");
+                    let target = request.contains(r#""organizationId":"org_target""#);
                     serde_json::json!({
                         "accessToken": test_access_token(target.then_some("org_target")),
                         "refreshToken": if target { "refresh_target" } else { "refresh_unscoped" },
                     })
-                } else if first_line.starts_with("GET /auth/orgs ") {
-                    if let Some(seen) = orgs_seen_tx.take() {
+                } else if first_line.starts_with("GET /auth/organizations ") {
+                    if let Some(seen) = organizations_seen_tx.take() {
                         let _ = seen.send(());
                     }
                     serde_json::json!({
-                        "orgs": [{
+                        "organizations": [{
                             "id": "membership_target",
                             "organizationId": "org_target",
-                            "name": "Target Team",
+                            "name": "Target Organization",
                             "role": "admin",
                         }]
                     })
@@ -2835,13 +2988,13 @@ mod tests {
             dir.path().join("session.json"),
             r#"{"refreshToken":"saved","user":{"id":"user_1","email":"u@example.com"}}"#,
         )
-        .expect("seed org-less session");
+        .expect("seed organization-less session");
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: free_port().await,
             edge_url,
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: Some("client_test".into()),
             default_harness: HarnessId::Mock,
         })
@@ -2849,18 +3002,18 @@ mod tests {
         .expect("deferred bootstrap");
         assert_eq!(handle.engine_info().profile, None);
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), orgs_seen_rx)
+        tokio::time::timeout(std::time::Duration::from_secs(2), organizations_seen_rx)
             .await
-            .expect("default-org probe reached memberships")
+            .expect("default-organization probe reached memberships")
             .expect("membership signal");
         handle
             .client()
             .call(
-                methods::SELECT_ORG,
+                methods::SELECT_ORGANIZATION,
                 serde_json::json!({"organizationId": "org_target"}),
             )
             .await
-            .expect("select existing Team");
+            .expect("select existing Organization");
         let mut deferred = handle.deferred_state().expect("deferred lifecycle");
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2870,7 +3023,7 @@ mod tests {
         .expect("runtime assembly completed")
         .expect("runtime became ready");
 
-        let expected = Some(EngineProfileIdentity {
+        let expected = Some(ProfileIdentity {
             user_id: "user_1".into(),
             organization_id: "org_target".into(),
         });
@@ -2911,7 +3064,7 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
+            organization_id: None,
             workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
@@ -2924,8 +3077,8 @@ mod tests {
             }
         );
         assert_eq!(
-            handle.engine_info().workspace_scope,
-            WorkspaceScope::Development
+            handle.engine_info().profile_scope,
+            ProfileScope::Development
         );
         let harnesses = handle
             .client()
@@ -3023,9 +3176,9 @@ mod tests {
     }
 
     #[test]
-    fn local_workspace_hides_the_unknown_device_sentinel() {
+    fn local_profile_hides_the_unknown_device_sentinel() {
         let mut state = AppState::new();
-        state.workspace_scope = Some(WorkspaceScope::Local);
+        state.profile_scope = Some(ProfileScope::Local);
         state.local_device_id = Some("local".into());
 
         state.apply_devices(vec![
@@ -3462,7 +3615,7 @@ mod tests {
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Local),
+                Some(ProfileScope::Local),
                 Some(&AuthState::SignedOut),
             ),
             GatePhase::Ready
@@ -3470,7 +3623,7 @@ mod tests {
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Synced),
+                Some(ProfileScope::Synced),
                 Some(&AuthState::SignedOut),
             ),
             GatePhase::SignIn
@@ -3478,29 +3631,29 @@ mod tests {
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Synced),
+                Some(ProfileScope::Synced),
                 Some(&AuthState::SignedIn {
                     user: user.clone(),
-                    org_id: None
+                    organization_id: None
                 })
             ),
             GatePhase::Ready
         );
-        // No org yet → org gate.
+        // No Organization selected yet → Organization gate.
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Synced),
+                Some(ProfileScope::Synced),
                 Some(&AuthState::NeedsOrganization { user })
             ),
-            GatePhase::OrgGate
+            GatePhase::OrganizationGate
         );
     }
 
     #[test]
     fn auth_changes_do_not_change_a_local_runtime_scope_or_watches() {
         let mut state = AppState::new();
-        state.workspace_scope = Some(WorkspaceScope::Local);
+        state.profile_scope = Some(ProfileScope::Local);
         state.watch_tasks.push(Task::ready(()));
 
         state.apply_auth(AuthState::NeedsOrganization {
@@ -3510,7 +3663,7 @@ mod tests {
                 name: None,
             },
         });
-        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert_eq!(state.profile_scope, Some(ProfileScope::Local));
         assert_eq!(state.watch_tasks.len(), 1);
 
         state.apply_auth(AuthState::SignedIn {
@@ -3519,9 +3672,9 @@ mod tests {
                 email: "w@example.com".into(),
                 name: None,
             },
-            org_id: Some("org-1".into()),
+            organization_id: Some("org-1".into()),
         });
-        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert_eq!(state.profile_scope, Some(ProfileScope::Local));
         assert_eq!(state.watch_tasks.len(), 1);
     }
 
@@ -3533,18 +3686,18 @@ mod tests {
                 email: format!("{user_id}@example.com"),
                 name: None,
             },
-            org_id: Some(organization_id.into()),
+            organization_id: Some(organization_id.into()),
         };
         let old_runtime = EngineInfo {
             device_id: "device-1".into(),
-            workspace_scope: WorkspaceScope::Synced,
-            profile: Some(zeron_proto::EngineProfileIdentity {
+            profile_scope: ProfileScope::Synced,
+            profile: Some(zeron_proto::ProfileIdentity {
                 user_id: "user-1".into(),
                 organization_id: "org-old".into(),
             }),
         };
         let mut first_viewport = AppState::new();
-        first_viewport.workspace_scope = Some(WorkspaceScope::Synced);
+        first_viewport.profile_scope = Some(ProfileScope::Synced);
         first_viewport.profile_cache_namespace =
             ProfileCacheNamespace::for_engine(&old_runtime, None);
         let fixed = first_viewport.profile_cache_namespace();
@@ -3556,7 +3709,7 @@ mod tests {
             }
         );
 
-        // SELECT_ORG publishes AuthStatus before the old fixed-profile runtime
+        // SELECT_ORGANIZATION publishes AuthStatus before the old fixed-profile runtime
         // has necessarily stopped. Its cache namespace must not follow.
         first_viewport.apply_auth(auth("user-1", "org-new"));
         assert_eq!(first_viewport.profile_cache_namespace(), fixed);
@@ -3564,7 +3717,7 @@ mod tests {
         // A viewport attaching inside that window sees the new AuthStatus but
         // must still key bytes to the old immutable EngineInfo profile.
         let mut second_viewport = AppState::new();
-        second_viewport.workspace_scope = Some(WorkspaceScope::Synced);
+        second_viewport.profile_scope = Some(ProfileScope::Synced);
         second_viewport.profile_cache_namespace =
             ProfileCacheNamespace::for_engine(&old_runtime, None);
         second_viewport.apply_auth(auth("user-1", "org-new"));
@@ -3579,7 +3732,7 @@ mod tests {
     fn missing_engine_profile_never_falls_back_to_mutable_auth_identity() {
         let legacy_or_onboarding_runtime = EngineInfo {
             device_id: "legacy-device".into(),
-            workspace_scope: WorkspaceScope::Synced,
+            profile_scope: ProfileScope::Synced,
             profile: None,
         };
         let mut viewport = AppState::new();
@@ -3594,7 +3747,7 @@ mod tests {
                 email: "user-1@example.com".into(),
                 name: None,
             },
-            org_id: Some("org-new".into()),
+            organization_id: Some("org-new".into()),
         });
         assert_eq!(viewport.profile_cache_namespace(), isolated);
     }
@@ -3603,7 +3756,7 @@ mod tests {
     fn ready_legacy_synced_engine_with_no_fixed_profile_fails_closed() {
         let unsupported = EngineInfo {
             device_id: "legacy-device".into(),
-            workspace_scope: WorkspaceScope::Synced,
+            profile_scope: ProfileScope::Synced,
             profile: None,
         };
         let signed_in = AuthState::SignedIn {
@@ -3612,12 +3765,12 @@ mod tests {
                 email: "user-1@example.com".into(),
                 name: None,
             },
-            org_id: Some("org-1".into()),
+            organization_id: Some("org-1".into()),
         };
         assert!(
             missing_fixed_synced_profile_error(Some(&unsupported), true, Some(&signed_in))
                 .is_some(),
-            "a ready legacy daemon must not render Team stores under mutable auth"
+            "a ready legacy daemon must not render Organization stores under mutable auth"
         );
         assert_eq!(
             missing_fixed_synced_profile_error(Some(&unsupported), false, Some(&signed_in)),
@@ -3627,7 +3780,7 @@ mod tests {
         assert_eq!(
             fixed_synced_profile_gate(Some(&unsupported), false, Some(&signed_in)),
             Some(GatePhase::Loading),
-            "signed-in Team data stays occluded while deferred identity is unresolved"
+            "signed-in Organization data stays occluded while deferred identity is unresolved"
         );
         assert!(matches!(
             fixed_synced_profile_gate(Some(&unsupported), true, Some(&signed_in)),
@@ -3646,10 +3799,10 @@ mod tests {
                 }),
             ),
             None,
-            "the organization gate has no Team data plane yet"
+            "the organization gate has no Organization data plane yet"
         );
         let supported = EngineInfo {
-            profile: Some(EngineProfileIdentity {
+            profile: Some(ProfileIdentity {
                 user_id: "user-1".into(),
                 organization_id: "org-1".into(),
             }),
@@ -3669,7 +3822,7 @@ mod tests {
                 email: "user-1@example.com".into(),
                 name: None,
             },
-            org_id: Some("org-2".into()),
+            organization_id: Some("org-2".into()),
         };
         assert_eq!(
             fixed_synced_profile_gate(Some(&supported), true, Some(&switched_auth)),
@@ -3684,14 +3837,14 @@ mod tests {
         let data_dir = PathBuf::from("/tmp/zeron-profile-reset-test");
         state.update(cx, |state, cx| {
             state.connection = ConnectionStatus::Ready;
-            state.workspace_scope = Some(WorkspaceScope::Synced);
+            state.profile_scope = Some(ProfileScope::Synced);
             state.auth = Some(AuthState::SignedIn {
                 user: UserProfile {
                     id: "u".into(),
                     email: "u@example.com".into(),
                     name: None,
                 },
-                org_id: Some("old-org".into()),
+                organization_id: Some("old-org".into()),
             });
             state.data_dir = Some(data_dir.clone());
             state.add_diff_comment(
@@ -3700,7 +3853,7 @@ mod tests {
                     "src/lib.rs",
                     crate::comments::CommentSide::New,
                     7,
-                    "old Team note",
+                    "old Organization note",
                 ),
             );
             state
@@ -3720,28 +3873,32 @@ mod tests {
             assert!(state.watch_tasks.is_empty());
             assert!(state.transcript_task.is_none());
             assert_eq!(state.connection, ConnectionStatus::Connecting);
-            assert_eq!(state.workspace_scope, None);
+            assert_eq!(state.profile_scope, None);
             assert_eq!(state.auth, None);
             assert_eq!(state.data_dir.as_ref(), Some(&data_dir));
         });
     }
 
     #[test]
-    fn auth_frames_parse_both_wire_shapes() {
+    fn auth_frames_parse_canonical_and_legacy_wire_shapes() {
         // Proto shape.
         let proto = serde_json::json!({ "state": "signedOut" });
         assert_eq!(parse_auth_state(&proto), Some(AuthState::SignedOut));
-        // Engine shape (`_tag`, PascalCase, orgId).
+        // Explicit legacy engine shape (`_tag`, PascalCase, `orgId`).
         let engine = serde_json::json!({
             "_tag": "SignedIn",
             "user": { "id": "u1", "email": "w@example.com" },
             "orgId": "org-1",
         });
-        let Some(AuthState::SignedIn { user, org_id }) = parse_auth_state(&engine) else {
+        let Some(AuthState::SignedIn {
+            user,
+            organization_id,
+        }) = parse_auth_state(&engine)
+        else {
             panic!("expected SignedIn");
         };
         assert_eq!(user.email, "w@example.com");
-        assert_eq!(org_id.as_deref(), Some("org-1"));
+        assert_eq!(organization_id.as_deref(), Some("org-1"));
         let needs = serde_json::json!({
             "_tag": "NeedsOrganization",
             "user": { "id": "u1", "email": "w@example.com", "name": "W" },
@@ -3834,14 +3991,14 @@ mod tests {
     }
 
     #[test]
-    fn org_gate_reducers() {
-        assert!(org_name_valid("Acme"));
-        assert!(org_name_valid("  padded  "));
-        assert!(!org_name_valid(""));
-        assert!(!org_name_valid("   "));
-        assert!(!org_name_valid(&"x".repeat(65)));
+    fn organization_gate_reducers() {
+        assert!(organization_name_valid("Acme"));
+        assert!(organization_name_valid("  padded  "));
+        assert!(!organization_name_valid(""));
+        assert!(!organization_name_valid("   "));
+        assert!(!organization_name_valid(&"x".repeat(65)));
 
-        let rows = parse_orgs(&serde_json::json!({ "orgs": [
+        let rows = parse_organizations(&serde_json::json!({ "organizations": [
             { "id": "m2", "organizationId": "o2", "name": "beta" },
             { "id": "m1", "organizationId": "o1", "name": "Alpha" },
             { "id": "m3", "organizationId": "o1", "name": "Alpha" },
@@ -3852,15 +4009,36 @@ mod tests {
         assert_eq!(
             names,
             ["Alpha", "beta"],
-            "case-insensitive sort + dedupe by org id"
+            "case-insensitive sort + dedupe by organization id"
         );
-        // Bare-array replies parse too; garbage yields empty.
         assert_eq!(
-            parse_orgs(&serde_json::json!([{ "id": "m", "organizationId": "o", "name": "n" }]))
-                .len(),
-            1
+            parse_organizations(&serde_json::json!({ "orgs": [
+                { "id": "legacy", "organizationId": "legacy-org", "name": "Legacy" }
+            ]}))[0]
+                .organization_id,
+            "legacy-org"
         );
-        assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+        assert_eq!(
+            parse_organizations(&serde_json::json!([
+                { "id": "bare", "organizationId": "bare-org", "name": "Bare" }
+            ]))[0]
+                .organization_id,
+            "bare-org"
+        );
+        assert_eq!(
+            parse_organizations(&serde_json::json!({
+                "organizations": [
+                    { "id": "canonical", "organizationId": "canonical-org", "name": "Canonical" }
+                ],
+                "orgs": [
+                    { "id": "legacy", "organizationId": "legacy-org", "name": "Legacy" }
+                ]
+            }))[0]
+                .organization_id,
+            "canonical-org",
+            "the canonical envelope wins when both spellings are present"
+        );
+        assert!(parse_organizations(&serde_json::json!("nope")).is_empty());
     }
 
     #[test]

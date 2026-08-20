@@ -13,7 +13,7 @@ final class AppConfig: @unchecked Sendable {
     let edgeURL: URL
     let mode: Mode
     let userId: String
-    let orgId: String
+    let organizationId: String
     let deviceId: String
     let deviceName: String
 
@@ -29,13 +29,13 @@ final class AppConfig: @unchecked Sendable {
     /// stall on every app open past token expiry (~5 min).
     private var refreshTask: Task<String?, Never>?
 
-    init(edgeURL: URL, mode: Mode, userId: String, orgId: String,
+    init(edgeURL: URL, mode: Mode, userId: String, organizationId: String,
          deviceId: String, deviceName: String,
          tokens: AuthTokens? = nil, devBearer: String? = nil) {
         self.edgeURL = edgeURL
         self.mode = mode
         self.userId = userId
-        self.orgId = orgId
+        self.organizationId = organizationId
         self.deviceId = deviceId
         self.deviceName = deviceName
         self.tokens = tokens
@@ -74,10 +74,10 @@ final class AppConfig: @unchecked Sendable {
             lock.unlock()
             return await existing.value
         }
-        let task = Task<String?, Never> { [edgeURL, orgId] in
+        let task = Task<String?, Never> { [edgeURL, organizationId] in
             let client = AuthClient(baseURL: edgeURL)
             let refreshed = try? await client.refresh(refreshToken: current.refreshToken,
-                                                      organizationId: orgId)
+                                                      organizationId: organizationId)
             if let refreshed {
                 self.updateTokens(refreshed)
                 Keychain.save(refreshed.accessToken, key: "accessToken")
@@ -103,18 +103,19 @@ final class AppConfig: @unchecked Sendable {
         return components.url!
     }
 
-    /// The workspace registry room (docs/registry-sync.md) — the row-table
-    /// replacement for the old ws Loro workspace doc.
+    /// The Organization registry room (docs/registry-sync.md) — the row-table
+    /// replacement for the legacy Loro workspace document.
     func registrySocketURL() async -> URL? {
         guard let token = await currentToken() else { return nil }
-        var url = wsBase.appending(path: "registry/\(orgId)/ws")
+        // `registry` and its room namespace are established wire protocol.
+        var url = wsBase.appending(path: "registry/\(organizationId)/ws")
         url.append(queryItems: [URLQueryItem(name: "token", value: token),
                                 URLQueryItem(name: "device", value: deviceId)])
         return url
     }
 
     /// Room-path prefix for a chat's sync generation: 2 = single-owner
-    /// `chat2`, 3+ = org-shared `chat3` (same DO surface, member-open reads).
+    /// `chat2`, 3+ = Organization-shared legacy `chat3` namespace.
     private static func chatRoomPrefix(roomGen: Int) -> String {
         roomGen >= 3 ? "chat3" : "chat2"
     }
@@ -169,11 +170,11 @@ final class AppConfig: @unchecked Sendable {
         return request
     }
 
-    /// GET /registry/{orgId}/rows?since= — the WS hello's delta answer over
+    /// GET /registry/{organizationId}/rows?since= — the WS hello's delta answer over
     /// plain HTTPS. `beat=1` doubles as a presence beat.
     func registryRowsRequest(since: UInt64?) async -> URLRequest? {
         guard let token = await currentToken() else { return nil }
-        var url = edgeURL.appending(path: "registry/\(orgId)/rows")
+        var url = edgeURL.appending(path: "registry/\(organizationId)/rows")
         var items = [URLQueryItem(name: "device", value: deviceId),
                      URLQueryItem(name: "beat", value: "1"),
                      URLQueryItem(name: "token", value: token)]
@@ -182,11 +183,11 @@ final class AppConfig: @unchecked Sendable {
         return URLRequest(url: url)
     }
 
-    /// POST /registry/{orgId}/push — one op batch over plain HTTPS (LWW
+    /// POST /registry/{organizationId}/push — one op batch over plain HTTPS (LWW
     /// clocks make replays apply zero ops).
     func registryPushRequest() async -> URLRequest? {
         guard let token = await currentToken() else { return nil }
-        var url = edgeURL.appending(path: "registry/\(orgId)/push")
+        var url = edgeURL.appending(path: "registry/\(organizationId)/push")
         url.append(queryItems: [URLQueryItem(name: "device", value: deviceId)])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -210,7 +211,7 @@ final class AppConfig: @unchecked Sendable {
     }
 
     /// GET /device/{deviceId}/status → whether the device's relay HOST socket
-    /// is currently attached (distinct from workspace presence).
+    /// is currently attached (distinct from registry presence).
     func deviceStatus(deviceId: String) async -> String {
         guard let token = await currentToken() else { return "no-token" }
         var request = URLRequest(url: edgeURL.appending(path: "device/\(deviceId)/status"))

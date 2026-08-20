@@ -169,10 +169,10 @@ final class AuthSessionCoordinator: NSObject, ASWebAuthenticationPresentationCon
     }
 }
 
-struct OrgPickerView: View {
+struct OrganizationPickerView: View {
     @Environment(AppModel.self) private var model
     let tokens: AuthTokens
-    let orgs: [AuthOrg]
+    let organizations: [AuthOrganization]
     @State private var busy = false
     @State private var error: String?
 
@@ -180,16 +180,16 @@ struct OrgPickerView: View {
         ZStack {
             Theme.bg.ignoresSafeArea()
             VStack(spacing: 20) {
-                Text("Choose an organization")
+                Text("Choose an Organization")
                     .font(Theme.sans(16, weight: .semibold))
                     .foregroundStyle(Theme.text)
                 VStack(spacing: 8) {
-                    ForEach(orgs) { org in
+                    ForEach(organizations) { organization in
                         Button {
-                            select(org)
+                            select(organization)
                         } label: {
                             HStack {
-                                Text(org.name)
+                                Text(organization.name)
                                     .font(Theme.sans(14, weight: .medium))
                                     .foregroundStyle(Theme.text)
                                 Spacer()
@@ -216,12 +216,12 @@ struct OrgPickerView: View {
         }
     }
 
-    private func select(_ org: AuthOrg) {
+    private func select(_ organization: AuthOrganization) {
         busy = true
         error = nil
         Task {
             do {
-                try await model.selectOrg(org, tokens: tokens)
+                try await model.selectOrganization(organization, tokens: tokens)
             } catch {
                 self.error = error.localizedDescription
             }

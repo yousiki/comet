@@ -1,11 +1,10 @@
-// Entity model — Swift mirrors of the workspace/session doc rows
-// (crates/doc/src/workspace.rs, schema.rs) and the derived display state
+// Entity model — Swift mirrors of the registry/session rows and derived display state
 // (crates/ui/src/state.rs, entities.rs). Field names match the doc schema
 // exactly; derivations (indicator, staleness, attention rank) are ports.
 
 import Foundation
 
-// MARK: - Workspace doc rows
+// MARK: - Registry rows
 
 struct DeviceRow: Identifiable, Hashable {
     var id: String
@@ -59,10 +58,11 @@ struct Chat: Identifiable, Hashable {
     var spaceId: String?
     var lastSeenAt: Int64?
     /// Sync room generation (docs/chat2-sync.md M2): absent/1 = legacy s2
-    /// (never dialed from mobile), 2 = chat2, 3 = org-shared chat3. The host
+    /// (never dialed from mobile), 2 = `chat2`, 3 = Organization-shared legacy
+    /// `chat3` namespace. The host
     /// flips it when seeding/migrating.
     var roomGen: Int? = nil
-    /// Creating user (org-shared registries; absent on pre-attribution rows).
+    /// Creating user (Organization registries; absent on pre-attribution rows).
     var userId: String? = nil
 
     var displayTitle: String {
@@ -141,7 +141,7 @@ enum ChatIndicator: Int {
 /// state.rs:277 — a Working/AwaitingInput row older than this reads as stale
 /// (a crashed backend never shows eternal "Working").
 let sessionStaleMs: Int64 = 45_000
-/// workspace_host.rs:45 — presence freshness window for device online dots.
+/// Registry host presence freshness window for device online dots.
 let presenceFreshMs: Int64 = 45_000
 
 func effectiveStatus(_ row: SessionRow?, now: Int64) -> SessionStatus? {
@@ -242,7 +242,7 @@ struct MessageEntry: Identifiable, Hashable {
     var continuationOf: String?
 }
 
-// MARK: - Folder browsing (add-space palette data)
+// MARK: - Folder browsing (Add Project palette data)
 
 /// zeron-proto FolderListing (entities.rs:225): the device's answer to
 /// ListFolders. Dotfiles are pre-filtered and entries are capped at 500 by

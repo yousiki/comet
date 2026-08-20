@@ -449,11 +449,11 @@ async fn folder_lister_show_hidden_keeps_dotfiles_but_never_git() {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace file read (file-explorer viewer)
+// Working-directory file read (file-explorer viewer)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn workspace_file_read_text_binary_truncated_and_jail() {
+async fn working_directory_file_read_text_binary_truncated_and_jail() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("checkout");
     std::fs::create_dir_all(root.join("src")).expect("dirs");
@@ -466,7 +466,7 @@ async fn workspace_file_read_text_binary_truncated_and_jail() {
 
     // Plain text comes back verbatim with its size.
     let text = repos
-        .read_workspace_file(root.clone(), root.join("src/lib.rs"))
+        .read_working_directory_file(root.clone(), root.join("src/lib.rs"))
         .await
         .expect("text read");
     assert_eq!(text.text.as_deref(), Some("pub fn x() {}\n"));
@@ -475,14 +475,14 @@ async fn workspace_file_read_text_binary_truncated_and_jail() {
 
     // Relative paths resolve against the root.
     let rel = repos
-        .read_workspace_file(root.clone(), std::path::PathBuf::from("src/lib.rs"))
+        .read_working_directory_file(root.clone(), std::path::PathBuf::from("src/lib.rs"))
         .await
         .expect("relative read");
     assert_eq!(rel.text.as_deref(), Some("pub fn x() {}\n"));
 
     // NUL byte → binary, contents withheld.
     let bin = repos
-        .read_workspace_file(root.clone(), root.join("blob.bin"))
+        .read_working_directory_file(root.clone(), root.join("blob.bin"))
         .await
         .expect("binary read");
     assert!(bin.binary && bin.text.is_none());
@@ -490,22 +490,23 @@ async fn workspace_file_read_text_binary_truncated_and_jail() {
     // `..` escape and absolute paths outside the root are both rejected.
     for escape in [root.join("../outside.txt"), tmp.path().join("outside.txt")] {
         let err = repos
-            .read_workspace_file(root.clone(), escape)
+            .read_working_directory_file(root.clone(), escape)
             .await
-            .expect_err("escapes the workspace");
+            .expect_err("escapes the working directory");
         assert!(
-            err.to_string().contains("escapes the workspace"),
+            err.to_string().contains("escapes the working directory"),
             "unexpected error: {err}"
         );
     }
 
     // Directories are not regular files.
     let err = repos
-        .read_workspace_file(root.clone(), root.join("src"))
+        .read_working_directory_file(root.clone(), root.join("src"))
         .await
         .expect_err("directory rejected");
     assert!(
-        err.to_string().contains("not a regular workspace file"),
+        err.to_string()
+            .contains("not a regular working directory file"),
         "unexpected error: {err}"
     );
 
@@ -514,11 +515,12 @@ async fn workspace_file_read_text_binary_truncated_and_jail() {
     {
         std::os::unix::fs::symlink(root.join("src/lib.rs"), root.join("link.rs")).expect("symlink");
         let err = repos
-            .read_workspace_file(root.clone(), root.join("link.rs"))
+            .read_working_directory_file(root.clone(), root.join("link.rs"))
             .await
             .expect_err("symlink rejected");
         assert!(
-            err.to_string().contains("not a regular workspace file"),
+            err.to_string()
+                .contains("not a regular working directory file"),
             "unexpected error: {err}"
         );
     }
@@ -526,7 +528,7 @@ async fn workspace_file_read_text_binary_truncated_and_jail() {
     // Over the 2 MiB cap → truncated, contents withheld (never partial).
     std::fs::write(root.join("big.txt"), vec![b'a'; 2 * 1024 * 1024 + 1]).expect("big file");
     let big = repos
-        .read_workspace_file(root.clone(), root.join("big.txt"))
+        .read_working_directory_file(root.clone(), root.join("big.txt"))
         .await
         .expect("big read");
     assert!(big.truncated && big.text.is_none() && !big.binary);
@@ -780,7 +782,7 @@ async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
 
     let core = assemble(&tmp.path().join("data"));
     // Seeded as git (a lying picker) — the owner's sync must correct it.
-    core.workspace
+    core.registry
         .create_space(
             "space-1",
             &core.device_id,
@@ -791,7 +793,7 @@ async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
         .expect("space row");
     core.spaces_sync.reconcile_now().await;
 
-    let mut spaces_rx = core.workspace.watch_spaces();
+    let mut spaces_rx = core.registry.watch_spaces();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let space = loop {
         {
@@ -838,7 +840,7 @@ async fn delete_space_cascades_chats_and_sessions() {
     std::fs::create_dir_all(&folder).expect("folder");
 
     let core = assemble(&tmp.path().join("data"));
-    core.workspace
+    core.registry
         .create_space(
             "space-1",
             &core.device_id,
@@ -847,28 +849,24 @@ async fn delete_space_cascades_chats_and_sessions() {
             false,
         )
         .expect("space row");
-    core.workspace
+    core.registry
         .create_chat("chat-1", Some("space-1"), None, None, None)
         .expect("chat row");
-    let chat = core
-        .workspace
-        .chat("chat-1")
-        .expect("read")
-        .expect("exists");
+    let chat = core.registry.chat("chat-1").expect("read").expect("exists");
     assert_eq!(chat.space_id.as_deref(), Some("space-1"));
     assert_eq!(chat.device_id, core.device_id);
     assert_eq!(chat.cwd.as_deref(), Some(&*folder.to_string_lossy()));
 
-    let deleted = core.workspace.delete_space("space-1").expect("cascade");
+    let deleted = core.registry.delete_space("space-1").expect("cascade");
     assert!(deleted.existed);
     assert_eq!(deleted.chat_ids, vec!["chat-1".to_string()]);
-    assert!(core.workspace.chat("chat-1").expect("read").is_none());
-    assert!(core.workspace.read_spaces().expect("spaces").is_empty());
+    assert!(core.registry.chat("chat-1").expect("read").is_none());
+    assert!(core.registry.read_spaces().expect("spaces").is_empty());
     core.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
-// Diff sync (watchers + workspace branch upkeep) via EngineCore
+// Diff sync (watchers + registry branch upkeep) via EngineCore
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -879,7 +877,7 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
     std::fs::write(repo_dir.join("a.txt"), "one\ntwo\nedited\n").expect("dirty tree");
 
     let core = assemble(&tmp.path().join("data"));
-    core.workspace
+    core.registry
         .create_space(
             "space-diff",
             &core.device_id,
@@ -888,7 +886,7 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
             true,
         )
         .expect("space row");
-    core.workspace
+    core.registry
         .create_chat("chat-diff", Some("space-diff"), None, None, None)
         .expect("chat row");
     core.diff_sync.reconcile_now().await;
@@ -913,9 +911,9 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
     assert!(!diff.checkout_id.is_empty());
     assert!(!diff.checksum.is_empty());
 
-    // Row upkeep: branch + checkoutId stamped on the workspace chat row.
+    // Row upkeep: branch + checkoutId stamped on the registry chat row.
     let chat = core
-        .workspace
+        .registry
         .chat("chat-diff")
         .expect("read chat")
         .expect("row");
@@ -1200,10 +1198,10 @@ async fn rpc_dispatch_for_m5_methods() {
 
     // SearchFiles resolves both space and chat roots, while rejecting a chat
     // whose cwd was retargeted outside the owning repository.
-    core.workspace
+    core.registry
         .create_space("space-term", &core.device_id, &repo_path, None, true)
         .expect("search space");
-    core.workspace
+    core.registry
         .create_chat("search-chat", Some("space-term"), None, None, None)
         .expect("search chat");
     let space_matches = client
@@ -1238,7 +1236,7 @@ async fn rpc_dispatch_for_m5_methods() {
     );
     let outside = tmp.path().join("outside");
     std::fs::create_dir(&outside).expect("outside directory");
-    core.workspace
+    core.registry
         .create_chat(
             "outside-chat",
             Some("space-term"),
@@ -1255,24 +1253,24 @@ async fn rpc_dispatch_for_m5_methods() {
             )
             .await
             .is_err(),
-        "chat cwd must stay inside its workspace checkout"
+        "chat cwd must stay inside its project checkout"
     );
 
-    // ReadWorkspaceFile shares SearchFiles' root resolution, then reads the
+    // ReadWorkingDirectoryFile shares SearchFiles' root resolution, then reads the
     // jailed file (the file-explorer viewer's path).
     let read = client
         .call(
-            methods::READ_WORKSPACE_FILE,
+            methods::READ_WORKING_DIRECTORY_FILE,
             serde_json::json!({ "chatId": "search-chat", "path": "file.txt" }),
         )
         .await
-        .expect("ReadWorkspaceFile by chat");
+        .expect("ReadWorkingDirectoryFile by chat");
     assert_eq!(read["text"], "hello\n");
     assert_eq!(read["binary"], false);
     assert!(
         client
             .call(
-                methods::READ_WORKSPACE_FILE,
+                methods::READ_WORKING_DIRECTORY_FILE,
                 serde_json::json!({ "chatId": "search-chat", "path": "../outside/x" }),
             )
             .await

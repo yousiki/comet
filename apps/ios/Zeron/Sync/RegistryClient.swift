@@ -1,11 +1,11 @@
 // Registry room client — a Swift port of crates/sync/src/registry.rs, the
 // text-frame sibling of RoomClient (which still carries the Loro session
-// docs). JSON text frames over one WebSocket to /registry/{orgId}/ws:
+// docs). JSON text frames over one WebSocket to /registry/{organizationId}/ws:
 // hello/cursor handshake, push/ack for pending op batches, merged-row
 // broadcasts, presence beats, probe/redial liveness, reconnect with backoff.
 //
 // The client owns no row semantics: everything applies through the
-// WorkspaceStore's RegistryDoc on the main actor (the Swift stand-in for the
+// RegistryStore's RegistryDoc on the main actor (the Swift stand-in for the
 // Rust side's doc mutex). Delivery is awaited in the receive loop, so frame
 // order is preserved — the server sends the rows broadcast BEFORE the ack for
 // your own push (apply rows, then retire the pending batch).

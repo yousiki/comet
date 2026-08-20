@@ -1,11 +1,7 @@
-//! M4a integration: two `EngineCore`s (distinct data dirs + device ids) sharing one
-//! per-org workspace doc.
-//!
-//! The in-memory bridge below stands in for the edge room: it cross-imports Loro
-//! updates (`export(updates)`) between the two engines' workspace docs on a timer,
-//! which is exactly what `RoomClient` + the SessionRoom DO do over the wire. A live
-//! variant against a real edge runs behind `#[ignore]` (ZERON_EDGE_WS, like
-//! zeron-sync's edge_convergence test).
+//! Registry integration: two `EngineCore`s with distinct data directories and
+//! device IDs share one per-Organization registry through an in-memory server
+//! that speaks the RegistryRoom JSON protocol. A live variant against a real
+//! edge runs behind `#[ignore]` (`ZERON_EDGE_WS`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,8 +120,8 @@ async fn bridge(
     b: &EngineCore,
 ) -> zeron_sync::registry::mock_server::MockRegistryServer {
     let server = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
-    a.workspace.connect_registry_url(&server.url());
-    b.workspace.connect_registry_url(&server.url());
+    a.registry.connect_registry_url(&server.url());
+    b.registry.connect_registry_url(&server.url());
     server
 }
 
@@ -201,7 +197,7 @@ fn queue_run_with(
 }
 
 #[tokio::test]
-async fn two_engines_share_a_workspace() {
+async fn two_engines_share_a_registry() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let a = assemble(dir_a.path(), "dev-a");
@@ -213,7 +209,7 @@ async fn two_engines_share_a_workspace() {
         wait_for(
             || {
                 let ids: Vec<String> = core
-                    .workspace
+                    .registry
                     .read_devices()
                     .unwrap_or_default()
                     .into_iter()
@@ -251,7 +247,7 @@ async fn two_engines_share_a_workspace() {
     // The space row crosses to B alongside the chat row.
     wait_for(
         || {
-            b.workspace
+            b.registry
                 .read_spaces()
                 .unwrap_or_default()
                 .iter()
@@ -261,15 +257,15 @@ async fn two_engines_share_a_workspace() {
     )
     .await;
     wait_for(
-        || b.workspace.chat("chat-1").ok().flatten().is_some(),
+        || b.registry.chat("chat-1").ok().flatten().is_some(),
         "chat row on B",
     )
     .await;
 
-    // Run on A: B's workspace view shows the session Working, then Idle.
+    // Run on A: B's registry view shows the session Working, then Idle.
     queue_run(&a, "chat-1", "cmd-run-1", "m-1");
     let b_status = |wanted: SessionStatus| {
-        let ws = b.workspace.clone();
+        let ws = b.registry.clone();
         move || {
             ws.read_sessions()
                 .unwrap_or_default()
@@ -284,7 +280,7 @@ async fn two_engines_share_a_workspace() {
     // assistant's final text (first-120-chars policy).
     wait_for(
         || {
-            b.workspace
+            b.registry
                 .chat("chat-1")
                 .ok()
                 .flatten()
@@ -313,7 +309,7 @@ async fn two_engines_share_a_workspace() {
         .expect("archive chat");
     wait_for(
         || {
-            a.workspace
+            a.registry
                 .chat("chat-1")
                 .ok()
                 .flatten()
@@ -333,7 +329,7 @@ async fn two_engines_share_a_workspace() {
         .expect("rename device");
     wait_for(
         || {
-            a.workspace
+            a.registry
                 .read_devices()
                 .unwrap_or_default()
                 .iter()
@@ -360,7 +356,7 @@ async fn claim_on_first_command_creates_the_chat_row() {
     queue_run(&a, "chat-claimed", "cmd-claim-1", "m-1");
     wait_for(
         || {
-            b.workspace
+            b.registry
                 .chat("chat-claimed")
                 .ok()
                 .flatten()
@@ -420,7 +416,7 @@ async fn claim_resolves_a_worktree_cwd_to_the_repo_root_space() {
     queue_run_with(&core, "chat-wt", "cmd-wt-1", "m-1", request);
     wait_for(
         || {
-            core.workspace
+            core.registry
                 .chat("chat-wt")
                 .ok()
                 .flatten()
@@ -429,7 +425,7 @@ async fn claim_resolves_a_worktree_cwd_to_the_repo_root_space() {
         "worktree chat attributed to the project space",
     )
     .await;
-    let spaces = core.workspace.read_spaces().unwrap_or_default();
+    let spaces = core.registry.read_spaces().unwrap_or_default();
     assert_eq!(
         spaces.len(),
         1,
@@ -453,7 +449,7 @@ async fn claimed_chat_row_records_the_run_harness() {
     queue_run_with(&core, "chat-glyph", "cmd-glyph-1", "m-1", request);
     wait_for(
         || {
-            core.workspace
+            core.registry
                 .chat("chat-glyph")
                 .ok()
                 .flatten()
@@ -471,13 +467,13 @@ async fn non_host_engine_leaves_remote_chats_commands_alone() {
     let dir_a = tempfile::tempdir().unwrap();
     let a = assemble(dir_a.path(), "dev-a");
 
-    // The workspace says dev-b hosts this chat (via its dev-b space); a run
+    // The registry says dev-b hosts this chat (via its dev-b space); a run
     // command in A's local copy of the session doc must NOT execute on A
     // (is_host gating).
-    a.workspace
+    a.registry
         .create_space("space-remote", "dev-b", "/tmp/remote", None, false)
         .expect("create remote space row");
-    a.workspace
+    a.registry
         .create_chat("chat-remote", Some("space-remote"), None, None, None)
         .expect("create remote-hosted chat row");
     queue_run(&a, "chat-remote", "cmd-remote-1", "m-1");
@@ -506,10 +502,10 @@ async fn chat_config_selects_the_run_harness() {
     let dir_a = tempfile::tempdir().unwrap();
     let a = assemble(dir_a.path(), "dev-a"); // default harness = Mock ("Hello")
 
-    a.workspace
+    a.registry
         .create_space("space-cfg", "dev-a", "/tmp/cfg", None, false)
         .expect("create space");
-    a.workspace
+    a.registry
         .create_chat(
             "chat-cfg",
             Some("space-cfg"),
@@ -543,7 +539,7 @@ async fn chat_config_selects_the_run_harness() {
     a.shutdown().await;
 }
 
-/// Live-edge variant: the same convergence through a real workspace room. Requires
+/// Live-edge variant: the same convergence through a real registry room. Requires
 /// the TS edge (`wrangler dev` in `edge/` with AUTH_MODE=dev):
 ///
 /// ```sh
@@ -551,26 +547,33 @@ async fn chat_config_selects_the_run_harness() {
 /// ```
 #[tokio::test]
 #[ignore = "requires a live edge: set ZERON_EDGE_WS (e.g. ws://127.0.0.1:8787)"]
-async fn two_engines_converge_through_a_real_workspace_room() {
+async fn two_engines_converge_through_a_real_registry_room() {
     use zeron_engine::doc_host::EdgeConfig;
 
     let base = std::env::var("ZERON_EDGE_WS")
         .expect("set ZERON_EDGE_WS to the edge origin, e.g. ws://127.0.0.1:8787");
-    let org = format!("org-{}", uuid::Uuid::new_v4().simple());
+    let organization_id = format!("org-{}", uuid::Uuid::new_v4().simple());
 
     let assemble_live = |dir: &std::path::Path, device_id: &str, user: &str| {
         std::fs::create_dir_all(dir).expect("create data dir");
         std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-        // Dev-mode bearer `user@org` carries the org claim the workspace route checks.
+        // The dev-mode `user@organization` bearer carries the Organization claim.
         let edge = Some(EdgeConfig::with_static_token(
             base.clone(),
-            format!("{user}@{org}"),
+            format!("{user}@{organization_id}"),
         ));
-        EngineCore::assemble_with_identity(dir, registry(), HarnessId::Mock, edge, &org, user)
-            .expect("engine core assembles")
+        EngineCore::assemble_with_identity(
+            dir,
+            registry(),
+            HarnessId::Mock,
+            edge,
+            &organization_id,
+            user,
+        )
+        .expect("engine core assembles")
     };
 
-    // Workspace docs are per-user (`ws3/{org}/{user}`): convergence is across
+    // Legacy workspace docs were per-user (`ws3/{organizationId}/{userId}`): convergence is across
     // ONE user's devices — two engines, same user, different device ids.
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
@@ -582,7 +585,7 @@ async fn two_engines_converge_through_a_real_workspace_room() {
         wait_for(
             || {
                 let ids: Vec<String> = core
-                    .workspace
+                    .registry
                     .read_devices()
                     .unwrap_or_default()
                     .into_iter()
@@ -596,12 +599,12 @@ async fn two_engines_converge_through_a_real_workspace_room() {
     }
 
     // A rename from B lands on A.
-    b.workspace
+    b.registry
         .rename_device("dev-live-a", "renamed by b")
         .expect("rename");
     wait_for(
         || {
-            a.workspace
+            a.registry
                 .read_devices()
                 .unwrap_or_default()
                 .iter()
@@ -622,10 +625,10 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
     let dir_a = tempfile::tempdir().unwrap();
     // Seed the identity-scoped store with a LEGACY Loro workspace snapshot —
     // what an updated engine finds on its first boot after the registry change.
-    let org_dir = dir_a.path().join("orgs").join("dev-org").join("dev-user");
+    let organization_dir = dir_a.path().join("orgs").join("dev-org").join("dev-user");
     {
-        let store = zeron_sync::DocsStore::open(&org_dir).expect("open store");
-        let legacy = zeron_doc::WorkspaceDoc::new();
+        let store = zeron_sync::DocsStore::open(&organization_dir).expect("open store");
+        let legacy = zeron_doc::LegacyWorkspaceDoc::new();
         let now = chrono::Utc::now();
         legacy
             .upsert_device(&Device {
@@ -687,17 +690,17 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
     // Boot: migration is instant — the full sidebar state is readable before
     // any server contact.
     let a = assemble(dir_a.path(), "dev-a");
-    let chats = a.workspace.read_chats().expect("chats");
+    let chats = a.registry.read_chats().expect("chats");
     assert_eq!(chats.len(), 1);
     assert_eq!(chats[0].title.as_deref(), Some("Migrated chat"));
     assert_eq!(chats[0].harness_session_id.as_deref(), Some("hs-9"));
     assert_eq!(chats[0].space_id.as_deref(), Some("space-legacy"));
-    let spaces = a.workspace.read_spaces().expect("spaces");
+    let spaces = a.registry.read_spaces().expect("spaces");
     assert_eq!(spaces.len(), 1);
     assert!(spaces[0].git_detected);
     // The boot-time device upsert kept the LEGACY user-set name (LWW row
     // exists), not the hostname.
-    let devices = a.workspace.read_devices().expect("devices");
+    let devices = a.registry.read_devices().expect("devices");
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].name, "old laptop");
 
@@ -707,7 +710,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
     let link = bridge(&a, &b).await;
     wait_for(
         || {
-            b.workspace
+            b.registry
                 .chat("chat-legacy")
                 .ok()
                 .flatten()
@@ -718,12 +721,12 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
     .await;
 
     // A live rename beats the migrated (historical-HLC) title everywhere.
-    b.workspace
+    b.registry
         .rename_chat("chat-legacy", "renamed live")
         .expect("rename");
     wait_for(
         || {
-            a.workspace
+            a.registry
                 .chat("chat-legacy")
                 .ok()
                 .flatten()
@@ -738,7 +741,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
     b.shutdown().await;
 
     // The registry snapshot now exists; the legacy snapshot is kept for rollback.
-    let store = zeron_sync::DocsStore::open(&org_dir).expect("reopen store");
+    let store = zeron_sync::DocsStore::open(&organization_dir).expect("reopen store");
     assert!(
         store
             .load_snapshot(zeron_doc::REGISTRY_DOC_ID)

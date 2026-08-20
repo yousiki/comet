@@ -3,11 +3,11 @@ import {
   WorkOsOutcomeUnknown,
   WorkOsRoleAssignmentFailed,
   WorkOsTransientFailure,
-  addMemberByEmail,
-  createOrg,
-  deleteOrg,
-  listMembers,
-  listOrgs,
+  addOrganizationMemberByEmail,
+  createOrganization,
+  deleteOrganization,
+  listOrganizationMembers,
+  listOrganizations,
   refresh
 } from "./workos";
 import type { Env } from "./env";
@@ -47,7 +47,7 @@ describe("WorkOS membership pagination", () => {
   const wireMembership = (index: number) => ({
     id: `membership-${index}`,
     organization_id: `org-${index}`,
-    organization_name: `Team ${index}`,
+    organization_name: `Organization ${index}`,
     user_id: `user-${index}`,
     role: { slug: index % 10 === 0 ? "admin" : "member" }
   });
@@ -59,13 +59,13 @@ describe("WorkOS membership pagination", () => {
       jsonResponse({ data: [wireMembership(100)], list_metadata: { after: null } })
     ]);
 
-    const orgs = await listOrgs("secret", "user-owner");
+    const organizations = await listOrganizations("secret", "user-owner");
 
-    expect(orgs).toHaveLength(101);
-    expect(orgs[100]).toMatchObject({
+    expect(organizations).toHaveLength(101);
+    expect(organizations[100]).toMatchObject({
       id: "membership-100",
       organizationId: "org-100",
-      name: "Team 100",
+      name: "Organization 100",
       role: "admin"
     });
     expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get("after")).toBeNull();
@@ -80,7 +80,7 @@ describe("WorkOS membership pagination", () => {
       jsonResponse({ data: [], list_metadata: { after: "same-cursor" } })
     ]);
 
-    const error = await listOrgs("secret", "user-owner").then(
+    const error = await listOrganizations("secret", "user-owner").then(
       () => undefined,
       (reason: unknown) => reason
     );
@@ -123,7 +123,7 @@ describe("WorkOS membership pagination", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const members = await listMembers("secret", "org-a");
+    const members = await listOrganizationMembers("secret", "org-a");
 
     expect(members).toHaveLength(101);
     expect(members[100]).toMatchObject({
@@ -146,7 +146,7 @@ describe("WorkOS membership pagination", () => {
       jsonResponse({ message: "user lookup rate limited" }, 429)
     ]);
 
-    const error = await listMembers("secret", "org-a").then(
+    const error = await listOrganizationMembers("secret", "org-a").then(
       () => undefined,
       (reason: unknown) => reason
     );
@@ -161,7 +161,7 @@ describe("WorkOS membership pagination", () => {
       jsonResponse({ message: "no such user" }, 404)
     ]);
 
-    const members = await listMembers("secret", "org-a");
+    const members = await listOrganizationMembers("secret", "org-a");
 
     expect(members).toEqual([
       {
@@ -184,7 +184,7 @@ describe("WorkOS organization role assignment", () => {
       jsonResponse({ deleted: true })
     ]);
 
-    const error = await createOrg("secret", "user-1", "New team").then(
+    const error = await createOrganization("secret", "user-1", "New organization").then(
       () => undefined,
       (reason: unknown) => reason
     );
@@ -200,7 +200,7 @@ describe("WorkOS organization role assignment", () => {
     expect(fetchMock.mock.calls[2]?.[0]).toBe("https://api.workos.com/organizations/org-new");
     expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "DELETE" });
     expect(warn).toHaveBeenCalledWith(
-      "workos createOrg admin assignment failed; organization rolled back",
+      "workos createOrganization admin assignment failed; organization rolled back",
       { organizationId: "org-new" }
     );
     expect(JSON.stringify(warn.mock.calls)).not.toContain("secret");
@@ -214,7 +214,7 @@ describe("WorkOS organization role assignment", () => {
       jsonResponse({ message: "organization deletion unavailable" }, 503)
     ]);
 
-    const error = await createOrg("secret", "user-1", "New team").then(
+    const error = await createOrganization("secret", "user-1", "New organization").then(
       () => undefined,
       (reason: unknown) => reason
     );
@@ -232,7 +232,7 @@ describe("WorkOS organization role assignment", () => {
     );
     expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "DELETE" });
     expect(logError).toHaveBeenCalledWith(
-      "workos createOrg rollback failed after admin assignment failure",
+      "workos createOrganization rollback failed after admin assignment failure",
       {
         organizationId: "org-orphan",
         rollbackFailure: "organization deletion unavailable"
@@ -258,7 +258,7 @@ describe("WorkOS organization role assignment", () => {
       })
     ]);
 
-    await expect(createOrg("secret", "user-1", "New team")).resolves.toEqual({
+    await expect(createOrganization("secret", "user-1", "New organization")).resolves.toEqual({
       organizationId: "org-verified"
     });
     expect(fetchMock).toHaveBeenCalledTimes(3);
@@ -267,7 +267,7 @@ describe("WorkOS organization role assignment", () => {
     expect(verificationUrl.searchParams.get("user_id")).toBe("user-1");
     expect(verificationUrl.searchParams.get("organization_id")).toBe("org-verified");
     expect(warn).toHaveBeenCalledWith(
-      "workos createOrg membership request failed; admin membership verified",
+      "workos createOrganization membership request failed; admin membership verified",
       { organizationId: "org-verified" }
     );
     expect(JSON.stringify(warn.mock.calls)).not.toContain("secret");
@@ -290,12 +290,12 @@ describe("WorkOS organization role assignment", () => {
       })
     ]);
 
-    await expect(createOrg("secret", "user-1", "New team")).resolves.toEqual({
+    await expect(createOrganization("secret", "user-1", "New organization")).resolves.toEqual({
       organizationId: "org-verified-5xx"
     });
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(warn).toHaveBeenCalledWith(
-      "workos createOrg membership request failed; admin membership verified",
+      "workos createOrganization membership request failed; admin membership verified",
       { organizationId: "org-verified-5xx" }
     );
   });
@@ -309,7 +309,7 @@ describe("WorkOS organization role assignment", () => {
       jsonResponse({ deleted: true })
     ]);
 
-    const error = await createOrg("secret", "user-1", "New team").then(
+    const error = await createOrganization("secret", "user-1", "New organization").then(
       () => undefined,
       (reason: unknown) => reason
     );
@@ -327,7 +327,7 @@ describe("WorkOS organization role assignment", () => {
     );
     expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({ method: "DELETE" });
     expect(warn).toHaveBeenCalledWith(
-      "workos createOrg admin membership not verified; rolling back organization",
+      "workos createOrganization admin membership not verified; rolling back organization",
       { organizationId: "org-transport", verification: "membership not found" }
     );
     expect(JSON.stringify(warn.mock.calls)).not.toContain("secret");
@@ -342,7 +342,7 @@ describe("WorkOS organization role assignment", () => {
       jsonResponse({ deleted: true })
     ]);
 
-    const error = await createOrg("secret", "user-1", "New team").then(
+    const error = await createOrganization("secret", "user-1", "New organization").then(
       () => undefined,
       (reason: unknown) => reason
     );
@@ -359,7 +359,7 @@ describe("WorkOS organization role assignment", () => {
       "https://api.workos.com/organizations/org-5xx-empty"
     );
     expect(warn).toHaveBeenCalledWith(
-      "workos createOrg admin membership not verified; rolling back organization",
+      "workos createOrganization admin membership not verified; rolling back organization",
       { organizationId: "org-5xx-empty", verification: "membership not found" }
     );
   });
@@ -373,7 +373,7 @@ describe("WorkOS organization role assignment", () => {
       jsonResponse({ deleted: true })
     ]);
 
-    const error = await createOrg("secret", "user-1", "New team").then(
+    const error = await createOrganization("secret", "user-1", "New organization").then(
       () => undefined,
       (reason: unknown) => reason
     );
@@ -390,7 +390,7 @@ describe("WorkOS organization role assignment", () => {
       "https://api.workos.com/organizations/org-unverified"
     );
     expect(warn).toHaveBeenCalledWith(
-      "workos createOrg admin membership not verified; rolling back organization",
+      "workos createOrganization admin membership not verified; rolling back organization",
       {
         organizationId: "org-unverified",
         verification: expect.stringContaining(
@@ -416,7 +416,7 @@ describe("WorkOS organization role assignment", () => {
       jsonResponse({ error: "admin role unavailable" }, 400)
     ]);
 
-    const error = await addMemberByEmail(
+    const error = await addOrganizationMemberByEmail(
       "secret",
       "org-1",
       "member@example.com",
@@ -440,7 +440,7 @@ describe("WorkOS organization role assignment", () => {
       jsonResponse({ message: "admin invitation role unavailable" }, 400)
     ]);
 
-    const error = await addMemberByEmail(
+    const error = await addOrganizationMemberByEmail(
       "secret",
       "org-1",
       "new-member@example.com",
@@ -475,7 +475,7 @@ describe("WorkOS organization role assignment", () => {
     ]);
 
     await expect(
-      addMemberByEmail("secret", "org-1", "member@example.com", "member")
+      addOrganizationMemberByEmail("secret", "org-1", "member@example.com", "member")
     ).resolves.toEqual({ added: true, invited: false });
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(requestBody(fetchMock.mock.calls[1])).toMatchObject({ role_slug: "member" });
@@ -497,7 +497,7 @@ describe("WorkOS organization role assignment", () => {
       jsonResponse({ error: "membership service failed after write" }, 503)
     ]);
 
-    const error = await addMemberByEmail(
+    const error = await addOrganizationMemberByEmail(
       "secret",
       "org-1",
       "member@example.com",
@@ -564,7 +564,7 @@ describe("WorkOS failure classification", () => {
   it("classifies organization delete post-commit disconnect as outcome unknown", async () => {
     stubResponses([new Error("connection closed after commit")]);
 
-    const error = await deleteOrg("secret", "org-deleted").then(
+    const error = await deleteOrganization("secret", "org-deleted").then(
       () => undefined,
       (reason: unknown) => reason
     );
@@ -578,7 +578,7 @@ describe("WorkOS failure classification", () => {
   it("classifies organization delete HTTP 5xx as outcome unknown", async () => {
     stubResponses([jsonResponse({ message: "failed after delete" }, 503)]);
 
-    const error = await deleteOrg("secret", "org-deleted").then(
+    const error = await deleteOrganization("secret", "org-deleted").then(
       () => undefined,
       (reason: unknown) => reason
     );
@@ -590,7 +590,7 @@ describe("WorkOS failure classification", () => {
   it("classifies organization delete HTTP 429 as a definite transient rejection", async () => {
     stubResponses([jsonResponse({ message: "rate limited" }, 429)]);
 
-    const error = await deleteOrg("secret", "org-deleted").then(
+    const error = await deleteOrganization("secret", "org-deleted").then(
       () => undefined,
       (reason: unknown) => reason
     );

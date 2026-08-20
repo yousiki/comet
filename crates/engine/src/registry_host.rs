@@ -1,8 +1,7 @@
-//! WorkspaceHost — owns the per-user workspace **registry** (docs/
-//! registry-sync.md; replaces the Loro workspace doc after the 2026-07/08
+//! RegistryHost — owns the per-profile registry (docs/registry-sync.md;
+//! replaces the legacy Loro workspace doc after the 2026-07/08
 //! wedge incidents): local snapshot persistence, edge room sync
-//! (`/registry/{orgId}/ws` → room `reg1/{orgId}/{userId}`, offline-tolerant —
-//! spaces/sessions are private to their owner, never org-visible), the device
+//! (`/registry/{organizationId}/ws`, offline-tolerant), the device
 //! registry row for THIS device, and the typed watch channels the
 //! WatchChats/WatchDevices/WatchSessions RPC streams are fed from.
 //!
@@ -25,7 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use chrono::Utc;
 use tokio::sync::watch;
 
-use zeron_doc::{DeletedDevice, DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
+use zeron_doc::{DeletedDevice, DeletedSpace, LegacyWorkspaceDoc, REGISTRY_DOC_ID, RegistryDoc};
 use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
 use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
 
@@ -34,15 +33,15 @@ use crate::{EngineError, now_ms};
 
 /// Legacy Loro workspace snapshot row — now only read once, as the migration
 /// source for the registry seed. Kept on disk for rollback.
-pub const WORKSPACE_DOC_ID: &str = "workspace2";
+pub const LEGACY_WORKSPACE_V2_DOC_ID: &str = "workspace2";
 /// Per-profile device-share opt-out marker (DocsStore row, value `b"0"`).
 /// Present = this device must NOT register itself in this profile's registry:
 /// no device row, no presence beats, never a host. Absent = shared (default).
 const DEVICE_SHARE_DOC_ID: &str = "device-share1";
 /// Legacy (pre-spaces) snapshot row — best-effort deleted on open.
 const LEGACY_WORKSPACE_DOC_ID: &str = "workspace";
-/// Org used when none is configured (matches the edge's dev-mode `user@org` bearers).
-pub const DEFAULT_ORG_ID: &str = "dev-org";
+/// Organization used when none is configured (matches dev-mode bearers).
+pub const DEFAULT_ORGANIZATION_ID: &str = "dev-org";
 /// User used when none is configured (dev mode without a bearer).
 pub const DEFAULT_USER_ID: &str = "dev-user";
 /// Presence beat cadence.
@@ -139,25 +138,25 @@ pub(crate) fn join_retry_jitter() -> std::time::Duration {
 }
 
 #[derive(Debug, Clone)]
-pub struct WorkspaceHostConfig {
+pub struct RegistryHostConfig {
     pub device_id: String,
     /// Human name for this device's registry row (hostname by default).
     pub device_name: String,
     /// `std::env::consts::OS`-style platform string.
     pub platform: String,
-    pub org_id: String,
-    /// The signed-in user. The registry room is org-shared (`reg2/{orgId}`):
+    pub organization_id: String,
+    /// The signed-in user. The registry room is Organization-shared:
     /// every member sees every row; `user_id` stamps creator attribution on
     /// chats this device creates or claims.
     pub user_id: String,
-    /// When present, the host joins `/registry/{orgId}/ws`. `None` = fully offline
+    /// When present, the host joins `/registry/{organizationId}/ws`. `None` = fully offline
     /// (local snapshots only; the registry still drives everything device-side).
     pub edge: Option<EdgeConfig>,
 }
 
-struct WorkspaceHostInner {
+struct RegistryHostInner {
     store: Arc<DocsStore>,
-    config: WorkspaceHostConfig,
+    config: RegistryHostConfig,
     reg: Arc<Mutex<RegistryDoc>>,
     chats_tx: watch::Sender<Vec<Chat>>,
     devices_tx: watch::Sender<Vec<Device>>,
@@ -165,7 +164,7 @@ struct WorkspaceHostInner {
     spaces_tx: watch::Sender<Vec<Space>>,
     room: Mutex<Option<Arc<RegistryClient>>>,
     /// Bumped on every registry change (local mutation or applied server
-    /// frame) — drives republish + the snapshot debounce in `workspace_task`.
+    /// frame) — drives republish + the snapshot debounce in `registry_task`.
     changed_tx: watch::Sender<u64>,
     /// Freshest presence heartbeat (ms) we have EVER observed per device. The
     /// room's presence map forgets entries after its 30s TTL and starts empty
@@ -181,13 +180,13 @@ struct WorkspaceHostInner {
     presence_watch: Mutex<PresenceWatch>,
     /// True once the registry room has been joined at least once this boot
     /// (hello state applied). Gates `is_host` on unknown chats: in an
-    /// org-shared registry, "no row yet" usually means "not synced yet", and
+    /// Organization-shared registry, "no row yet" usually means "not synced yet", and
     /// claiming a foreign chat before the first sync would double-execute its
     /// commands. Local-only (no edge) hosts never wait.
     synced_once: std::sync::atomic::AtomicBool,
     /// Device-share state for THIS profile (persisted via
     /// [`DEVICE_SHARE_DOC_ID`]). False = guest mode: no device row, no
-    /// presence beats, `is_host`/claims always refuse — the org can see this
+    /// presence beats, `is_host`/claims always refuse — the Organization can see this
     /// user's writes but cannot address this machine. Arc: the HTTP registry
     /// transport holds a clone to gate its `?beat=1` presence side effect.
     shared: Arc<std::sync::atomic::AtomicBool>,
@@ -197,7 +196,7 @@ struct WorkspaceHostInner {
     room_joined_at: std::sync::atomic::AtomicI64,
 }
 
-/// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
+/// "This peer is alive" callback (device id) — see `RegistryHost::set_peer_alive_hook`.
 pub type PeerAliveHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -205,33 +204,33 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[derive(Clone)]
-pub struct WorkspaceHost {
-    inner: Arc<WorkspaceHostInner>,
+pub struct RegistryHost {
+    inner: Arc<RegistryHostInner>,
 }
 
-impl WorkspaceHost {
+impl RegistryHost {
     /// Load (or migrate, or init) the registry, upsert this device's row, start
     /// the change-driven task, and join the edge registry room when configured.
-    pub fn open(store: Arc<DocsStore>, config: WorkspaceHostConfig) -> Result<Self, EngineError> {
+    pub fn open(store: Arc<DocsStore>, config: RegistryHostConfig) -> Result<Self, EngineError> {
         let mut doc = match store.load_snapshot(REGISTRY_DOC_ID)? {
             Some(bytes) => RegistryDoc::from_bytes(&bytes, &config.device_id)
                 .map_err(|e| EngineError::Other(format!("registry snapshot load failed: {e}")))?,
             None => {
                 // MIGRATION (instant, one-time): seed from the legacy Loro
-                // workspace snapshot when one exists. Seeds are pending upserts
+                // legacy workspace snapshot when one exists. Seeds are pending upserts
                 // with historical HLCs — the overlay serves the full sidebar
                 // immediately, the room converges on first join, and any live
                 // write beats a migrated value. The legacy snapshot stays on
                 // disk for rollback.
                 let mut doc = RegistryDoc::new(&config.device_id);
-                match store.load_snapshot(WORKSPACE_DOC_ID) {
+                match store.load_snapshot(LEGACY_WORKSPACE_V2_DOC_ID) {
                     Ok(Some(bytes)) => {
                         let raw = loro::LoroDoc::new();
                         match raw.import(&bytes) {
                             Ok(_) => {
-                                let legacy = WorkspaceDoc::from_doc(raw);
+                                let legacy = LegacyWorkspaceDoc::from_doc(raw);
                                 match legacy.read_all() {
-                                    Ok(state) => match doc.seed_from_workspace(&state) {
+                                    Ok(state) => match doc.seed_from_legacy_workspace(&state) {
                                         Ok(rows) => {
                                             tracing::info!(
                                                 rows,
@@ -239,7 +238,7 @@ impl WorkspaceHost {
                                             );
                                         }
                                         Err(err) => {
-                                            tracing::warn!(error = %err, "workspace migration seed failed");
+                                            tracing::warn!(error = %err, "legacy workspace migration seed failed");
                                         }
                                     },
                                     Err(err) => {
@@ -288,7 +287,7 @@ impl WorkspaceHost {
         let (changed_tx, changed_rx) = watch::channel(0u64);
 
         let host = Self {
-            inner: Arc::new(WorkspaceHostInner {
+            inner: Arc::new(RegistryHostInner {
                 store,
                 config,
                 reg: Arc::new(Mutex::new(doc)),
@@ -311,7 +310,7 @@ impl WorkspaceHost {
         // dies before the first debounced save.
         host.inner.save_snapshot();
         host.join_room();
-        tokio::spawn(workspace_task(Arc::downgrade(&host.inner), changed_rx));
+        tokio::spawn(registry_task(Arc::downgrade(&host.inner), changed_rx));
         if host.inner.config.edge.is_some() {
             tokio::spawn(relay_probe_task(Arc::downgrade(&host.inner)));
         }
@@ -323,9 +322,9 @@ impl WorkspaceHost {
         let Some(edge) = &self.inner.config.edge else {
             return;
         };
-        let org_id = self.inner.config.org_id.clone();
+        let organization_id = self.inner.config.organization_id.clone();
         // Per-dial URL provider: the bearer is re-read on every (re)connect.
-        let url = edge.room_url(format!("/registry/{org_id}/ws"));
+        let url = edge.room_url(format!("/registry/{organization_id}/ws"));
         self.spawn_join(url, edge.token_changes(), Some(edge.token.clone()));
     }
 
@@ -343,7 +342,7 @@ impl WorkspaceHost {
         mut token_changes: Option<tokio::sync::watch::Receiver<u64>>,
         token: Option<Arc<dyn zeron_rpc::TokenSource>>,
     ) {
-        let org_id = self.inner.config.org_id.clone();
+        let organization_id = self.inner.config.organization_id.clone();
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
         let shared = self.inner.shared.clone();
@@ -411,7 +410,7 @@ impl WorkspaceHost {
                             .room_joined_at
                             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                         inner.bump_changed();
-                        tracing::info!(org = %org_id, "registry room joined");
+                        tracing::info!(organization = %organization_id, "registry room joined");
                         drop(inner);
                         // The slot is the sole owner. This lets engine-level
                         // revocation close the socket synchronously by taking it.
@@ -471,7 +470,7 @@ impl WorkspaceHost {
                                 },
                                 _ = token_changed(&mut token_changes) => {
                                     if token_revoked(&token).await {
-                                        tracing::info!(org = %org_id,
+                                        tracing::info!(organization = %organization_id,
                                             "registry credentials removed; leaving room");
                                         break;
                                     }
@@ -484,7 +483,7 @@ impl WorkspaceHost {
                         return;
                     }
                     Err(err) => {
-                        tracing::warn!(org = %org_id, error = %err, backoff_ms = backoff.as_millis() as u64,
+                        tracing::warn!(organization = %organization_id, error = %err, backoff_ms = backoff.as_millis() as u64,
                             "registry room join failed; retrying");
                     }
                 }
@@ -681,7 +680,7 @@ impl WorkspaceHost {
         self.inner.devices_tx.subscribe()
     }
 
-    /// Raw workspace session-status rows (all devices').
+    /// Raw registry session-status rows (all devices').
     pub fn watch_session_rows(&self) -> watch::Receiver<Vec<Session>> {
         self.inner.sessions_tx.subscribe()
     }
@@ -724,12 +723,12 @@ impl WorkspaceHost {
     /// Writer discipline: the chat's host is its row's `deviceId`. Unknown chats
     /// are claimable — the first run command claims them via [`Self::claim_chat`]
     /// — but only once the registry has synced at least once (or when there is
-    /// no edge at all). Fail-closed before that: in an org-shared registry an
+    /// no edge at all). Fail-closed before that: in an Organization-shared registry an
     /// unsynced device believing it hosts a foreign chat would double-execute
     /// its commands. Read errors are likewise no longer treated as ownership.
     pub fn is_host(&self, chat_id: &str) -> bool {
         // Guest mode: an unshared device never hosts in this profile, even for
-        // chats whose row still names it — org members must not be able to
+        // chats whose row still names it — Organization members must not be able to
         // execute here by pointing a chat at our device id.
         if !self.device_shared() {
             return false;
@@ -772,7 +771,7 @@ impl WorkspaceHost {
     pub fn claim_chat(&self, chat_id: &str, cwd: Option<&str>) -> Result<(), EngineError> {
         if !self.device_shared() {
             return Err(EngineError::Other(
-                "device sharing is off for this workspace".into(),
+                "device sharing is off for this profile".into(),
             ));
         }
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
@@ -850,7 +849,7 @@ impl WorkspaceHost {
     // ── host-side row writes ────────────────────────────────────────────────
 
     /// Sidebar freshness on message persist: preview = first 120 chars of the last
-    /// message's text. Claims the row first so a pre-workspace chat gains one.
+    /// message's text. Claims the row first so a pre-registry chat gains one.
     pub fn note_message(&self, chat_id: &str, text: &str) {
         let preview: String = text.chars().take(120).collect();
         let result = self.claim_chat(chat_id, None).and_then(|_| {
@@ -920,7 +919,7 @@ impl WorkspaceHost {
         let space = match space_id {
             Some(space_id) => match self.read(|doc| doc.space(space_id))? {
                 Some(space) => Some(space),
-                None => return Err(EngineError::Other(format!("no such space: {space_id}"))),
+                None => return Err(EngineError::Other(format!("no such Project: {space_id}"))),
             },
             None => None,
         };
@@ -935,7 +934,7 @@ impl WorkspaceHost {
         };
         if host_device == self.inner.config.device_id && !self.device_shared() {
             return Err(EngineError::Other(
-                "device sharing is off for this workspace".into(),
+                "device sharing is off for this profile".into(),
             ));
         }
         self.mutate(|doc| {
@@ -959,7 +958,7 @@ impl WorkspaceHost {
                 harness_session_id: None,
                 // Born on the current room generation: a brand-new chat has
                 // an empty doc — nothing to seed, no migration race to lose.
-                // 3 = org-shared chat3 whenever an edge is configured; only
+                // 3 = Organization-shared chat3 whenever an edge is configured; only
                 // pre-existing chats go through the host migration sweep.
                 room_gen: Some(if self.inner.config.edge.is_some() {
                     3
@@ -994,7 +993,7 @@ impl WorkspaceHost {
     ) -> Result<(), EngineError> {
         if device_id == self.inner.config.device_id && !self.device_shared() {
             return Err(EngineError::Other(
-                "device sharing is off for this workspace".into(),
+                "device sharing is off for this profile".into(),
             ));
         }
         let spaces = self.read(|doc| doc.read_spaces())?;
@@ -1054,7 +1053,7 @@ impl WorkspaceHost {
             Some(space) => {
                 tracing::warn!(
                     space = %space_id, owner = %space.device_id,
-                    "refusing git stamp on space owned by another device"
+                    "refusing git stamp on Project owned by another device"
                 );
                 Ok(false)
             }
@@ -1236,7 +1235,7 @@ impl WorkspaceHost {
     }
 }
 
-impl WorkspaceHostInner {
+impl RegistryHostInner {
     fn bump_changed(&self) {
         self.changed_tx.send_modify(|v| *v = v.wrapping_add(1));
     }
@@ -1441,7 +1440,7 @@ fn merge_sessions(device_id: &str, rows: &[Session], local: &[Session]) -> Vec<S
 /// false "offline" now requires BOTH independent paths to be down — at which
 /// point the device is, for every purpose the app has, genuinely offline.
 /// Steady state (healthy room, fresh heartbeats) probes nothing.
-async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
+async fn relay_probe_task(weak: Weak<RegistryHostInner>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(RELAY_PROBE_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await; // consume the immediate first tick
@@ -1517,7 +1516,7 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
 /// server frames) by re-publishing the watch channels and debouncing snapshots,
 /// and refreshes presence every [`PRESENCE_INTERVAL_MS`]. Holds only a weak
 /// handle so a dropped host tears the task down.
-async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::Receiver<u64>) {
+async fn registry_task(weak: Weak<RegistryHostInner>, mut changed_rx: watch::Receiver<u64>) {
     let mut presence =
         tokio::time::interval(std::time::Duration::from_millis(PRESENCE_INTERVAL_MS));
     presence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1571,7 +1570,7 @@ fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> Stri
 /// sentinel is repaired with the platform-resolved name because it was never a
 /// user-selected name.
 fn own_device_row(
-    config: &WorkspaceHostConfig,
+    config: &RegistryHostConfig,
     existing: Option<&Device>,
     now: chrono::DateTime<Utc>,
 ) -> Device {
@@ -1587,13 +1586,13 @@ fn own_device_row(
         // (the Devices page "Added …" fragment).
         created_at: existing.and_then(|d| d.created_at).or(Some(now)),
         // Every boot restamps the running binary's version (fleet staleness
-        // on the Devices page; workspace version — same for every crate).
+        // on the Devices page; registry version — same for every crate).
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
     }
 }
 
 /// Plain-HTTPS registry pull/push derived from the SAME WebSocket URL
-/// provider the dial uses (`wss://…/registry/{org}/ws?token=…&device=…`):
+/// provider the dial uses (`wss://…/registry/{organizationId}/ws?token=…&device=…`):
 /// swap the scheme, swap the `/ws` leaf for `/rows` or `/push`, keep the
 /// fresh token+device the provider already mints per attempt. No second
 /// auth path to maintain, and the `?beat=1` keeps presence alive for a
@@ -1713,7 +1712,7 @@ mod tests {
         }
     }
 
-    /// Org-shared registry: rows now arrive from other USERS' devices too.
+    /// Organization-shared registry: rows now arrive from other users' devices too.
     /// The overlay must keep them verbatim while replacing only rows for our
     /// own device with the local live statuses.
     #[test]

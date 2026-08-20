@@ -579,7 +579,7 @@ async fn host_offline_fails_fast_and_cools_down() {
     );
 }
 
-/// The data-driven cooldown reset (fresh workspace presence → peer is alive):
+/// The data-driven cooldown reset (fresh registry presence → peer is alive):
 /// with a long backoff engaged, `reset_cooldown` lets the next call dial
 /// immediately instead of waiting the window out.
 #[tokio::test]

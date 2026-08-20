@@ -1,5 +1,5 @@
-//! Workspace registry — the client side of the row-table sidebar sync that
-//! replaces the Loro workspace doc (docs/registry-sync.md).
+//! Registry — the client side of the row-table sidebar sync that replaces the
+//! legacy Loro workspace doc (docs/registry-sync.md).
 //!
 //! [`RegistryDoc`] is a local replica of the per-user registry room:
 //! - `authoritative` rows — the server's truth, replaced wholesale by `state`/
@@ -11,7 +11,7 @@
 //!
 //! The merge function [`apply_op`] mirrors `edge/src/registry-core.ts` 1:1 —
 //! the shared test vectors live in both files; change them together. The
-//! typed API mirrors the old `WorkspaceDoc` surface so `WorkspaceHost` is a
+//! typed API mirrors the old `LegacyWorkspaceDoc` surface so `RegistryHost` is a
 //! drop-in swap.
 
 use std::collections::{BTreeMap, HashMap};
@@ -22,8 +22,8 @@ use serde_json::{Value, json};
 
 use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
 
+use crate::legacy_workspace::{DeletedDevice, DeletedSpace, LegacyWorkspaceState};
 use crate::schema::DocError;
-use crate::workspace::{DeletedDevice, DeletedSpace, WorkspaceState};
 
 /// Row kinds — the four sidebar tables.
 pub const KIND_DEVICES: &str = "devices";
@@ -675,7 +675,7 @@ impl RegistryDoc {
         self.overlay_row(kind, id).is_some()
     }
 
-    // ── typed API (the WorkspaceDoc surface) ────────────────────────────────
+    // ── typed API (the LegacyWorkspaceDoc surface) ────────────────────────────────
 
     /// Upsert a full device row (writer discipline: callers pass their OWN device).
     pub fn upsert_device(&mut self, device: &Device) -> Result<(), DocError> {
@@ -771,7 +771,7 @@ impl RegistryDoc {
 
     pub fn read_devices(&self) -> Result<Vec<Device>, DocError> {
         let mut devices: Vec<Device> = self
-            .read_kind::<crate::workspace::RawDevice>(KIND_DEVICES)
+            .read_kind::<crate::legacy_workspace::RawDevice>(KIND_DEVICES)
             .into_iter()
             .map(Device::from)
             .collect();
@@ -799,13 +799,13 @@ impl RegistryDoc {
     pub fn space(&self, space_id: &str) -> Result<Option<Space>, DocError> {
         Ok(self
             .overlay_row(KIND_SPACES, space_id)
-            .and_then(|row| row_to::<crate::workspace::RawSpace>(&row))
+            .and_then(|row| row_to::<crate::legacy_workspace::RawSpace>(&row))
             .map(Space::from))
     }
 
     pub fn read_spaces(&self) -> Result<Vec<Space>, DocError> {
         let mut spaces: Vec<Space> = self
-            .read_kind::<crate::workspace::RawSpace>(KIND_SPACES)
+            .read_kind::<crate::legacy_workspace::RawSpace>(KIND_SPACES)
             .into_iter()
             .map(Space::from)
             .collect();
@@ -974,13 +974,13 @@ impl RegistryDoc {
     pub fn chat(&self, chat_id: &str) -> Result<Option<Chat>, DocError> {
         Ok(self
             .overlay_row(KIND_CHATS, chat_id)
-            .and_then(|row| row_to::<crate::workspace::RawChat>(&row))
+            .and_then(|row| row_to::<crate::legacy_workspace::RawChat>(&row))
             .map(Chat::from))
     }
 
     pub fn read_chats(&self) -> Result<Vec<Chat>, DocError> {
         let mut chats: Vec<Chat> = self
-            .read_kind::<crate::workspace::RawChat>(KIND_CHATS)
+            .read_kind::<crate::legacy_workspace::RawChat>(KIND_CHATS)
             .into_iter()
             .map(Chat::from)
             .collect();
@@ -1166,7 +1166,7 @@ impl RegistryDoc {
 
     pub fn read_sessions(&self) -> Result<Vec<Session>, DocError> {
         let mut sessions: Vec<Session> = self
-            .read_kind::<crate::workspace::RawSession>(KIND_SESSIONS)
+            .read_kind::<crate::legacy_workspace::RawSession>(KIND_SESSIONS)
             .into_iter()
             .map(Session::from)
             .collect();
@@ -1176,8 +1176,8 @@ impl RegistryDoc {
 
     // ── whole-doc read ──────────────────────────────────────────────────────
 
-    pub fn read_all(&self) -> Result<WorkspaceState, DocError> {
-        Ok(WorkspaceState {
+    pub fn read_all(&self) -> Result<LegacyWorkspaceState, DocError> {
+        Ok(LegacyWorkspaceState {
             devices: self.read_devices()?,
             spaces: self.read_spaces()?,
             chats: self.read_chats()?,
@@ -1193,7 +1193,10 @@ impl RegistryDoc {
     /// genuinely newer live write beats the migrated value; identical across
     /// devices, so N devices seeding the same converged doc is idempotent
     /// (equal values, deterministic device tie-break).
-    pub fn seed_from_workspace(&mut self, state: &WorkspaceState) -> Result<usize, DocError> {
+    pub fn seed_from_legacy_workspace(
+        &mut self,
+        state: &LegacyWorkspaceState,
+    ) -> Result<usize, DocError> {
         let mut ops: Vec<RowOp> = Vec::new();
         let mut seed = |kind: &str, id: &str, ms: i64, set: BTreeMap<String, Value>| {
             ops.push(RowOp {

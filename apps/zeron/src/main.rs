@@ -24,7 +24,7 @@ enum Command {
     Login,
     /// Remove the saved session and return to local-only on the next start.
     Logout,
-    /// Show workspace mode, optional auth, and engine status.
+    /// Show profile mode, optional auth, and engine status.
     Status,
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
@@ -78,6 +78,19 @@ fn edge_url_from_env() -> String {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_EDGE_URL.into())
+}
+
+/// Development Organization selection. The full name is canonical; the short
+/// legacy variable remains a read-only fallback for existing service files.
+fn organization_id_from_env() -> Option<String> {
+    std::env::var("ZERON_ORGANIZATION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("ZERON_ORG_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
 }
 
 /// WorkOS client id resolution: explicit env wins (empty string = dev mode);
@@ -203,7 +216,7 @@ fn main() -> anyhow::Result<()> {
                 edge_url: edge_url_from_env(),
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,
-                org_id: std::env::var("ZERON_ORG_ID").ok(),
+                organization_id: organization_id_from_env(),
                 default_harness: zeron_ui::HarnessId::ClaudeCode,
             });
             Ok(())
@@ -227,9 +240,9 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
             .and_then(|p| p.parse().ok())
             .unwrap_or(27654),
         default_harness: harness_from_env(),
-        // WorkOS mode: the signed-in session's org wins; ZERON_ORG_ID (dev
-        // default "dev-org") scopes the workspace room otherwise.
-        org_id: std::env::var("ZERON_ORG_ID").ok(),
+        // WorkOS mode: the signed-in session's Organization wins; the
+        // development override scopes the registry room otherwise.
+        organization_id: organization_id_from_env(),
         // Real auth against production by default; see
         // `workos_client_id_from_env` for the dev-mode escape hatches.
         workos_client_id: workos_client_id_from_env(&edge_token),
@@ -267,7 +280,7 @@ fn dirs_data_dir() -> std::path::PathBuf {
 
 /// `zeron sync`: dial the running engine's IPC and print per-room sync state.
 /// The introspection surface every 2026-08 incident was missing — "is this
-/// device's workspace room actually receiving?" as a one-liner.
+/// device's registry room actually receiving?" as a one-liner.
 async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
     let client = zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
         .await
@@ -329,8 +342,13 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
             .unwrap_or("?")
     );
     println!(
-        "Workspace: {}",
-        room_line(status.get("workspace").filter(|v| !v.is_null()))
+        "Registry:  {}",
+        room_line(
+            status
+                .get("registry")
+                .or_else(|| status.get("workspace"))
+                .filter(|v| !v.is_null()),
+        )
     );
     let chats = status
         .get("chats")

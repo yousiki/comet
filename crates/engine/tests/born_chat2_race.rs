@@ -143,7 +143,7 @@ async fn transcript_survives_open_racing_create_chat() {
             .await
             .expect("createChat lands after the open");
         // Pre-title so the auto-titler's harness request stays out of the run.
-        core.workspace
+        core.registry
             .rename_chat(CHAT, "Pre-titled")
             .expect("rename chat");
 

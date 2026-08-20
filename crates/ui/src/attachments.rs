@@ -900,7 +900,7 @@ mod tests {
         assert!(begin_load(&old, device, path));
         clear_profile_cache();
         // Simulate an old viewport completing after another viewport cleared
-        // the global cache and opened the replacement Team.
+        // the global cache and opened the replacement Organization.
         store_loaded(&old, device, path, "old.png".into(), cached_test_image(1));
 
         assert!(

@@ -1364,7 +1364,7 @@ impl Pickers {
 
     /// Apply `change` to the selected chat's effective config and persist it:
     /// optimistic row stamp (chips update on click) + `Mutate setChatConfig`
-    /// (LWW workspace write — restarts and other devices see it). The written
+    /// (LWW registry write — restarts and other devices see it). The written
     /// row always carries the CONCRETE resolved model/reasoning, with the
     /// reasoning re-clamped to the (possibly just-changed) model's ladder.
     fn update_chat_config(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut ChatConfig)) {
@@ -1671,8 +1671,8 @@ impl Pickers {
         }
     }
 
-    /// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel` /
-    /// `resolveCurrentWorkspaceLabel`).
+    /// Label of the checkout-kind trigger (legacy t3code frontend:
+    /// `resolveEnvModeLabel` / `resolveCurrentWorkspaceLabel`).
     fn checkout_label(&self) -> &'static str {
         match self.config.checkout {
             CheckoutKind::NewWorktree => "New worktree",
@@ -2233,8 +2233,8 @@ impl Pickers {
             )
     }
 
-    /// A read-only footer label (locked sessions — t3code's
-    /// `resolveLockedWorkspaceLabel` span).
+    /// A read-only footer label (legacy t3code frontend:
+    /// `resolveLockedWorkspaceLabel` span for locked sessions).
     fn footer_label(icon_path: &'static str, label: SharedString, theme: &Theme) -> gpui::Div {
         div()
             .h(px(20.0))
@@ -2343,7 +2343,7 @@ impl Pickers {
     /// name their target in the titlebar.
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
-        // A selected chat whose workspace row hasn't synced yet (the moment
+        // A selected chat whose registry row hasn't synced yet (the moment
         // right after send mints it) still renders the DRAFT footer — the
         // values are identical, so the toolbar never blinks through a
         // half-empty locked state.

@@ -34,11 +34,13 @@ enum DocDisk {
         try? data.write(to: url(for: id), options: .atomic)
     }
 
-    /// The workspace registry's persisted blob ({rows, cursor, gcFloor,
-    /// clock, pending} JSON — RegistryDoc.toData). Replaces the old `ws3_`
-    /// Loro workspace snapshot; session docs stay Loro snapshots unchanged.
-    static func registryURL(orgId: String, userId: String) -> URL {
-        directory.appendingPathComponent("registry1_\(orgId)_\(userId).json")
+    /// The registry's persisted blob ({rows, cursor, gcFloor, clock, pending}
+    /// JSON — RegistryDoc.toData). Replaces the legacy `ws3_` Loro workspace
+    /// snapshot; session docs stay Loro snapshots unchanged.
+    static func registryURL(organizationId: String, userId: String) -> URL {
+        // `registry1_` is the historical on-disk identity and must not change:
+        // renaming it would strand existing offline state.
+        directory.appendingPathComponent("registry1_\(organizationId)_\(userId).json")
     }
 
     // MARK: chat2 lineage snapshots (docs/chat2-sync.md C2)
@@ -86,7 +88,7 @@ enum DocDisk {
         try? data.write(to: chat2URL(for: id), options: .atomic)
     }
 
-    /// LRU-prune session snapshots (the workspace registry blob is always
+    /// LRU-prune session snapshots (the Organization registry blob is always
     /// kept; a leftover `ws3_` Loro snapshot is retained for rollback).
     static func prune(keep: Int) {
         let fm = FileManager.default

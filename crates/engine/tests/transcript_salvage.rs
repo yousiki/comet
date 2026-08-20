@@ -65,8 +65,8 @@ async fn blank_journaled_chat_recovers_entries_from_fat_rollback() {
 
     // Phase 2: plant the loss artifacts the salvage keys on — a non-empty run
     // journal, and the fat lineage holding the real transcript.
-    let org_dir = dir.join("orgs").join("dev-org").join("dev-user");
-    let journals = org_dir.join("journals");
+    let organization_dir = dir.join("orgs").join("dev-org").join("dev-user");
+    let journals = organization_dir.join("journals");
     std::fs::create_dir_all(&journals).unwrap();
     std::fs::write(
         journals.join(format!("{CHAT}.jsonl")),
@@ -90,7 +90,7 @@ async fn blank_journaled_chat_recovers_entries_from_fat_rollback() {
     .unwrap();
     let fat_bytes = fat.export_snapshot().unwrap();
     {
-        let store = zeron_sync::DocsStore::open(&org_dir).unwrap();
+        let store = zeron_sync::DocsStore::open(&organization_dir).unwrap();
         store
             .save_snapshot(&format!("{CHAT}.pre-chat2"), &fat_bytes)
             .unwrap();

@@ -1,6 +1,6 @@
 /**
  * ChatRoom — one Durable Object per chat session (`chat2/{chatId}` legacy
- * single-owner, `chat3/{orgId}/{chatId}` org-shared), the dumb authenticated
+ * single-owner, Organization-shared legacy `chat3` namespace), the dumb authenticated
  * log relay replacing SessionRoom's loro-aware s2 rooms (docs/chat2-sync.md
  * workstream B). Modeled line-for-line on RegistryRoom, NOT on SessionRoom:
  * no loro-wasm import anywhere in this class.
@@ -33,7 +33,12 @@ import {
 } from "./chat-log";
 import { decodeFrame, encodeFrame, FRAME } from "./chat-frames";
 import { authorizeChatRoom, type ChatOp } from "./chat-room-auth";
-import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import {
+  AUTH_USER_HEADER,
+  LEGACY_ORGANIZATION_CHAT_ROOM_KIND,
+  ROOM_KIND_HEADER,
+  type Env
+} from "./env";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** Inbound frame budget: one pushed row (+ header slack). */
@@ -55,8 +60,8 @@ const QUOTA_MAX_BYTES = 8 * 1024 * 1024;
 interface SocketState {
   userId: string;
   device: string;
-  /** Explicit on new sockets. Missing means a pre-deploy attachment, for
-   * which disabling excludeOwn is the data-safe compatibility behavior. */
+  /** Historical serialized attachment field. Explicit on new sockets; missing
+   * on pre-deploy attachments, where disabling excludeOwn is data-safe. */
   orgChat?: boolean;
   /** Set once a valid hello established the session. */
   ready?: boolean;
@@ -101,12 +106,13 @@ export class ChatRoom implements DurableObject {
     if (!userId) return json({ error: "unauthenticated" }, 401);
 
     const sql = this.ctx.storage.sql;
-    // Org-shared rooms (chat3, Worker-verified org membership rides the room
-    // name) use host-user discipline via authorizeChatRoom; legacy chat2
+    // Organization-shared legacy `chat3` rooms use host-user discipline via
+    // authorizeChatRoom; legacy `chat2`
     // rooms keep the single-owner discipline, claiming on the first
     // authenticated contact. The header is Worker-controlled
     // (deleted-then-set on every forward).
-    const orgChat = request.headers.get(ROOM_KIND_HEADER) === "org-chat";
+    const organizationSharedRoom =
+      request.headers.get(ROOM_KIND_HEADER) === LEGACY_ORGANIZATION_CHAT_ROOM_KIND;
     const roleHost = url.searchParams.get("role") === "host";
     /** Drain an unread body before answering a denial: responding with the
      * request stream unconsumed makes workerd abort the connection ("Can't
@@ -120,9 +126,9 @@ export class ChatRoom implements DurableObject {
       }
       return response;
     };
-    /** null = allowed (an org-chat host claim is persisted as a side effect). */
+    /** null = allowed (a shared-room host claim is persisted as a side effect). */
     const gate = (op: ChatOp): Response | null => {
-      if (orgChat) {
+      if (organizationSharedRoom) {
         const verdict = authorizeChatRoom(op, userId, getMeta(sql, "hostUser") ?? null, roleHost);
         if (!verdict.allow) return json({ error: "forbidden" }, 403);
         if (verdict.claimHost) setMeta(sql, "hostUser", userId);
@@ -143,7 +149,8 @@ export class ChatRoom implements DurableObject {
       const device = url.searchParams.get("device") ?? "";
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
-      const state: SocketState = { userId, device, orgChat };
+      // `orgChat` is retained in serialized attachments for hibernated-socket compatibility.
+      const state: SocketState = { userId, device, orgChat: organizationSharedRoom };
       pair[1].serializeAttachment(state);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -216,7 +223,7 @@ export class ChatRoom implements DurableObject {
       const after = Number.isInteger(afterRaw) && afterRaw >= 0 ? afterRaw : 0;
       const device = url.searchParams.get("device") ?? "";
       const exclude = excludedDevice(
-        orgChat,
+        organizationSharedRoom,
         url.searchParams.get("excludeOwn") === "1",
         device
       );
@@ -268,7 +275,7 @@ export class ChatRoom implements DurableObject {
       // makes at-least-once delivery exact-once in effect.
       const device = url.searchParams.get("device") ?? "";
       // `device` is caller-controlled even though `userId` is Worker-stamped.
-      // Match the WS path's attribution so one org member cannot collide with
+      // Match the WS path's attribution so one Organization member cannot collide with
       // another member's quota window or incident ledger by reusing/omitting
       // a device id.
       const attribution = attributionKey({ userId, device });
@@ -416,7 +423,7 @@ export class ChatRoom implements DurableObject {
     // The URL `device` param (Worker-validated against ID_RE) is the ONLY
     // device source. The hello header's copy is ignored so attribution cannot
     // change after the authenticated upgrade. Quotas/outcomes also include
-    // `userId`, and org rooms disable raw-device `excludeOwn` below.
+    // `userId`, and Organization-shared rooms disable raw-device `excludeOwn` below.
     void header;
     state.ready = true;
     ws.serializeAttachment(state);
@@ -447,7 +454,7 @@ export class ChatRoom implements DurableObject {
       return;
     }
     const after = typeof header.after === "number" && header.after >= 0 ? header.after : 0;
-    // In an org room `device` is caller-selected, not identity-bound. Another
+    // In an Organization-shared room `device` is caller-selected, not identity-bound. Another
     // member may legitimately or maliciously reuse it; filtering by the raw
     // value would hide that member's rows forever. Re-importing our own Loro
     // rows is a no-op, so chat3 disables this bandwidth-only optimization.
@@ -616,14 +623,15 @@ export class ChatRoom implements DurableObject {
 const attributionKey = (state: SocketState): string =>
   `${state.userId}:${state.device === "" ? "(unknown)" : state.device}`;
 
-/** Legacy chat2 may omit its own device's replay rows. Org-shared chat3 must
+/** Legacy `chat2` may omit its own device's replay rows. Organization-shared `chat3` must
  * not: device ids are not bound to user identity, so a collision would hide a
  * foreign member's update. */
 const excludedDevice = (
-  orgChat: boolean | undefined,
+  organizationSharedRoom: boolean | undefined,
   requested: boolean,
   device: string
-): string | undefined => (requested && orgChat === false && device !== "" ? device : undefined);
+): string | undefined =>
+  requested && organizationSharedRoom === false && device !== "" ? device : undefined;
 
 const send = (
   ws: WebSocket,

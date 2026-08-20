@@ -20,14 +20,14 @@ pub fn blob_avatar(seed: &str, size: f32) -> Img {
     .flex_none()
 }
 
-/// Square team badge for `seed`, `size` logical pixels on a side. Same palette
+/// Square organization badge for `seed`, `size` logical pixels on a side. Same palette
 /// and pipeline as [`blob_avatar`], but a mirror-symmetric straight-edged crest
-/// with no eyes: geometry reads as "org", the organic face reads as "person".
-pub fn team_avatar(seed: &str, size: f32) -> Img {
+/// with no eyes: geometry reads as "Organization", the organic face reads as "person".
+pub fn organization_avatar(seed: &str, size: f32) -> Img {
     let dim = (size * 2.0).round() as u32;
     img(Arc::new(Image::from_bytes(
         ImageFormat::Svg,
-        team_svg(seed, dim).into_bytes(),
+        organization_svg(seed, dim).into_bytes(),
     )))
     .size(px(size))
     .flex_none()
@@ -131,12 +131,12 @@ fn svg(seed: &str, dim: u32) -> String {
     )
 }
 
-fn team_svg(seed: &str, dim: u32) -> String {
+fn organization_svg(seed: &str, dim: u32) -> String {
     let mut t = Traits::new(seed);
     let (top, bottom) = gradient(&mut t);
 
     // Crest: 8 spokes from a top vertex, joined by straight edges. Symmetry
-    // and hard corners are what separate a Team from a person at 16px; the
+    // and hard corners are what separate an Organization from a person at 16px; the
     // eyes are deliberately absent. Only the right half is generated — the
     // left is its exact reflection, snapped to whole viewBox units so the
     // emitted digits mirror too, not just the floats behind them.
@@ -166,7 +166,7 @@ fn team_svg(seed: &str, dim: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{svg, team_svg};
+    use super::{organization_svg, svg};
 
     #[test]
     fn deterministic_distinct_and_well_formed() {
@@ -180,11 +180,11 @@ mod tests {
     }
 
     #[test]
-    fn team_badges_are_stable_symmetric_and_not_faces() {
-        assert_eq!(team_svg("org-1", 56), team_svg("org-1", 56));
-        assert_ne!(team_svg("org-1", 56), team_svg("org-2", 56));
-        // A Team never wears a person's face, even on a colliding seed.
-        assert_ne!(team_svg("org-1", 56), svg("org-1", 56));
+    fn organization_badges_are_stable_symmetric_and_not_faces() {
+        assert_eq!(organization_svg("org-1", 56), organization_svg("org-1", 56));
+        assert_ne!(organization_svg("org-1", 56), organization_svg("org-2", 56));
+        // An Organization never wears a person's face, even on a colliding seed.
+        assert_ne!(organization_svg("org-1", 56), svg("org-1", 56));
 
         // Regression anchors against computing both halves instead of
         // reflecting one: `sym-3390` rounds to an asymmetric pair of digits,
@@ -198,10 +198,10 @@ mod tests {
             "snap-4302",
             "组织",
         ] {
-            let s = team_svg(seed, 56);
+            let s = organization_svg(seed, 56);
             assert!(s.starts_with("<svg"), "not an svg: {s}");
             assert!(!s.contains("NaN") && !s.contains("inf"), "bad number: {s}");
-            assert!(!s.contains("<circle"), "team badge grew eyes: {s}");
+            assert!(!s.contains("<circle"), "organization badge grew eyes: {s}");
 
             // Mirror check: every vertex has a partner at the same y, its x
             // reflected through the 64 axis to the digit (the top and bottom

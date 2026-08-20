@@ -17,8 +17,8 @@ pub mod composer;
 pub mod devices;
 pub mod harnesses;
 pub mod notifications;
+pub mod organization;
 pub mod shortcuts;
-pub mod team;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -63,7 +63,7 @@ pub struct UiSettings {
     /// written by a pre-tabs build; seeded once from the last space's sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_tabs: Option<Vec<String>>,
-    /// Sidebar session filter: a space id, or `None` for "All spaces".
+    /// Sidebar session filter: a `Space` wire id, or `None` for "All Projects".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_filter: Option<String>,
     /// Legacy: per-space tab order, from when tabs were the selected space's

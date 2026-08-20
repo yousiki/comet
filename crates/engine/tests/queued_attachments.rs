@@ -158,7 +158,7 @@ async fn run_defers_until_attachment_bytes_land_then_executes_rewritten() {
         )
         .await
         .expect("createChat");
-    core.workspace
+    core.registry
         .rename_chat(CHAT, "Pre-titled")
         .expect("rename chat");
 

@@ -1,7 +1,8 @@
 # zeron — Architecture
 
 A ground-up native rewrite of [zeron](../zeron) — a multi-device controller for coding agents
-(Claude Code / Codex) — in Rust, with a gpui UI. Fresh app; no backwards compatibility required.
+(Claude Code / Codex) — in Rust, with a gpui UI. Compatibility is limited to the explicitly
+documented legacy storage and protocol readers.
 
 **Pillars (from the goal):**
 - Optional sync uses Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects; the same docs persist locally when sync is disabled.
@@ -19,17 +20,33 @@ A ground-up native rewrite of [zeron](../zeron) — a multi-device controller fo
 gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══ engine B ─ RPC ─ gpui UI
                     │       optional edge Worker: auth, rooms, R2        │
                     └── optional chat2 sync ──  ChatRoom DO (per chat) ──┘
-                                          └─ Workspace registry room ────┘
+                                          └─ Registry room ──────────────┘
 ```
 
 - **Engine = backend** (was `@zeron/backend`): runs agents, owns auth, terminals, repos/worktrees,
   diff sync, doc hosting. Pure Rust daemon, fully functional headless.
-- **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC whether the engine is in-process or a separate daemon. Organized around **spaces** — (device, folder) pairs, local or synced according to the active profile. The sidebar is the data: an attention-sorted Sessions list, filtered by a searchable spaces dropdown ("All spaces" included) that also hosts space management. The horizontal tabs are a **device-local viewport** onto that list (`ui-settings.json` `openTabs`, cross-space): closing a tab is local-only — archiving is an explicit sidebar action — and a sidebar click (re)opens a session as a tab. The new-session canvas carries a space picker (defaulting to the sidebar filter, else the last selected space); new sessions are minted onto the picked space's device via relay-forwardable RPCs.
+- **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC whether the engine is in-process or a separate daemon. Organized around **Projects** — device-and-folder pairs represented as `Space` on the wire — local or synced according to the active profile. The sidebar is the data: an attention-sorted Sessions list, filtered by a searchable Project dropdown ("All Projects" included) that also hosts Project management. The horizontal tabs are a **device-local viewport** onto that list (`ui-settings.json` `openTabs`, cross-Project): closing a tab is local-only — archiving is an explicit sidebar action — and a sidebar click (re)opens a session as a tab. The new-session canvas carries a Project picker (defaulting to the sidebar filter, else the last selected Project); new sessions are minted onto the picked Project's device via relay-forwardable RPCs.
 - **Edge (TypeScript, ported from zeron `apps/edge`)**: Worker + ChatRoom DO (per chat, the
   chat2 row protocol; the legacy SessionRoom DO remains deployed only for pre-cutover clients —
   no current client dials it) + DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth.
-  Absorbs the old `apps/server` responsibilities (WorkOS code exchange/refresh, orgs) so
+  Absorbs the old `apps/server` responsibilities (WorkOS code exchange/refresh,
+  organizations) so
   **Postgres, the Hono server, and the WebRTC/signaling stack are all gone**.
+
+### Domain terminology
+
+- **Organization** is Comet's single top-level membership, authorization, and shared-data
+  boundary. WorkOS currently supplies that entity, but the domain type is provider-independent.
+- **Profile** is the immutable local runtime/storage context. A synced profile selects one
+  `(user, Organization)` pair; a local profile has no Organization.
+- **Registry** is the profile index containing devices, projects/spaces, chats, and live session
+  status. Historical `workspace2`, `ws4`, and `/workspace/*` names are migration or compatibility
+  identifiers only.
+- **Project** is the user-facing name for a folder on a particular device. `Space` remains its
+  wire/schema name. A chat's **working directory** may be that folder or an isolated worktree.
+
+`Team` and product-facing `Workspace` are not aliases or additional entity levels. Creating,
+selecting, or deleting the shared boundary always operates on an Organization.
 
 ### Headed / headless
 Single binary `zeron`:
@@ -41,25 +58,25 @@ Single binary `zeron`:
   window still opens, having lost only the ability to host peers.
 - `zeron headless` — engine only. A clean installation immediately serves its local profile over localhost IPC; when a saved account selects the synced profile at startup and a bearer is available, it also hosts its DeviceRoom for remote control. A VPS can run this while a laptop's UI drives it.
 
-### Local-first workspace profiles
+### Local-first profiles
 
-Authentication and workspace selection are deliberately separate state machines:
+Authentication and profile selection are deliberately separate state machines:
 
 - `AuthState` is live credential state: `SignedOut`, `NeedsOrganization`, or `SignedIn`. It may change after login, refresh, revocation, or logout.
-- `WorkspaceScope` is the immutable storage and transport boundary captured once at engine startup: `Local`, `Synced`, or explicit `Development`.
+- `ProfileScope` is the immutable storage and transport boundary captured once at engine startup: `Local`, `Synced`, or explicit `Development`.
 
 The engine never re-resolves an open store because `AuthState` changed. This prevents a sign-in, token refresh, or revocation from silently swapping databases or attaching online transports to a runtime that started local-only.
 
-| Startup condition | `WorkspaceScope` | Online transports |
+| Startup condition | `ProfileScope` | Online transports |
 | --- | --- | --- |
 | WorkOS enabled, no parseable saved `session.json` | `Local` | Disabled |
 | Parseable saved WorkOS session | `Synced` | Enabled when a bearer is available; organization onboarding completes before opening the store when needed |
 | WorkOS disabled without a dev bearer | `Development` | Disabled |
 | Explicit non-empty dev bearer | `Development` | Enabled |
 
-`zeron login` and `zeron logout` operate on `session.json` while the engine is stopped. Login selects `Synced` for the next start; logout selects `Local` for the next start. The UI may update live authentication status, but the active `WorkspaceScope` still changes only after restart.
+`zeron login` and `zeron logout` operate on `session.json` while the engine is stopped. Login selects `Synced` for the next start; logout selects `Local` for the next start. The UI may update live authentication status, but the active `ProfileScope` still changes only after restart.
 
-The resolved profile selects the session snapshots, registry snapshot, run journals, and attachment cache that may contain workspace data:
+The resolved profile selects the session snapshots, registry snapshot, run journals, and attachment cache that may contain organization data:
 
 | Scope | Store and journals | Uploads |
 | --- | --- | --- |
@@ -96,11 +113,11 @@ Two persistent doc kinds. When sync is enabled, session docs ride the chat2 row 
    run journal), tail/diff sidecars. Constants carried over (`STREAM_COMMIT_MS=120`,
    `DO_FLUSH_MS=5s`, compaction at 8MB, retain 30d, tail 64).
 
-2. **Workspace registry doc** (per profile) — the `registry1` snapshot stores spaces (id, deviceId, path, name?, gitDetected, checkoutId), the chats index (id, deviceId, title, archived, cwd, branch, checkoutId, spaceId, lastSeenAt, lastMessagePreview/At, config), devices, session-status rows, and checkout-diff summary pointers. A space is a device+folder pair in the active profile; the owning device's `SpacesSync` stamps git presence so branch pickers and the diff sidebar can gate without another RPC. Local scope keeps the registry entirely in its profile store. Synced and development scopes join `/registry/{orgId}/ws`, backed by the ORG-SHARED room `reg2/{orgId}`: every member of the org reads and writes the same table, which is what makes shared sessions visible in every member's sidebar. Chat rows carry an optional `userId` (creator attribution). The former per-user privacy boundary (`reg1/{orgId}/{userId}`) is replaced by the org boundary.
+2. **Profile registry** — the `registry1` snapshot stores projects/spaces (id, deviceId, path, name?, gitDetected, checkoutId), the chats index (id, deviceId, title, archived, cwd, branch, checkoutId, spaceId, lastSeenAt, lastMessagePreview/At, config), devices, session-status rows, and checkout-diff summary pointers. A space is the wire representation of a project: a device+folder pair in the active profile. The owning device's `SpacesSync` stamps git presence so branch pickers and the diff sidebar can gate without another RPC. Local scope keeps the registry entirely in its profile store. Synced and development scopes join `/registry/{organizationId}/ws`, backed by the organization-shared room `reg2/{organizationId}`: every member of the Organization reads and writes the same table, which is what makes shared sessions visible in every member's sidebar. Chat rows carry an optional `userId` (creator attribution). The former per-user privacy boundary (`reg1/{organizationId}/{userId}`) is replaced by the Organization boundary.
 
    Writer discipline: each device writes its own device and session-status rows, rows for chats it hosts, and git stamps for spaces it owns. Creates, renames, archives, and seen marks are LWW sets accepted from any device. `deleteSpace` tombstones the space and every chat/session row in it in one commit. Presence uses ephemeral room frames rather than durable heartbeat writes.
 
-   Device membership is opt-out per profile (`setDeviceShared`, Settings → Devices): an unshared device withdraws its device row, sends no presence beats, and refuses every host path (`is_host`, claims, createChat/createSpace targeting itself) — org members cannot execute on it, while the user still participates in foreign-hosted chats as a guest. `deleteDevice` is retired-device cleanup: one batch tombstones the device row, its spaces, and every chat it hosts; a live shared device simply re-registers on its next boot (deletion is not a kick — org membership is).
+   Device membership is opt-out per profile (`setDeviceShared`, Settings → Devices): an unshared device withdraws its device row, sends no presence beats, and refuses every host path (`is_host`, claims, createChat/createSpace targeting itself) — Organization members cannot execute on it, while the user still participates in foreign-hosted chats as a guest. `deleteDevice` is retired-device cleanup: one batch tombstones the device row, its spaces, and every chat it hosts; a live shared device simply re-registers on its next boot (deletion is not a kick — Organization membership is).
 
    *Why one registry and not N tiny docs:* the sidebar needs one subscription for the whole list (grouping, resort animations, unseen markers). Its rows contain indexes rather than transcripts, so one local snapshot and, when enabled, one room connection remain bounded and cheap.
 
@@ -128,7 +145,7 @@ zeron/
                                  # entities, RPC envelopes (serde; ndjson framing);
                                  # `view` = the pure derivations both frontends share
                                  # (sort orders, staleness gating, grouping, boot gate)
-    doc/          zeron-doc      # session-doc + workspace-registry schemas, mirror layer,
+    doc/          zeron-doc      # session-doc + profile-registry schemas, mirror layer,
                                  # parts fold, continuations, command ledger, sidecars
     sync/         zeron-sync     # loro room client (join/VV backfill/fragments/backoff),
                                  # ephemeral presence, DocsStore (SQLite snapshots +
@@ -220,11 +237,12 @@ Direct ports of zeron behaviors (spec: feature-inventory §3):
   `codex exec --json`; model/reasoning/option catalogs ported from `packages/harness`.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches zeron, avoids libgit2 edge
   cases); worktrees under `~/.zeron/worktrees`; fs watchers (`notify`) + 2min repair; diff
-  capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff
+  capture (patch + numstat + untracked, 3MiB cap, sha256) → registry summary + DO diff
   sidecar.
 - **Agent accounts**: credential-slot swap (macOS Keychain via `security-framework`, files
   elsewhere), plan labels, usage probes, paste-code/browser-poll OAuth flows.
-- **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs); loopback
+- **Auth**: Comet Organizations backed by WorkOS through edge routes
+  (`/auth/exchange`, `/auth/refresh`, `/auth/organizations`); loopback
   callback server headed, paste-code headless; dev mode (no key ⇒ bearer = configured user id).
 
 ## 6. Edge plan (TypeScript, `edge/`)
@@ -232,7 +250,7 @@ Direct ports of zeron behaviors (spec: feature-inventory §3):
 Port `zeron/apps/edge` nearly verbatim (it is already Loro-native and smoke-tested: session room
 w/ hibernation + two-level compaction + daily alarm backups, device room byte relay + nudges +
 sidecar slots, R2 attachments, JWKS auth). Additions:
-1. Org-shared registry rooms (`/registry/{orgId}/ws` → `reg2/{orgId}`) with authenticated row sync and ephemeral device presence. Chat rooms have an org-shared generation too: `chat3/{orgId}/{chatId}` (roomGen 3) — every org member may join/push/read; only the host user (claimed via `?role=host`) may checkpoint, publish tail/diff sidecars, or reset. Blobs are org-scoped (`blob3/{orgId}/{chatId}/{partId}`), and the device-room `/nudge` gate admits org members — which is what carries agent-to-agent sends (`send_to_session`, engine MCP bridge `zeron mcp-bridge`) across users.
+1. Organization-shared registry rooms (`/registry/{organizationId}/ws` → `reg2/{organizationId}`) with authenticated row sync and ephemeral device presence. Chat rooms have an organization-shared generation too: `chat3/{organizationId}/{chatId}` (roomGen 3) — every Organization member may join/push/read; only the host user (claimed via `?role=host`) may checkpoint, publish tail/diff sidecars, or reset. Blobs are organization-scoped (`blob3/{organizationId}/{chatId}/{partId}`), and the device-room `/nudge` gate admits Organization members — which is what carries agent-to-agent sends (`send_to_session`, engine MCP bridge `zeron mcp-bridge`) across users.
 2. `/auth/*` routes absorbed from `apps/server` (WorkOS API key in Worker secret).
 3. Drop `/seed` migration path and legacy sync anything (fresh app).
 Hibernation hygiene: no idle timers (flush timer only while dirty), auto-response ping/pong —
@@ -243,7 +261,7 @@ per `docs/research/durable-objects-language.md`.
 - **Excluded**: token-usage display (profile heatmap, lifetime stats, per-message token columns,
   `WatchUsage`). Rate-limit meters on agent accounts are *kept* (separate concern; probed from
   CLIs, not CRDT-synced).
-- **Changed**: Postgres entity sync/server → workspace registry + edge; Electron/React/mugen → gpui with
+- **Changed**: Postgres entity sync/server → profile registry + edge; Electron/React/mugen → gpui with
   ported techniques; Node harness SDKs → subprocess protocols; WebRTC → device-room relay (zeron
   had already made this move); mobile app → out of scope for this repo.
 - **Kept verbatim**: session-doc schema shape + constants, command ledger rules, edge DO design,
@@ -262,8 +280,8 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
   turn, journal + doc writes, recovery test.
 - ✅ **M3 UI core** — shell (sidebar/panes/header), transcript (virtualized, markdown, streaming,
   stick-to-bottom), composer (send/steer/stop, question panel); local chat fully usable headed.
-- ✅ **M4 Multi-device** — device-room host/client virtual sockets, remote device control, workspace
-  registry sync, WorkOS auth + org gate, presence. Proven live by `scripts/e2e-smoke.sh`:
+- ✅ **M4 Multi-device** — device-room host/client virtual sockets, remote device control, profile
+  registry sync, WorkOS auth + Organization membership gate, presence. Proven live by `scripts/e2e-smoke.sh`:
   two headless engines against a real edge — B queues a run into the chat doc, the durable
   nudge wakes host A, A executes (mock harness), transcript + session status sync back to B.
 - 🟡 **M5 Full surface** — terminals, diff pane, repo/branch/folder pickers + worktrees,

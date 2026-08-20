@@ -49,7 +49,7 @@ fn write_claude_login(config: &AgentAccountsConfig, email: &str, uuid: &str, tok
                 "accountUuid": uuid,
                 "emailAddress": email,
                 "displayName": "Test User",
-                "organizationName": "Test Org",
+                "organizationName": "Test Organization",
                 "organizationType": "claude_max",
                 "organizationRateLimitTier": "default_claude_max_20x",
             },
@@ -188,7 +188,7 @@ async fn claude_slot_swap_round_trip() {
         "plan label parse"
     );
     assert_eq!(alice.display_name.as_deref(), Some("Test User"));
-    assert_eq!(alice.organization.as_deref(), Some("Test Org"));
+    assert_eq!(alice.organization.as_deref(), Some("Test Organization"));
     assert!(alice.switchable);
     assert!(snapshot.warnings.is_empty());
     let alice_id = alice.id.clone();
@@ -488,7 +488,7 @@ async fn uploads_chunk_commit_readback_and_jail() {
         uploads.read_chunk(&sneaky, 0, &[]).is_err(),
         "traversal rejected"
     );
-    // …but a workspace-known cwd root admits its files.
+    // …but a registry-known working-directory root admits its files.
     let ok = uploads
         .read_chunk(&outside.to_string_lossy(), 0, &[tmp.path().to_path_buf()])
         .expect("cwd-rooted read");
@@ -540,7 +540,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         ],
     );
     let chat_id = "chat-title-1";
-    core.workspace
+    core.registry
         .create_space(
             "space-title",
             &core.device_id,
@@ -549,7 +549,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
             true,
         )
         .expect("create space");
-    core.workspace
+    core.registry
         .create_chat(
             chat_id,
             Some("space-title"),
@@ -558,7 +558,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
             Some(worktree.path.clone()),
         )
         .expect("create chat");
-    core.workspace
+    core.registry
         .set_chat_branch(chat_id, &worktree.branch)
         .expect("set branch");
 
@@ -583,7 +583,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
 
     // The mock's scripted reply doubles as the titling model's output.
     let chat = wait_for("chat title", || {
-        core.workspace
+        core.registry
             .chat(chat_id)
             .ok()
             .flatten()
@@ -605,7 +605,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     );
 
     // A titled chat is never re-titled: rename, run again, title sticks.
-    core.workspace
+    core.registry
         .rename_chat(chat_id, "My Custom Name")
         .expect("rename");
     let request = zeron_proto::RunRequest {
@@ -627,7 +627,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .await
         .expect("second dispatch");
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let chat = core.workspace.chat(chat_id).expect("chat").expect("row");
+    let chat = core.registry.chat(chat_id).expect("chat").expect("row");
     assert_eq!(chat.title.as_deref(), Some("My Custom Name"));
     core.shutdown().await;
 }

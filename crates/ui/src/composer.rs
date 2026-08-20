@@ -1054,7 +1054,7 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentMentionSpan {
     pub range: Range<usize>,
-    /// Full workspace-relative path (labels can be shortened to basenames).
+    /// Full Working Directory-relative path (labels can be shortened to basenames).
     pub path: SharedString,
     pub is_dir: bool,
 }
@@ -1344,7 +1344,7 @@ impl ComposerInput {
         Self {
             key_context,
             // GPUI tab traversal is opt-in. Inputs participate so Tab can
-            // leave the composer for the avatar/Team control and return.
+            // leave the composer for the avatar/Organization control and return.
             focus_handle: cx.focus_handle().tab_stop(true),
             content: String::new(),
             placeholder: placeholder.into(),
@@ -3401,7 +3401,7 @@ impl EventEmitter<ComposerEvent> for Composer {}
 
 /// Profile-bound input that a runtime handoff would discard or interrupt.
 /// Kept as a value object so Shell can build one destructive preflight for
-/// avatar-menu and Settings Team changes without reaching into Composer state.
+/// avatar-menu and Settings Organization changes without reaching into Composer state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ComposerUnsentRisk {
     pub current_input: bool,
@@ -3600,7 +3600,7 @@ impl Composer {
 
     /// The composer defaults file also contains profile identities. Keep the
     /// user's device-local model/reasoning/favorite preferences, but never
-    /// seed a replacement Team with the previous Team's device or project id.
+    /// seed a replacement Organization with the previous Organization's device or project id.
     pub(crate) fn clear_profile_targets(data_dir: &Path) {
         let mut defaults = ComposerDefaults::load(data_dir);
         let had_device = defaults.device.take().is_some();
@@ -3967,7 +3967,7 @@ impl Composer {
         }
         let request = self.mention.request;
         self.mention_task = Some(cx.spawn(async move |this, cx| {
-            // A short debounce prevents one full workspace walk per keystroke
+            // A short debounce prevents one full Working Directory walk per keystroke
             // during normal typing. The generation check below still guards
             // requests that were already in flight when the query changed.
             cx.background_executor()
@@ -4593,9 +4593,9 @@ impl Composer {
             cx.notify();
             return;
         };
-        // Capture the fixed runtime profile once. Team AuthStatus can change
+        // Capture the fixed runtime profile once. Organization AuthStatus can change
         // while this async send is still finishing; late seeds must remain in
-        // the old namespace instead of following mutable auth into a new Team.
+        // the old namespace instead of following mutable auth into a new Organization.
         let attachment_namespace = self.state.read(cx).profile_cache_namespace();
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).

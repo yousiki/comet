@@ -1,5 +1,5 @@
 // Zeron for iOS — a viewport onto the zeron mesh. The phone is a peer
-// device: it joins the workspace and session doc rooms and drives remote
+// device: it joins the Organization registry and session rooms and drives remote
 // engines through the durable command queue.
 
 import SwiftUI
@@ -24,8 +24,8 @@ struct ZeronApp: App {
                         model.flushDocs()
                     } else if phase == .active {
                         // Suspension kills sockets without running any
-                        // failure path — without this kick the workspace
-                        // room stays dead after foregrounding while chat
+                        // failure path — without this kick the registry room
+                        // stays dead after foregrounding while chat
                         // views reconnect on open (frozen sidebar/Working
                         // indicators against live transcripts, 2026-08-04).
                         model.foregrounded()
@@ -43,8 +43,8 @@ struct RootView: View {
             switch model.phase {
             case .signedOut:
                 SignInView()
-            case .pickingOrg(let tokens, let orgs):
-                OrgPickerView(tokens: tokens, orgs: orgs)
+            case .pickingOrganization(let tokens, let organizations):
+                OrganizationPickerView(tokens: tokens, organizations: organizations)
             case .ready:
                 HomeView()
             }

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Interactive local playground for org-shared sessions + agent-to-agent sends.
+# Interactive local playground for Organization-shared sessions + agent-to-agent sends.
 # NO Cloudflare account needed: the edge runs locally under `wrangler dev`
-# with AUTH_MODE=dev (bearer string IS the identity, `user@org` form).
+# with AUTH_MODE=dev (bearer string IS the identity, `user@organization` form).
 #
 # Starts:
 #   1. the local edge worker on :27640 (unless one is already healthy)
-#   2. alice's HEADLESS engine (:27801) — simulates the teammate/VPS side
-# then prints the command that opens bob's GUI against the same org.
+#   2. alice's HEADLESS engine (:27801) — simulates the other member/VPS side
+# then prints the command that opens bob's GUI against the same Organization.
 #
-# Both users share org "myteam": every session either side creates is visible
+# Both users share Organization "myorganization": every session either side creates is visible
 # and drivable by the other, and agents can message each other's sessions.
 #
 # Usage: scripts/try-shared.sh [claude|mock]   (harness; default claude,
@@ -21,7 +21,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 EDGE_PORT="${ZERON_E2E_EDGE_PORT:-27640}"
 EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
-ORG=myteam
+ORGANIZATION_ID=myorganization
 
 HARNESS="${1:-claude}"
 if [[ "$HARNESS" == "claude" ]] && ! command -v claude >/dev/null 2>&1; then
@@ -45,16 +45,16 @@ else
   until curl -sf -m 3 "$EDGE_URL/health" >/dev/null 2>&1; do sleep 1; done
 fi
 
-# ── 2. alice: headless engine (the "teammate on a VPS") ────────────────────
+# ── 2. alice: headless engine (the "other member on a VPS") ────────────────
 echo
 echo "alice: headless engine on ipc :27801 (data: ~/.zeron-try-alice)"
 echo "-------------------------------------------------------------------"
 cat <<EOF
-In ANOTHER terminal, open bob's GUI (same org, different user):
+In ANOTHER terminal, open bob's GUI (same Organization, different user):
 
   ZERON_DATA_DIR=~/.zeron-try-bob ZERON_IPC_PORT=27802 \\
-  ZERON_EDGE_URL=$EDGE_URL ZERON_EDGE_TOKEN=bob@$ORG \\
-  ZERON_ORG_ID=$ORG ZERON_USER_ID=bob ZERON_WORKOS_CLIENT_ID= \\
+  ZERON_EDGE_URL=$EDGE_URL ZERON_EDGE_TOKEN=bob@$ORGANIZATION_ID \\
+  ZERON_ORGANIZATION_ID=$ORGANIZATION_ID ZERON_USER_ID=bob ZERON_WORKOS_CLIENT_ID= \\
   ZERON_HARNESS=$HARNESS $ZERON
 
 Things to try in bob's GUI:
@@ -68,8 +68,8 @@ Things to try in bob's GUI:
 
 To drive alice's side from a THIRD terminal (optional):
   ZERON_DATA_DIR=~/.zeron-try-alice2 ZERON_IPC_PORT=27803 \\
-  ZERON_EDGE_URL=$EDGE_URL ZERON_EDGE_TOKEN=alice@$ORG \\
-  ZERON_ORG_ID=$ORG ZERON_USER_ID=alice ZERON_WORKOS_CLIENT_ID= \\
+  ZERON_EDGE_URL=$EDGE_URL ZERON_EDGE_TOKEN=alice@$ORGANIZATION_ID \\
+  ZERON_ORGANIZATION_ID=$ORGANIZATION_ID ZERON_USER_ID=alice ZERON_WORKOS_CLIENT_ID= \\
   ZERON_HARNESS=$HARNESS $ZERON
 -------------------------------------------------------------------
 EOF
@@ -77,7 +77,7 @@ EOF
 exec env \
   ZERON_DATA_DIR="$HOME/.zeron-try-alice" ZERON_IPC_PORT=27801 \
   ZERON_DEVICE_NAME=alice-vps \
-  ZERON_EDGE_URL="$EDGE_URL" ZERON_EDGE_TOKEN="alice@$ORG" \
-  ZERON_ORG_ID="$ORG" ZERON_USER_ID=alice ZERON_WORKOS_CLIENT_ID= \
+  ZERON_EDGE_URL="$EDGE_URL" ZERON_EDGE_TOKEN="alice@$ORGANIZATION_ID" \
+  ZERON_ORGANIZATION_ID="$ORGANIZATION_ID" ZERON_USER_ID=alice ZERON_WORKOS_CLIENT_ID= \
   ZERON_HARNESS="$HARNESS" RUST_LOG=info \
   "$ZERON" headless

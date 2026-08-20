@@ -98,9 +98,9 @@ struct SessionView: View {
         }
     }
 
-    /// "space @ device" — short, like the home dropdown's rows. The space
-    /// NAME (not the cwd basename: they differ for renamed spaces and
-    /// worktree sessions), falling back to the cwd when the space row is gone.
+    /// "project @ device" — short, like the home dropdown's rows. The project
+    /// name (not the cwd basename: they differ for renamed projects and
+    /// worktree sessions), falling back to the cwd when the project row is gone.
     private var subtitle: String? {
         guard let chat else { return nil }
         let space = model.space(for: chat)?.displayName
@@ -211,7 +211,7 @@ struct SessionView: View {
         if let demo = model.demo {
             return effectiveStatus(demo.sessions[chat.id], now: nowMs())
         }
-        return effectiveStatus(model.workspace?.sessions[chat.id], now: nowMs())
+        return effectiveStatus(model.registry?.sessions[chat.id], now: nowMs())
     }
 
     /// Reserved 24pt status strip (shell.rs render_status_strip) — Working
@@ -248,7 +248,7 @@ struct SessionView: View {
     }
 
     private func sessionStartedAt(chat: Chat) -> Int64 {
-        let row = model.demo?.sessions[chat.id] ?? model.workspace?.sessions[chat.id]
+        let row = model.demo?.sessions[chat.id] ?? model.registry?.sessions[chat.id]
         return row?.startedAt ?? row?.updatedAt ?? nowMs()
     }
 }

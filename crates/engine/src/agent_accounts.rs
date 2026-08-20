@@ -710,7 +710,7 @@ impl AgentAccounts {
             ));
         };
 
-        // Best-effort profile fetch — fills in the plan/org the way Claude Code does.
+        // Best-effort profile fetch — fills in the plan/organization the way Claude Code does.
         let profile: Option<serde_json::Value> = match self
             .inner
             .http
@@ -1418,7 +1418,7 @@ fn slot_id_for(harness: HarnessId, account_key: &str) -> String {
     crate::repos::hex(&digest)[..16].to_string()
 }
 
-/// Pretty plan label from Claude's org type + rate-limit tier ("Max 20×").
+/// Pretty plan label from Claude's organization type + rate-limit tier ("Max 20×").
 fn claude_plan(org_type: Option<&str>, tier: Option<&str>) -> Option<String> {
     let base = match org_type {
         Some("claude_max") => "Max",

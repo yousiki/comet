@@ -342,7 +342,7 @@ enum RegistryStateOutcome: Equatable {
 /// The local registry replica: authoritative rows (server truth, replaced
 /// wholesale by state/rows frames — clients never re-merge server rows) plus
 /// a pending op-batch queue (local writes not yet acked, replayed over the
-/// authoritative rows for every read). Pure data, no I/O — WorkspaceStore
+/// authoritative rows for every read). Pure data, no I/O — RegistryStore
 /// drives it on the main actor; unit tests drive it directly.
 final class RegistryDoc {
     /// Ops per push batch cap is 500 server-side; seeds chunk under it.
@@ -498,7 +498,7 @@ final class RegistryDoc {
         pending.append(RegistryPendingBatch(batch: "b-\(nextHlc())", ops: ops))
     }
 
-    /// Seeds can exceed the server's 500-op batch cap on a large workspace —
+    /// Seeds can exceed the server's 500-op batch cap on a large registry —
     /// chunk them (the cascade-delete batches real writes produce never do).
     private func enqueueSeed(_ ops: [RegistryOp]) {
         guard !ops.isEmpty else { return }

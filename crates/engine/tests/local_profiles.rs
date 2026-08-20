@@ -6,8 +6,8 @@ use std::sync::{Arc, Barrier, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use zeron_engine::{
-    AuthState, Engine, EngineConfig, EngineCore, EngineInfo, EngineProfile, EngineProfileIdentity,
-    HarnessId, WorkspaceScope, default_registry,
+    AuthState, Engine, EngineConfig, EngineCore, EngineInfo, EngineProfile, HarnessId,
+    ProfileIdentity, ProfileScope, default_registry,
 };
 use zeron_rpc::{memory_client, methods};
 
@@ -23,7 +23,7 @@ fn config(
         edge_token: edge_token.map(str::to_string),
         ipc_port: 0,
         default_harness: HarnessId::Mock,
-        org_id: None,
+        organization_id: None,
         workos_client_id: workos_client_id.map(str::to_string),
     }
 }
@@ -46,19 +46,29 @@ async fn engine_info_announces_the_fixed_profile_instead_of_live_auth() {
     // direct test core has none. EngineInfo must still describe the immutable
     // profile that opened the stores.
     let client = memory_client(core.rpc_service());
-    let info: EngineInfo = client
-        .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+    let info_wire = client
+        .call(methods::ENGINE_INFO, serde_json::json!({}))
         .await
         .expect("engine info");
+    assert_eq!(info_wire["profileScope"], "synced");
+    assert_eq!(info_wire["workspaceScope"], "synced");
+    let info: EngineInfo = serde_json::from_value(info_wire).expect("typed engine info");
 
-    assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+    assert_eq!(info.profile_scope, ProfileScope::Synced);
     assert_eq!(
         info.profile,
-        Some(EngineProfileIdentity {
+        Some(ProfileIdentity {
             user_id: "user-1".into(),
             organization_id: "org-old".into(),
         })
     );
+
+    let sync_status = client
+        .call(methods::SYNC_STATUS, serde_json::json!({}))
+        .await
+        .expect("sync status");
+    assert!(sync_status.get("registry").is_some());
+    assert_eq!(sync_status["workspace"], sync_status["registry"]);
     shutdown(core).await;
 }
 
@@ -73,7 +83,7 @@ fn concurrent_engine_info(
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                Engine::engine_info(&config, WorkspaceScope::Local)
+                Engine::engine_info(&config, ProfileScope::Local)
                     .expect("resolve concurrent engine info")
                     .device_id
             })
@@ -154,7 +164,7 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
     let local_upload = {
         let core = assemble(local_profile.clone());
         let device_id = core.device_id.clone();
-        core.workspace
+        core.registry
             .create_space(
                 "local-space",
                 &device_id,
@@ -163,10 +173,10 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
                 false,
             )
             .expect("create local space");
-        core.workspace
+        core.registry
             .create_chat("local-chat", Some("local-space"), None, None, None)
             .expect("create local chat");
-        core.workspace
+        core.registry
             .rename_chat("local-chat", "Private local session")
             .expect("name local chat");
         core.doc_host
@@ -191,7 +201,7 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
         let core = assemble(synced_profile.clone());
         assert_eq!(core.device_id, local_upload.0, "device identity is global");
         assert!(
-            core.workspace
+            core.registry
                 .chat("local-chat")
                 .expect("read synced chats")
                 .is_none(),
@@ -207,7 +217,7 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
             "unexpected jail error: {error}"
         );
 
-        core.workspace
+        core.registry
             .create_space(
                 "synced-space",
                 &core.device_id,
@@ -216,7 +226,7 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
                 false,
             )
             .expect("create synced space");
-        core.workspace
+        core.registry
             .create_chat("synced-chat", Some("synced-space"), None, None, None)
             .expect("create synced chat");
         shutdown(core).await;
@@ -233,7 +243,7 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
         let core = assemble(reopened_profile);
         assert_eq!(core.device_id, local_upload.0);
         let chat = core
-            .workspace
+            .registry
             .chat("local-chat")
             .expect("read local chat")
             .expect("local chat survived restart");
@@ -249,7 +259,7 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].id, "local-message");
         assert!(
-            core.workspace
+            core.registry
                 .chat("synced-chat")
                 .expect("read local chats")
                 .is_none(),
@@ -351,7 +361,7 @@ async fn existing_session_opens_the_historical_cloud_layout_in_place() {
     let historical = EngineProfile::synced(dir.path(), "legacy-org", "legacy-user");
     {
         let core = assemble(historical.clone());
-        core.workspace
+        core.registry
             .create_space(
                 "legacy-space",
                 &core.device_id,
@@ -360,7 +370,7 @@ async fn existing_session_opens_the_historical_cloud_layout_in_place() {
                 false,
             )
             .expect("create historical space");
-        core.workspace
+        core.registry
             .create_chat("legacy-chat", Some("legacy-space"), None, None, None)
             .expect("create historical chat");
         shutdown(core).await;
@@ -378,12 +388,12 @@ async fn existing_session_opens_the_historical_cloud_layout_in_place() {
         None,
     );
     let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
+    let scope = Engine::initial_profile_scope(&auth);
     let resolved = Engine::resolve_profile(&config, &auth, scope)
         .expect("resolve existing session")
-        .expect("existing org is ready");
+        .expect("existing organization is ready");
 
-    assert_eq!(scope, WorkspaceScope::Synced);
+    assert_eq!(scope, ProfileScope::Synced);
     assert_eq!(resolved, historical);
     assert_eq!(
         resolved.store_root(),
@@ -393,7 +403,7 @@ async fn existing_session_opens_the_historical_cloud_layout_in_place() {
     {
         let core = assemble(resolved);
         assert!(
-            core.workspace
+            core.registry
                 .chat("legacy-chat")
                 .expect("read historical layout")
                 .is_some(),
@@ -500,11 +510,11 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<(String, Str
     Some((target, String::from_utf8_lossy(&body).into_owned()))
 }
 
-fn fake_jwt(org_id: &str) -> String {
+fn fake_jwt(organization_id: &str) -> String {
     let claims = serde_json::json!({
         "iat": 1_000,
         "exp": 4_600,
-        "org_id": org_id,
+        "org_id": organization_id,
     });
     format!("e30.{}.sig", base64url(claims.to_string().as_bytes()))
 }
@@ -546,7 +556,7 @@ async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = config(dir.path(), edge.url.clone(), Some("client_test"), None);
     let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
+    let scope = Engine::initial_profile_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
         .expect("resolve local profile")
         .expect("local profile is ready");
@@ -554,7 +564,7 @@ async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
         .await
         .expect("assemble local runtime");
 
-    assert_eq!(scope, WorkspaceScope::Local);
+    assert_eq!(scope, ProfileScope::Local);
     assert!(runtime.core().links().is_none());
 
     let sign_in_url = auth.start_headless_sign_in();
@@ -563,12 +573,12 @@ async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
         .await
         .expect("complete sign in");
     assert!(
-        matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "cloud-org")
+        matches!(auth.state(), AuthState::SignedIn { organization_id: Some(organization_id), .. } if organization_id == "cloud-org")
     );
 
     runtime
         .core()
-        .workspace
+        .registry
         .create_space(
             "still-local-space",
             &runtime.core().device_id,
@@ -579,7 +589,7 @@ async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
         .expect("create space after sign in");
     runtime
         .core()
-        .workspace
+        .registry
         .create_chat(
             "still-local-chat",
             Some("still-local-space"),
@@ -607,7 +617,7 @@ async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
         .expect("commit local upload after sign in");
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(runtime.workspace_scope(), WorkspaceScope::Local);
+    assert_eq!(runtime.profile_scope(), ProfileScope::Local);
     assert!(runtime.core().links().is_none());
     assert!(Path::new(&upload).starts_with(dir.path().join("profiles/local/uploads")));
     let requests = edge.requests.lock().expect("requests lock").clone();

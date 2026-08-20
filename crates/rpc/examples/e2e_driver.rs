@@ -118,8 +118,8 @@ async fn main() {
         .unwrap_or_else(|| "27802".into())
         .parse()
         .expect("B port");
-    // Optional: assert the user entry's authorship (org-shared sessions —
-    // e2e-shared-org.sh passes the sending engine's user id).
+    // Optional: assert the user entry's authorship (organization-shared sessions —
+    // e2e-shared-organization.sh passes the sending engine's user id).
     let expect_user: Option<String> = args.next();
 
     let a = connect_ws(&format!("ws://127.0.0.1:{a_port}"))
@@ -191,7 +191,7 @@ async fn main() {
     }
     pass("space row synced A -> edge -> B (owner = A)");
 
-    // 3. Workspace sync A → edge → B: the chat row appears in B's WatchChats.
+    // 3. Registry sync A → edge → B: the chat row appears in B's WatchChats.
     let hosted_by = wait_stream(
         &b,
         methods::WATCH_CHATS,

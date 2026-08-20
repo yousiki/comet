@@ -11,7 +11,7 @@
 //! owning device via `ReadAttachmentChunk`; nothing is mirrored to the edge.
 //!
 //! `read_chunk` serves transcript images back in 45KB base64 chunks. Path jail:
-//! only files under the uploads dir or a workspace-known chat cwd are readable
+//! only files under the uploads dir or a known chat working directory are readable
 //! (the RPC layer supplies the cwd roots) — and only supported image types, as
 //! in zeron.
 
@@ -240,7 +240,7 @@ impl Uploads {
             .then(|| target.to_string_lossy().to_string())
     }
 
-    /// Read one 45KB chunk of an attachment. `extra_roots` are the workspace's
+    /// Read one 45KB chunk of an attachment. `extra_roots` are registry-known
     /// known chat cwds — together with the uploads dir they form the path jail.
     pub fn read_chunk(
         &self,
