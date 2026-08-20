@@ -29,7 +29,7 @@ use crate::changes::Changes;
 use crate::icons;
 use crate::markdown::render;
 use crate::popover::{self, Loadable};
-use crate::state::AppState;
+use crate::state::{AppState, call_with_legacy_method};
 use crate::theme::{self, Theme};
 
 /// Tree column width (Zed's project panel default neighborhood).
@@ -320,13 +320,13 @@ impl FileExplorer {
                     serde_json::Value::String(target.clone()),
                 );
             }
-            let result = engine
-                .client()
-                .call(
-                    methods::READ_WORKING_DIRECTORY_FILE,
-                    serde_json::Value::Object(params),
-                )
-                .await;
+            let result = call_with_legacy_method(
+                engine.client(),
+                methods::READ_WORKING_DIRECTORY_FILE,
+                methods::LEGACY_READ_WORKSPACE_FILE,
+                serde_json::Value::Object(params),
+            )
+            .await;
             this.update(cx, |this, cx| {
                 // A newer click wins.
                 if this.open_path.as_deref() != Some(path.as_str()) {
