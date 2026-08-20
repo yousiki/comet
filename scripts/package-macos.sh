@@ -28,6 +28,10 @@ rm -rf "$APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/zeron" "$APP/Contents/MacOS/zeron"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
+install -m 644 "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
+install -m 644 "$ROOT/crates/ui/assets/fonts/MapleMono-OFL.txt" "$APP/Contents/Resources/MapleMono-OFL.txt"
+install -m 644 "$ROOT/crates/ui/assets/fonts/NerdFonts-LICENSE.txt" "$APP/Contents/Resources/NerdFonts-LICENSE.txt"
+install -m 644 "$ROOT/crates/ui/assets/fonts/NerdFonts-LICENSE-AUDIT.md" "$APP/Contents/Resources/NerdFonts-LICENSE-AUDIT.md"
 
 # Icon: iconset from the pre-masked macOS icon (squircle + margins + shadow
 # baked into dist/macos/icon-1024.png — sips can't alpha-mask, so the mask is

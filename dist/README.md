@@ -13,6 +13,8 @@ Produces `target/package/zeron-<version>-linux-<arch>.tar.gz` containing:
 - `zeron.desktop` — XDG desktop entry
 - `zeron.png` — 1024×1024 Zeron app icon
 - `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
+- third-party font notices and license texts (also installed under
+  `~/.local/share/doc/zeron`)
 
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 `strip = "symbols"` for distribution builds.
@@ -29,6 +31,8 @@ dmg. The auto-update tarball retains an internal `Zeron.app` path so older
 installed builds can update into Zeron. CI runs this on tags
 (`.github/workflows/release.yml`). The manual steps it automates, for reference
 (run on a macOS host — gpui needs Metal; no cross-build from Linux):
+
+Font notices and license texts are placed in `Zeron.app/Contents/Resources`.
 
 1. Build the universal (or per-arch) binary:
    ```sh

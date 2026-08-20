@@ -32,6 +32,10 @@ mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/zeron"
 install -m 644 "$ROOT/dist/zeron.desktop" "$STAGE/zeron.desktop"
 install -m 644 "$ROOT/dist/zeron.png" "$STAGE/zeron.png"
+install -m 644 "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/THIRD_PARTY_NOTICES.md"
+install -m 644 "$ROOT/crates/ui/assets/fonts/MapleMono-OFL.txt" "$STAGE/MapleMono-OFL.txt"
+install -m 644 "$ROOT/crates/ui/assets/fonts/NerdFonts-LICENSE.txt" "$STAGE/NerdFonts-LICENSE.txt"
+install -m 644 "$ROOT/crates/ui/assets/fonts/NerdFonts-LICENSE-AUDIT.md" "$STAGE/NerdFonts-LICENSE-AUDIT.md"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
@@ -41,6 +45,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/zeron" "$HOME/.local/bin/zeron"
 install -Dm644 "$HERE/zeron.desktop" "$HOME/.local/share/applications/zeron.desktop"
 install -Dm644 "$HERE/zeron.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/zeron.png"
+install -Dm644 "$HERE/THIRD_PARTY_NOTICES.md" "$HOME/.local/share/doc/zeron/THIRD_PARTY_NOTICES.md"
+install -Dm644 "$HERE/MapleMono-OFL.txt" "$HOME/.local/share/doc/zeron/MapleMono-OFL.txt"
+install -Dm644 "$HERE/NerdFonts-LICENSE.txt" "$HOME/.local/share/doc/zeron/NerdFonts-LICENSE.txt"
+install -Dm644 "$HERE/NerdFonts-LICENSE-AUDIT.md" "$HOME/.local/share/doc/zeron/NerdFonts-LICENSE-AUDIT.md"
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "$HOME/.local/share/applications" || true
 echo "Installed. Make sure ~/.local/bin is on your PATH."

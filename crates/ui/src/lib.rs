@@ -63,8 +63,20 @@ static FONT_GEIST_MEDIUM: &[u8] = include_bytes!("../assets/fonts/Geist-Medium.t
 static FONT_GEIST_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/Geist-SemiBold.ttf");
 static FONT_GEIST_BOLD: &[u8] = include_bytes!("../assets/fonts/Geist-Bold.ttf");
 
+/// Terminal-only Maple Mono NF CN v7.9 faces — the complete upstream glyph set,
+/// including CJK and Nerd Font private-use glyphs. Keep all four faces because
+/// ANSI output can independently request bold and italic text.
+static FONT_MAPLE_MONO_NF_CN_REGULAR: &[u8] =
+    include_bytes!("../assets/fonts/MapleMono-NF-CN-Regular.ttf");
+static FONT_MAPLE_MONO_NF_CN_BOLD: &[u8] =
+    include_bytes!("../assets/fonts/MapleMono-NF-CN-Bold.ttf");
+static FONT_MAPLE_MONO_NF_CN_ITALIC: &[u8] =
+    include_bytes!("../assets/fonts/MapleMono-NF-CN-Italic.ttf");
+static FONT_MAPLE_MONO_NF_CN_BOLD_ITALIC: &[u8] =
+    include_bytes!("../assets/fonts/MapleMono-NF-CN-BoldItalic.ttf");
+
 /// Register the embedded fonts with the gpui text system. Failure is non-fatal:
-/// the theme's system fallbacks take over (same families the CSS stack names).
+/// GPUI's platform font fallback stack handles any family it cannot resolve.
 fn register_fonts(cx: &App) {
     if let Err(err) = cx.text_system().add_fonts(vec![
         Cow::Borrowed(FONT_GEIST),
@@ -72,8 +84,12 @@ fn register_fonts(cx: &App) {
         Cow::Borrowed(FONT_GEIST_MEDIUM),
         Cow::Borrowed(FONT_GEIST_SEMIBOLD),
         Cow::Borrowed(FONT_GEIST_BOLD),
+        Cow::Borrowed(FONT_MAPLE_MONO_NF_CN_REGULAR),
+        Cow::Borrowed(FONT_MAPLE_MONO_NF_CN_BOLD),
+        Cow::Borrowed(FONT_MAPLE_MONO_NF_CN_ITALIC),
+        Cow::Borrowed(FONT_MAPLE_MONO_NF_CN_BOLD_ITALIC),
     ]) {
-        tracing::warn!(error = %err, "failed to register embedded Geist fonts");
+        tracing::warn!(error = %err, "failed to register embedded fonts");
     }
 }
 

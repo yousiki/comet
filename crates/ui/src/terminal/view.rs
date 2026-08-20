@@ -24,6 +24,7 @@ use super::emulator::{CellColor, CellSnapshot, Side};
 use super::panel::TerminalPanel;
 
 /// Terminal font metrics (mono).
+pub const TERM_FONT_FAMILY: &str = "Maple Mono NF CN";
 pub const TERM_FONT_SIZE: f32 = 13.0;
 pub const TERM_LINE_HEIGHT: f32 = 18.0;
 /// Inner padding of the grid area.
@@ -524,14 +525,14 @@ impl gpui::Element for TerminalElement {
         let theme = Theme::of(cx).clone();
         // Ligatures OFF. A terminal is a fixed grid: the shaper must emit one
         // cell-width advance per character, and a contextual substitution
-        // (Geist Mono ligates `--`, `->`, …) collapses several cells into
+        // (Maple Mono ligates `--`, `->`, …) collapses several cells into
         // fewer glyphs, so the row renders SHORT while the cursor — a quad at
         // `cell_w * col` — stays on the true column. That is the `codex
         // --yolo` → `codex--yolo` report: the space is in the grid and went
         // to the pty (the command runs), only the painted run lost a cell.
         // The landing page disables the same three features on its ASCII art
         // for the same reason.
-        let mut mono = font(theme.font_mono.clone());
+        let mut mono = font(TERM_FONT_FAMILY);
         mono.features = gpui::FontFeatures(std::sync::Arc::new(vec![
             ("liga".into(), 0),
             ("calt".into(), 0),
