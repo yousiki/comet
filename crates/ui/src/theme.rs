@@ -143,9 +143,11 @@ pub const INK_FILL_SCALE: f32 = 1.0;
 /// keeps separators legible instead of dissolving into the panel.
 pub const INK_HAIRLINE_SCALE: f32 = 1.35;
 
-/// Paint-only syntax colors. The hues follow the Git history graph's lane
-/// palette (indigo, pink, emerald, amber, red, neutral), while light-mode
-/// variants are darkened enough to remain readable as text on white.
+/// Paint-only syntax colors. The hue families extend the Git history graph's
+/// lane palette (indigo, pink, emerald, amber, red, neutral) with a sky tone
+/// for callables/properties, at full chroma — code is read, not decoration,
+/// so unlike graph lanes these tones are not softened. Light-mode variants
+/// are darkened enough to remain readable as text on white.
 #[derive(Debug, Clone)]
 pub struct SyntaxPalette {
     pub comment: Hsla,
@@ -205,12 +207,13 @@ impl SyntaxPalette {
     }
 
     fn dark(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
-        // Same sources and 72% saturation treatment as history::graph_color.
-        let indigo = git_graph_tone(oklch(0.673, 0.182, 276.935));
-        let pink = git_graph_tone(oklch(0.718, 0.202, 349.761));
-        let emerald = git_graph_tone(oklch(0.765, 0.177, 163.223));
-        let amber = git_graph_tone(oklch(0.828, 0.189, 84.429));
-        let red = git_graph_tone(danger);
+        // Same hue sources as history::graph_color, plus sky, at full chroma.
+        let indigo = oklch(0.673, 0.182, 276.935);
+        let pink = oklch(0.718, 0.202, 349.761);
+        let emerald = oklch(0.765, 0.177, 163.223);
+        let amber = oklch(0.828, 0.189, 84.429);
+        let sky = oklch(0.746, 0.160, 232.661);
+        let red = danger;
         Self {
             comment,
             keyword: indigo,
@@ -222,11 +225,11 @@ impl SyntaxPalette {
             type_name: amber,
             type_builtin: emerald,
             constructor: amber,
-            function: indigo,
-            function_builtin: pink,
+            function: sky,
+            function_builtin: sky,
             macro_name: pink,
-            property: amber,
-            constant: emerald,
+            property: sky,
+            constant: amber,
             variable: text,
             variable_special: pink,
             parameter: text,
@@ -241,11 +244,12 @@ impl SyntaxPalette {
 
     fn light(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
         // Match the light graph's hue families at text-safe lightness.
-        let indigo = git_graph_tone(oklch(0.47, 0.20, 276.966));
-        let pink = git_graph_tone(oklch(0.47, 0.17, 0.584));
-        let emerald = git_graph_tone(oklch(0.46, 0.11, 163.225));
-        let amber = git_graph_tone(oklch(0.47, 0.12, 48.998));
-        let red = git_graph_tone(danger);
+        let indigo = oklch(0.47, 0.20, 276.966);
+        let pink = oklch(0.47, 0.17, 0.584);
+        let emerald = oklch(0.46, 0.11, 163.225);
+        let amber = oklch(0.47, 0.12, 48.998);
+        let sky = oklch(0.47, 0.13, 237.0);
+        let red = danger;
         Self {
             comment,
             keyword: indigo,
@@ -257,11 +261,11 @@ impl SyntaxPalette {
             type_name: amber,
             type_builtin: emerald,
             constructor: amber,
-            function: indigo,
-            function_builtin: pink,
+            function: sky,
+            function_builtin: sky,
             macro_name: pink,
-            property: amber,
-            constant: emerald,
+            property: sky,
+            constant: amber,
             variable: text,
             variable_special: pink,
             parameter: text,
@@ -273,13 +277,6 @@ impl SyntaxPalette {
             invalid: red,
         }
     }
-}
-
-/// Git history intentionally softens lane saturation so the graph remains
-/// colorful without competing with content. Syntax uses the same treatment.
-fn git_graph_tone(mut color: Hsla) -> Hsla {
-    color.s *= 0.72;
-    color
 }
 
 /// The app theme. Two concrete instances — [`Theme::dark`] and [`Theme::light`].
@@ -1293,6 +1290,20 @@ mod tests {
                 let r = contrast_ratio(fg, t.bg);
                 assert!(r >= 3.0, "{:?} {name} is {r:.2}:1 on bg", t.appearance);
             }
+        }
+    }
+
+    /// The regression that motivated the sky tone: keyword and function once
+    /// shared indigo, so `fn foo()` read as one color. Contrast tests can't
+    /// catch two kinds collapsing onto the same hue — assert it directly.
+    #[test]
+    fn syntax_keyword_and_function_are_distinct() {
+        for t in [Theme::dark(), Theme::light()] {
+            assert_ne!(
+                t.syntax.keyword, t.syntax.function,
+                "{:?} keyword and function must not share a color",
+                t.appearance
+            );
         }
     }
 

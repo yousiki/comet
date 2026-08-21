@@ -359,15 +359,10 @@ impl FileExplorer {
     }
 
     /// Whole-file tree-sitter highlight on the background executor; paint-only
-    /// runs, so a late arrival just recolors. Unsupported or oversized files
-    /// (the highlighter caps at 1 MiB) stay plain.
+    /// runs, so a late arrival just recolors. Language detection (extension,
+    /// known filename, shebang) happens inside `highlight`; unsupported or
+    /// oversized files (the highlighter caps at 1 MiB) stay plain.
     fn spawn_highlight(&mut self, path: String, source: String, cx: &mut Context<Self>) {
-        let Some(lang) = zeron_syntax::language_for_path(&path) else {
-            return;
-        };
-        if !zeron_syntax::supports_language(lang) {
-            return;
-        }
         let request_path = path.clone();
         self._highlight_task = Some(cx.spawn(async move |this, cx| {
             let doc = cx

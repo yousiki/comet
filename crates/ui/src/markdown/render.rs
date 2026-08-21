@@ -1153,7 +1153,7 @@ fn render_code_block(
         .into_any_element()
 }
 
-/// Paint color for a token class — the soft syntax palette (round 9: the
+/// Paint color for a token class — the shared syntax palette (round 9: the
 /// original's mdTheme code blocks are monochrome `#e7e7e7`, but the user
 /// asked for color; these are the diff pane's hues, now shared by both).
 pub fn token_color(kind: HighlightKind, theme: &Theme) -> Hsla {
@@ -1297,8 +1297,9 @@ mod tests {
 
     #[test]
     fn code_palette_is_colored_and_shared() {
-        // Round 9: transcript code blocks paint the soft hues (rose keyword,
-        // green string, amber number); comments stay faint neutral.
+        // Round 9: transcript code blocks paint the shared syntax palette
+        // (indigo keyword, emerald string, amber number); comments stay faint
+        // neutral.
         let theme = Theme::dark();
         assert_ne!(token_color(HighlightKind::Keyword, &theme), theme.text);
         assert_ne!(
