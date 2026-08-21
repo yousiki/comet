@@ -1,9 +1,7 @@
 {
-  // Zeron edge: per-session + legacy workspace-document sync DOs, per-device
-  // relay DOs, R2 blobs, and the absorbed WorkOS auth routes.
-  // Design: loro-sessions §2 (topology), §3 (persistence), §6.1 (diff
-  // sidecar), §8 (device-room streams), §1.2 (R2 attachments), §3.3 (R2
-  // backups); ARCHITECTURE.md §6.
+  // Zeron edge: chat/registry sync DOs, per-device relay DOs, R2 blobs, and
+  // the absorbed WorkOS auth routes.
+  // Design: docs/chat2-sync.md, docs/registry-sync.md; ARCHITECTURE.md §6.
   // NOTE: the worker name and R2 bucket names keep the historical "comet"
   // prefix on purpose — Durable Object storage is bound to the script name,
   // so renaming the worker would orphan every session/registry/chat room.
@@ -23,14 +21,8 @@
   "routes": [{ "pattern": "edge.siki.moe", "custom_domain": true }],
   // Serve src/install.sh as a string (the /install.sh route).
   "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
-  // loro-crdt's default entry loads its WASM via URL fetch, which workerd
-  // cannot do at runtime; the base64 entry inlines the module instead.
-  "alias": {
-    "loro-crdt": "loro-crdt/base64"
-  },
   "durable_objects": {
     "bindings": [
-      { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
       { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
       { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
       { "name": "CHAT_ROOMS", "class_name": "ChatRoom" }
@@ -52,6 +44,12 @@
       // replace SessionRoom's loro-aware s2 rooms.
       "tag": "v3",
       "new_sqlite_classes": ["ChatRoom"]
+    },
+    {
+      // s2/ws4 retirement: no client dials SessionRoom any more; its stored
+      // rooms are abandoned deliberately (fork policy: no backward compat).
+      "tag": "v4",
+      "deleted_classes": ["SessionRoom"]
     }
   ],
   "r2_buckets": [

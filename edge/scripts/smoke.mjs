@@ -1,30 +1,19 @@
 /**
  * End-to-end smoke test against a running `wrangler dev` instance
- * (AUTH_MODE=dev). Exercises the full design surface:
- *   1. two Loro peers join a session room and converge through the DO
- *   2. streamed text appends propagate live
- *   3. GET /tail returns the materialized L2 tail
- *   4. POST/GET /diff round-trips the sidecar
- *   5. ephemeral (%EPH) presence relays between peers
- *   6. device room relays client↔host frames and serves sidecar slots
- *   7. R2 attachments: PUT (hash verified) then GET
- *   8. legacy workspace room: one user's devices converge; Organization
- *      members remain isolated (per-user docs); wrong Organization gets 403
- *   9. absorbed /auth routes: 501 without WORKOS_API_KEY; cli callback page
+ * (AUTH_MODE=dev). Exercises the non-chat design surface:
+ *   1. device room relays client↔host frames and serves sidecar slots
+ *   2. nudges deliver live and replay from the offline queue
+ *   3. absorbed /auth routes: 501 without WORKOS_API_KEY; cli callback page
+ * (Chat-room coverage lives in scripts/chat3-check.mjs and the vitest tiers.)
  *
  * Usage: node scripts/smoke.mjs [baseUrl]   (default http://127.0.0.1:27640)
  */
-import { LoroDoc } from "loro-crdt";
-import { LoroWebsocketClient } from "loro-websocket";
-import { LoroAdaptor, LoroEphemeralAdaptor } from "loro-adaptors/loro";
 import { randomUUID } from "node:crypto";
 
 const base = process.argv[2] ?? "http://127.0.0.1:27640";
 const wsBase = base.replace(/^http/, "ws");
 const token = "smoke-user";
-const chatId = `smoke-${randomUUID().slice(0, 8)}`;
 const deviceId = `smokedev-${randomUUID().slice(0, 8)}`;
-const organizationId = `org-smoke-${randomUUID().slice(0, 8)}`;
 
 const fail = (msg) => {
   console.error(`✗ ${msg}`);
@@ -47,162 +36,6 @@ const until = async (fn, what, ms = 8000) => {
   if (!body.ok) fail("health");
   if (body.auth !== "dev") fail(`expected dev auth mode, got ${body.auth} — run wrangler dev with --var AUTH_MODE:dev`);
   ok("health (dev auth)");
-}
-
-// ── session room: two peers converge ─────────────────────────────────────
-const sessionUrl = `${wsBase}/session/${chatId}/ws?token=${token}`;
-
-const clientA = new LoroWebsocketClient({ url: sessionUrl });
-await clientA.waitConnected();
-const adaptorA = new LoroAdaptor();
-await clientA.join({ roomId: chatId, crdtAdaptor: adaptorA });
-const docA = adaptorA.getDoc();
-docA.getMap("meta").set("chatId", chatId);
-docA.getMap("meta").set("schemaVersion", 1);
-const messagesA = docA.getList("messages");
-const m1 = messagesA.insertContainer(0, new (await import("loro-crdt")).LoroMap());
-m1.set("id", "m1");
-m1.set("role", "user");
-m1.set("createdAt", Date.now());
-m1.set("deviceId", "peer-a");
-docA.commit();
-ok("peer A joined + wrote");
-
-const clientB = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${token}` });
-await clientB.waitConnected();
-const adaptorB = new LoroAdaptor();
-await clientB.join({ roomId: chatId, crdtAdaptor: adaptorB });
-const docB = adaptorB.getDoc();
-await until(() => docB.getList("messages").length > 0, "peer B backfill");
-ok("peer B backfilled through DO");
-
-// live propagation A→B
-const t0 = docA.getList("messages").get(0);
-docA.getMap("meta").set("title", "smoke");
-docA.commit();
-await until(() => docB.getMap("meta").get("title") === "smoke", "live A→B");
-ok("live update A→B");
-
-// live propagation B→A
-docB.getMap("meta").set("fromB", true);
-docB.commit();
-await until(() => docA.getMap("meta").get("fromB") === true, "live B→A");
-ok("live update B→A");
-void t0;
-
-// ── wrong user rejected ───────────────────────────────────────────────────
-{
-  const res = await fetch(`${base}/tail/${chatId}?token=intruder`);
-  if (res.status !== 403) fail(`intruder tail expected 403, got ${res.status}`);
-  ok("ownership enforced (intruder 403)");
-}
-
-// ── tail ──────────────────────────────────────────────────────────────────
-await new Promise((r) => setTimeout(r, 100));
-{
-  const res = await fetch(`${base}/tail/${chatId}?token=${token}`);
-  if (res.status !== 200) fail(`tail status ${res.status}`);
-  const tail = await res.json();
-  if (tail.chatId !== chatId) fail(`tail chatId ${tail.chatId}`);
-  if (tail.totalMessages < 1) fail("tail totalMessages");
-  ok(`tail (${tail.totalMessages} messages)`);
-}
-
-// ── diff sidecar ──────────────────────────────────────────────────────────
-{
-  const diff = { chatId, deviceId: "peer-a", checkoutPath: "/tmp/x", patch: "diff --git a b", files: [], additions: 1, deletions: 0, truncated: false, publishedAt: Date.now() };
-  const post = await fetch(`${base}/diff/${chatId}?token=${token}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(diff)
-  });
-  if (post.status !== 200) fail(`diff post ${post.status}`);
-  const get = await fetch(`${base}/diff/${chatId}?token=${token}`);
-  const body = await get.json();
-  if (body.patch !== diff.patch) fail("diff round-trip");
-  ok("diff sidecar round-trip");
-}
-
-// ── ephemeral presence ────────────────────────────────────────────────────
-{
-  const ephA = new LoroEphemeralAdaptor();
-  await clientA.join({ roomId: chatId, crdtAdaptor: ephA });
-  const ephB = new LoroEphemeralAdaptor();
-  await clientB.join({ roomId: chatId, crdtAdaptor: ephB });
-  ephA.getStore().set("presence:peer-a", { status: "busy" });
-  await until(
-    () => ephB.getStore().get("presence:peer-a")?.status === "busy",
-    "ephemeral A→B"
-  );
-  ok("ephemeral presence relay");
-}
-
-// ── Legacy workspace room: per-user docs — one user's devices converge;
-//    members in the same Organization remain isolated ────────────────────
-{
-  // The legacy development token is `userId@organizationId`; `ws3` is also a
-  // retained historical room namespace.
-  const roomA = `ws3/${organizationId}/alice`;
-  const deviceA1 = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${organizationId}/ws?token=alice@${organizationId}`
-  });
-  await deviceA1.waitConnected();
-  const wsAdaptorA1 = new LoroAdaptor();
-  await deviceA1.join({ roomId: roomA, crdtAdaptor: wsAdaptorA1 });
-  const wsDocA = wsAdaptorA1.getDoc();
-  wsDocA.getMap("meta").set("chatId", roomA);
-  wsDocA.getMap("chats").set("chat-1", { title: "hello" });
-  wsDocA.commit();
-
-  // A SECOND DEVICE of the same user joins the same per-user room and
-  // backfills.
-  const deviceA2 = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${organizationId}/ws?token=alice@${organizationId}`
-  });
-  await deviceA2.waitConnected();
-  const wsAdaptorA2 = new LoroAdaptor();
-  await deviceA2.join({ roomId: roomA, crdtAdaptor: wsAdaptorA2 });
-  await until(
-    () => wsAdaptorA2.getDoc().getMap("chats").get("chat-1") !== undefined,
-    "legacy workspace second-device backfill"
-  );
-  ok("legacy workspace room: one user's devices converge");
-
-  // Another Organization member lands in their own empty per-user room —
-  // alice's spaces/sessions must be invisible to bob.
-  const memberB = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${organizationId}/ws?token=bob@${organizationId}`
-  });
-  await memberB.waitConnected();
-  const wsAdaptorB = new LoroAdaptor();
-  await memberB.join({ roomId: `ws3/${organizationId}/bob`, crdtAdaptor: wsAdaptorB });
-  await new Promise((resolve) => setTimeout(resolve, 400)); // any (wrong) backfill gets a beat
-  if (wsAdaptorB.getDoc().getMap("chats").get("chat-1") !== undefined) {
-    fail("Organization member must not see another user's legacy workspace document");
-  }
-  ok("legacy workspace room: Organization members isolated by user");
-  memberB.close();
-  deviceA2.close();
-
-  // Wrong or missing Organization claims are rejected at the Worker.
-  const wrongOrganization = await fetch(
-    `${base}/workspace/${organizationId}/tail?token=mallory@org-other`
-  );
-  if (wrongOrganization.status !== 403) {
-    fail(`wrong-Organization tail expected 403, got ${wrongOrganization.status}`);
-  }
-  const noOrganization = await fetch(`${base}/workspace/${organizationId}/tail?token=${token}`);
-  if (noOrganization.status !== 403) {
-    fail(`missing-Organization tail expected 403, got ${noOrganization.status}`);
-  }
-  // A member can read the legacy workspace tail (empty messages — shape only).
-  const memberTail = await fetch(
-    `${base}/workspace/${organizationId}/tail?token=alice@${organizationId}`
-  );
-  if (memberTail.status !== 200) fail(`member legacy workspace tail ${memberTail.status}`);
-  ok("legacy workspace room: Organization membership enforced");
-
-  deviceA1.close();
 }
 
 // ── device room ───────────────────────────────────────────────────────────
@@ -336,22 +169,5 @@ await new Promise((r) => setTimeout(r, 100));
   ok("auth cli callback renders paste code");
 }
 
-// ── reconnect: new client with existing state catches up incrementally ───
-{
-  const clientC = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${token}` });
-  await clientC.waitConnected();
-  const preSeeded = new LoroDoc();
-  preSeeded.import(docA.export({ mode: "snapshot" }));
-  const adaptorC = new LoroAdaptor(preSeeded);
-  await clientC.join({ roomId: chatId, crdtAdaptor: adaptorC });
-  docA.getMap("meta").set("afterC", 1);
-  docA.commit();
-  await until(() => adaptorC.getDoc().getMap("meta").get("afterC") === 1, "peer C incremental");
-  ok("version-vector incremental join");
-  clientC.close();
-}
-
-clientA.close();
-clientB.close();
 console.log("\nALL SMOKE TESTS PASSED");
 process.exit(0);
