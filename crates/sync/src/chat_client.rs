@@ -412,6 +412,12 @@ async fn pump(
 struct PendingPush {
     batch_id: String,
     bytes: Vec<u8>,
+    /// Pushed at least once on the current socket. The nudge path skips
+    /// already-sent batches: re-pushing the whole queue on every enqueue
+    /// (8/s during streaming) multiplied the push rate by the queue depth
+    /// and livelocked the server's per-device quota (2026-08-20 storm:
+    /// 15k rejections/min). Reconnects clear the flags and replay all.
+    sent: bool,
 }
 
 #[derive(Default)]
@@ -730,6 +736,7 @@ impl ChatClient {
             lock(&self.shared).pending.push_back(PendingPush {
                 batch_id: uuid::Uuid::new_v4().to_string(),
                 bytes,
+                sent: false,
             });
             let _ = self.nudge.try_send(());
         }
@@ -760,6 +767,7 @@ impl ChatClient {
         shared.pending.push_back(PendingPush {
             batch_id: uuid::Uuid::new_v4().to_string(),
             bytes,
+            sent: false,
         });
         drop(shared);
         let _ = self.nudge.try_send(());
@@ -1053,24 +1061,41 @@ impl OfflineRoundGuard {
         } else {
             0
         };
-        for (batch_id, _) in &self.batches {
-            shared.offline_snapshot_ids.remove(batch_id);
-            shared.offline_ws_acks.remove(batch_id);
-            shared.permanent_rejections.remove(batch_id);
+        // One set for the whole cleanup: a long offline queue makes a nested
+        // scan quadratic under the shared lock (blocking enqueue + the WS
+        // actor).
+        let batch_ids: HashSet<&str> = self.batches.iter().map(|(id, _)| id.as_str()).collect();
+        for batch_id in &batch_ids {
+            shared.offline_snapshot_ids.remove(*batch_id);
+            shared.offline_ws_acks.remove(*batch_id);
+            shared.permanent_rejections.remove(*batch_id);
+        }
+        // Any snapshot batch still pending was not proven delivered by this
+        // round — replay responsibility returns to the WS path. Clearing
+        // `sent` makes the follow-up nudge actually re-push it (the nudge
+        // path skips already-sent batches).
+        for push in shared.pending.iter_mut() {
+            if batch_ids.contains(push.batch_id.as_str()) {
+                push.sent = false;
+            }
         }
         self.finished = true;
         restored
+    }
+
+    /// Finish by taking the shared lock. Failure paths call this BEFORE their
+    /// follow-up nudge: relying on Drop would race the nudged WS actor against
+    /// the not-yet-restored replay state.
+    fn finish(&mut self) {
+        let shared = self.shared.clone();
+        let mut shared = lock(&shared);
+        self.finish_locked(&mut shared);
     }
 }
 
 impl Drop for OfflineRoundGuard {
     fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        let shared_arc = self.shared.clone();
-        let mut shared = lock(&shared_arc);
-        self.finish_locked(&mut shared);
+        self.finish();
     }
 }
 
@@ -1100,6 +1125,7 @@ fn restore_http_snapshot_after_reset(shared: &mut Shared, batches: &[(String, Ve
             replay.push_back(PendingPush {
                 batch_id: batch_id.clone(),
                 bytes: bytes.clone(),
+                sent: false,
             });
             restored += 1;
         }
@@ -1193,6 +1219,7 @@ async fn offline_sync_once(
         Err(err) => {
             signal_if_access_denied(&err, &flags, &events);
             tracing::warn!(error = %err, "chat2: http pull failed; will retry");
+            round_guard.finish();
             let _ = nudge.try_send(());
             return;
         }
@@ -1201,6 +1228,7 @@ async fn offline_sync_once(
         Ok(response) => response,
         Err(err) => {
             tracing::warn!(error = %err, "chat2: incomplete/malformed http pull; will retry");
+            round_guard.finish();
             let _ = nudge.try_send(());
             return;
         }
@@ -1211,6 +1239,7 @@ async fn offline_sync_once(
             done_head = response.head_seq,
             "chat2: HTTP STATE/ROWS_DONE frontier mismatch; will retry"
         );
+        round_guard.finish();
         let _ = nudge.try_send(());
         return;
     }
@@ -1231,6 +1260,7 @@ async fn offline_sync_once(
             head_seq = response.head_seq,
             "chat2: reset response unexpectedly contains rows beyond the old cursor"
         );
+        round_guard.finish();
         let _ = nudge.try_send(());
         return;
     }
@@ -1258,6 +1288,7 @@ async fn offline_sync_once(
             Ok(frontier) => Some(frontier),
             Err(err) => {
                 tracing::warn!(error = %err, "chat2: http pull frontier is incomplete; will retry");
+                round_guard.finish();
                 let _ = nudge.try_send(());
                 return;
             }
@@ -1269,11 +1300,13 @@ async fn offline_sync_once(
             Ok(Ok(bytes)) => Some(bytes),
             Ok(Err(err)) => {
                 tracing::warn!(error = %err, "chat2: http checkpoint fetch failed; will retry");
+                round_guard.finish();
                 let _ = nudge.try_send(());
                 return;
             }
             Err(_) => {
                 tracing::warn!("chat2: http checkpoint fetch timed out; will retry");
+                round_guard.finish();
                 let _ = nudge.try_send(());
                 return;
             }
@@ -1342,6 +1375,10 @@ async fn offline_sync_once(
             if let Err(err) = sink.apply_checkpoint(&bytes, response.state.checkpoint_seq) {
                 drop(shared);
                 tracing::warn!(error = %err, "chat2: reset checkpoint import failed; will retry");
+                // finish() before the nudge: it restores replay eligibility
+                // (clears `sent`), so the woken WS actor re-pushes instead of
+                // skipping a still-`sent` batch that nothing would wake again.
+                round_guard.finish();
                 let _ = nudge.try_send(());
                 return;
             }
@@ -1371,6 +1408,9 @@ async fn offline_sync_once(
         if let Err(err) = sink.apply_checkpoint(&bytes, response.state.checkpoint_seq) {
             drop(shared);
             tracing::warn!(error = %err, "chat2: http checkpoint import failed; will retry");
+            // finish() before the nudge (see the reset-checkpoint path above):
+            // restores replay eligibility so the woken WS actor re-pushes.
+            round_guard.finish();
             let _ = nudge.try_send(());
             return;
         }
@@ -1721,7 +1761,7 @@ impl Actor {
         // so a message written on a dead network flushes ~2 RTTs after the
         // socket lands instead of waiting out a whole checkpoint download +
         // backfill ("typing works even when load doesn't").
-        if !self.push_pending(&mut pipe).await {
+        if !self.push_pending(&mut pipe, true).await {
             return SessionEnd::Reconnect;
         }
         let mut buffered: Vec<wire::WireFrame> = Vec::new();
@@ -1881,7 +1921,7 @@ impl Actor {
                     if lock(&self.shared).reset_version != session_reset_version {
                         return SessionEnd::Reconnect;
                     }
-                    if !self.push_pending(&mut pipe).await {
+                    if !self.push_pending(&mut pipe, false).await {
                         return SessionEnd::Reconnect;
                     }
                 }
@@ -1952,8 +1992,9 @@ impl Actor {
     /// Send only the queue's head batch — the quota-probe path.
     async fn push_head(&self, pipe: &mut BinPipe) -> bool {
         let frame = {
-            let shared = lock(&self.shared);
-            shared.pending.front().map(|push| {
+            let mut shared = lock(&self.shared);
+            shared.pending.front_mut().map(|push| {
+                push.sent = true;
                 wire::encode(
                     frame_type::PUSH,
                     &wire::PushHeader {
@@ -2032,21 +2073,33 @@ impl Actor {
         pipe.tx.send(req).await.is_ok()
     }
 
-    async fn push_pending(&self, pipe: &mut BinPipe) -> bool {
-        // Clone rather than drain: batches stay queued until their ack.
-        let frames: Vec<Vec<u8>> = lock(&self.shared)
-            .pending
-            .iter()
-            .map(|push| {
-                wire::encode(
-                    frame_type::PUSH,
-                    &wire::PushHeader {
-                        batch_id: &push.batch_id,
-                    },
-                    &push.bytes,
-                )
-            })
-            .collect();
+    /// Push queued batches. The nudge path (`replay_all=false`) sends only
+    /// batches never pushed on THIS socket — the storm fix: re-pushing the
+    /// whole queue on every enqueue (8/s during streaming × queue depth)
+    /// livelocked the server's per-device quota (2026-08-20: 15k rejections/
+    /// min). A fresh socket (`replay_all=true`) still resends everything (the
+    /// server dedupes by batchId), preserving delivery when a socket died
+    /// mid-flight. The quota drain itself is unchanged: a `quota` rejection
+    /// arms the head-probe retry clock, which drains one batch per grant.
+    async fn push_pending(&self, pipe: &mut BinPipe, replay_all: bool) -> bool {
+        let frames: Vec<Vec<u8>> = {
+            let mut shared = lock(&self.shared);
+            shared
+                .pending
+                .iter_mut()
+                .filter(|push| replay_all || !push.sent)
+                .map(|push| {
+                    push.sent = true;
+                    wire::encode(
+                        frame_type::PUSH,
+                        &wire::PushHeader {
+                            batch_id: &push.batch_id,
+                        },
+                        &push.bytes,
+                    )
+                })
+                .collect()
+        };
         for frame in frames {
             if pipe.tx.send(frame).await.is_err() {
                 return false;

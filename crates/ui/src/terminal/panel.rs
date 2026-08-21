@@ -514,10 +514,11 @@ impl TerminalPanel {
                 Ok(session) => session,
                 Err(err) => {
                     tracing::warn!(error = %err, "OpenTerminal failed");
+                    let notice = crate::state::rpc_error_notice(&err);
                     let _ = this.update(cx, |panel, cx| {
                         if let Some(tab) = panel.tab_mut(&chat, key) {
                             tab.emulator.feed(
-                                format!("\x1b[31mfailed to open terminal: {err}\x1b[0m\r\n")
+                                format!("\x1b[31mfailed to open terminal: {notice}\x1b[0m\r\n")
                                     .as_bytes(),
                             );
                             tab.exited = Some(-1);

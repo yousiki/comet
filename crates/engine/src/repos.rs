@@ -78,6 +78,28 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// `~` / `~/…` → this host's home directory. Anything else passes through.
+/// Registry chat rows store project-less working directories as the literal
+/// `"~"`; every consumer that turns a row's cwd into a real path must expand
+/// it first or the path resolves relative to the process cwd.
+pub(crate) fn expand_home(path: &str) -> String {
+    match path.strip_prefix('~') {
+        // Bare "~": home itself, with no trailing separator (join("") would
+        // add one, and callers compare the string against the raw home dir).
+        Some(rest) if rest.is_empty() => home_dir().to_string_lossy().into_owned(),
+        Some(rest) if rest.starts_with('/') => {
+            // Join the remainder STRICTLY home-relative: trim every leading
+            // slash so an absolute-looking remainder ("~//etc") can never make
+            // `PathBuf::join` discard the home base and escape the jail.
+            home_dir()
+                .join(rest.trim_start_matches('/'))
+                .to_string_lossy()
+                .into_owned()
+        }
+        _ => path.to_string(),
+    }
+}
+
 /// Where new worktrees live. Deliberately NOT under the backend data dir —
 /// worktrees are user-facing working checkouts. `ZERON_WORKTREES_DIR` overrides
 /// (test isolation); empty reads as unset.
@@ -1623,6 +1645,32 @@ tmpfs /run tmpfs rw 0 0
         let mut paths: Vec<&String> = drives.iter().map(|d| &d.path).collect();
         paths.dedup();
         assert_eq!(paths.len(), drives.len());
+    }
+
+    #[test]
+    fn expand_home_stays_inside_the_home_jail() {
+        let home = home_dir();
+        // Bare "~" and "~/rel" expand under home.
+        assert_eq!(std::path::PathBuf::from(expand_home("~")), home);
+        assert_eq!(
+            std::path::PathBuf::from(expand_home("~/proj/src")),
+            home.join("proj/src")
+        );
+        // The escape that mattered: an absolute-looking remainder must NOT let
+        // PathBuf::join discard the home base ("~//etc" → "/etc" would escape).
+        let escaped = expand_home("~//etc");
+        assert_eq!(
+            std::path::PathBuf::from(&escaped),
+            home.join("etc"),
+            "{escaped:?} must resolve strictly under home, never escape"
+        );
+        // A real absolute path (project chat) passes through untouched.
+        assert_eq!(
+            expand_home("/abs/checkout/file.rs"),
+            "/abs/checkout/file.rs"
+        );
+        // A "~user" form is NOT ours to expand — passes through.
+        assert_eq!(expand_home("~bob/x"), "~bob/x");
     }
 
     #[test]

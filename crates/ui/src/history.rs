@@ -15,7 +15,7 @@ use gpui::{
 use zeron_proto::{GitHistoryCommit, GitHistoryPage, GitHistoryRef, GitHistoryRefKind};
 use zeron_rpc::methods;
 
-use crate::state::AppState;
+use crate::state::{AppState, rpc_error_notice};
 use crate::theme::Theme;
 
 const HISTORY_PAGE_SIZE: usize = 100;
@@ -618,7 +618,7 @@ impl GitHistory {
                         history.fetch_page(key, cwd, target, 0, true, cx);
                         cx.emit(GitHistoryEvent::FetchSucceeded);
                     }
-                    Err(error) => history.fetch_error = Some(error.to_string().into()),
+                    Err(error) => history.fetch_error = Some(rpc_error_notice(&error).into()),
                 }
                 cx.notify();
             })
@@ -728,7 +728,7 @@ impl GitHistory {
                             );
                         }
                     }
-                    Err(error) => history.error = Some(error.to_string().into()),
+                    Err(error) => history.error = Some(rpc_error_notice(&error).into()),
                 }
                 cx.notify();
             })
