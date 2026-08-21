@@ -11,7 +11,6 @@
 pub mod commands;
 pub mod constants;
 pub mod parts;
-pub mod rebuild;
 pub mod registry;
 pub mod rows;
 pub mod schema;
@@ -20,7 +19,6 @@ pub mod transcript_delta;
 pub use commands::*;
 pub use constants::*;
 pub use parts::*;
-pub use rebuild::*;
 pub use registry::*;
 pub use rows::*;
 pub use schema::*;

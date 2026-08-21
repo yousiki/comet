@@ -66,7 +66,7 @@ const auth = { authorization: `Bearer ${token}` };
   } else ok("registry pull at cursor is an empty delta");
 }
 
-// ── chat2: push rows over HTTP, pull framed backfill ──────────────────────
+// ── chat3: push rows over HTTP, pull framed backfill ──────────────────────
 const FRAME = { state: 0x02, row: 0x04, rowsDone: 0x05 };
 const decodeFrames = (buf) => {
   const bytes = new Uint8Array(buf);
@@ -88,61 +88,62 @@ const decodeFrames = (buf) => {
 
 {
   // claim the room via a checkpoint POST (owner gate), then push rows
-  const seed = await fetch(`${base}/chat2/${chatId}/checkpoint?seqCovered=0`, {
+  const seed = await fetch(`${base}/chat3/${chatId}/checkpoint?seqCovered=0`, {
     method: "POST",
     headers: { ...auth, "x-chat2-frontier": "" },
     body: new Uint8Array([1, 2, 3])
   });
-  if (seed.status !== 200) fail(`chat2 seed checkpoint: ${seed.status}`);
-  else ok("chat2 room claimed via checkpoint POST");
+  if (seed.status !== 200) fail(`chat3 seed checkpoint: ${seed.status}`);
+  else ok("chat3 room claimed via checkpoint POST");
 
   const payload = new Uint8Array([9, 9, 9, 9]);
   const push = await fetch(
-    `${base}/chat2/${chatId}/rows?batchId=pp-row-1&device=${device}`,
+    `${base}/chat3/${chatId}/rows?batchId=pp-row-1&device=${device}`,
     { method: "POST", headers: auth, body: payload }
   );
   const ack = await push.json();
   if (push.status !== 200 || ack.seq !== 1 || ack.dup !== false) {
-    fail(`chat2 push: ${push.status} ${JSON.stringify(ack)}`);
-  } else ok(`chat2 push acked seq=${ack.seq}`);
+    fail(`chat3 push: ${push.status} ${JSON.stringify(ack)}`);
+  } else ok(`chat3 push acked seq=${ack.seq}`);
 
   const dup = await (
-    await fetch(`${base}/chat2/${chatId}/rows?batchId=pp-row-1&device=${device}`, {
+    await fetch(`${base}/chat3/${chatId}/rows?batchId=pp-row-1&device=${device}`, {
       method: "POST",
       headers: auth,
       body: payload
     })
   ).json();
-  if (dup.dup !== true || dup.seq !== 1) fail(`chat2 push dedupe: ${JSON.stringify(dup)}`);
-  else ok("chat2 push replay deduped");
+  if (dup.dup !== true || dup.seq !== 1) fail(`chat3 push dedupe: ${JSON.stringify(dup)}`);
+  else ok("chat3 push replay deduped");
 
-  const pull = await fetch(`${base}/chat2/${chatId}/rows?after=0&device=pp-dev-b`, {
+  const pull = await fetch(`${base}/chat3/${chatId}/rows?after=0&device=pp-dev-b`, {
     headers: auth
   });
-  if (pull.status !== 200) fail(`chat2 pull: ${pull.status}`);
+  if (pull.status !== 200) fail(`chat3 pull: ${pull.status}`);
   const frames = decodeFrames(await pull.arrayBuffer());
   const kinds = frames.map((f) => f.type);
   if (kinds[0] !== FRAME.state || kinds[kinds.length - 1] !== FRAME.rowsDone) {
-    fail(`chat2 pull framing: kinds=${JSON.stringify(kinds)}`);
-  } else ok(`chat2 pull framing state→rows→rowsDone (${frames.length} frames)`);
+    fail(`chat3 pull framing: kinds=${JSON.stringify(kinds)}`);
+  } else ok(`chat3 pull framing state→rows→rowsDone (${frames.length} frames)`);
   const state = frames[0].header;
   if (state.headSeq !== 1 || state.checkpointSize !== 3) {
-    fail(`chat2 pull state header: ${JSON.stringify(state)}`);
-  } else ok(`chat2 pull state headSeq=${state.headSeq} checkpointSize=${state.checkpointSize}`);
+    fail(`chat3 pull state header: ${JSON.stringify(state)}`);
+  } else ok(`chat3 pull state headSeq=${state.headSeq} checkpointSize=${state.checkpointSize}`);
   const row = frames.find((f) => f.type === FRAME.row);
   if (!row || row.header.seq !== 1 || row.header.batchId !== "pp-row-1" ||
       row.payload.length !== 4 || row.payload[0] !== 9) {
-    fail(`chat2 pull row: ${row && JSON.stringify(row.header)}`);
-  } else ok("chat2 pull row bytes intact");
+    fail(`chat3 pull row: ${row && JSON.stringify(row.header)}`);
+  } else ok("chat3 pull row bytes intact");
 
-  // exclude own rows
+  // own rows are never filtered in Organization-shared rooms (the historical
+  // excludeOwn=1 hint is ignored)
   const own = await fetch(
-    `${base}/chat2/${chatId}/rows?after=0&device=${device}&excludeOwn=1`,
+    `${base}/chat3/${chatId}/rows?after=0&device=${device}&excludeOwn=1`,
     { headers: auth }
   );
   const ownFrames = decodeFrames(await own.arrayBuffer());
-  if (ownFrames.some((f) => f.type === FRAME.row)) fail("excludeOwn=1 still returned own rows");
-  else ok("chat2 pull excludeOwn honored");
+  if (!ownFrames.some((f) => f.type === FRAME.row)) fail("own rows were filtered from replay");
+  else ok("chat3 pull serves own rows (excludeOwn ignored)");
 }
 
 if (failures > 0) {

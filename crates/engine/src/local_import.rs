@@ -425,11 +425,10 @@ impl LocalImporter {
         }
 
         // Row last: once it appears in watchers the chat is clickable, and by
-        // then its doc + journal are already in place. Chat2 lineage is
-        // explicit so `DocHost::open` never routes the import down the legacy
-        // s2 adopt branch.
+        // then its doc + journal are already in place. Imported chats join
+        // gen 3 (organization-shared chat3) like every other chat.
         let mut row = chat.clone();
-        row.room_gen = Some(CHAT2_DOC_EPOCH);
+        row.room_gen = Some(3);
         self.inner.registry.import_chat_row(&row)?;
         Ok(copied)
     }

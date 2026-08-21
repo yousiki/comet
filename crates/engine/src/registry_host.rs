@@ -933,15 +933,9 @@ impl RegistryHost {
                 last_message_at: None,
                 created_at: Utc::now(),
                 harness_session_id: None,
-                // Born on the current room generation: a brand-new chat has
-                // an empty doc — nothing to seed, no migration race to lose.
-                // 3 = Organization-shared chat3 whenever an edge is configured; only
-                // pre-existing chats go through the host migration sweep.
-                room_gen: Some(if self.inner.config.edge.is_some() {
-                    3
-                } else {
-                    2
-                }),
+                // Every chat is born on gen 3 (Organization-shared chat3
+                // rooms) — the only generation this fork still dials.
+                room_gen: Some(3),
                 harness_session_cwd: None,
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,

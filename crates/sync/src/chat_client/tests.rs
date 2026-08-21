@@ -299,22 +299,22 @@ fn http_rows_response(head_seq: u64, rows: &[(u64, &str, &[u8])]) -> Vec<u8> {
 }
 
 /// Answer hello with `state`, then serve the rows request with `rows`.
-/// Returns the observed `after` from the rows request. `expect_exclude`
-/// pins the F1 rule: the process's FIRST backfill must redownload own rows
-/// (false), same-process reconnects skip them (true).
+/// Returns the observed `after` from the rows request. The historical
+/// `_expect_exclude` parameter is retained only to keep call sites stable;
+/// rowsReq no longer carries an excludeOwn key.
 async fn serve_join(
     end: &mut ServerEnd,
     state: serde_json::Value,
     frontier: &[u8],
     rows: Vec<(u64, &str, Vec<u8>)>,
-    expect_exclude: bool,
+    _expect_exclude: bool,
 ) -> u64 {
     let hello = expect_kind(end, frame_type::HELLO).await;
     assert!(hello.header["device"].is_string());
     let head_seq = state["headSeq"].as_u64().unwrap();
     send(end, frame_type::STATE, state, frontier).await;
     let req = expect_kind(end, frame_type::ROWS_REQ).await;
-    assert_eq!(req.header["excludeOwn"], expect_exclude);
+    assert_eq!(req.header.get("excludeOwn"), None);
     let after = req.header["after"].as_u64().unwrap();
     for (seq, device, bytes) in rows {
         send(
@@ -382,7 +382,6 @@ fn frame_actor(shared: Arc<Mutex<Shared>>, sink: Arc<RecordingSink>) -> Actor {
         sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         offline_cancel: CancellationToken::new(),
         offline_task: Arc::new(Mutex::new(None)),
-        resumed: true,
     }
 }
 
@@ -1108,7 +1107,6 @@ fn stale_websocket_ack_cannot_retire_work_after_http_reset() {
         sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         offline_cancel: CancellationToken::new(),
         offline_task: Arc::new(Mutex::new(None)),
-        resumed: true,
     };
     let ack = decode(&encode(
         frame_type::ACK,
@@ -1266,7 +1264,6 @@ async fn failed_http_pull_self_nudges_a_steady_socket_to_repush() {
         sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         offline_cancel: CancellationToken::new(),
         offline_task: Arc::new(Mutex::new(None)),
-        resumed: false,
     };
     actor.spawn_offline_sync();
     let actor_task = tokio::spawn(async move {

@@ -76,7 +76,6 @@ pub struct HelloHeader<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct RowsReqHeader {
     pub after: u64,
-    pub exclude_own: bool,
 }
 
 #[derive(Debug, Serialize)]

@@ -142,7 +142,11 @@ async fn local_work_imports_into_synced_profile_once() {
         .expect("read chat")
         .expect("imported chat row");
     assert_eq!(row.title.as_deref(), Some("Fix the flaky test"));
-    assert_eq!(row.room_gen, Some(2), "imported chats must be chat2-born");
+    assert_eq!(
+        row.room_gen,
+        Some(3),
+        "imported chats join the current room generation"
+    );
     assert_eq!(row.space_id.as_deref(), Some("space-1"));
     assert!(
         synced

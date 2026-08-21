@@ -1209,15 +1209,6 @@ fn opt_ms(value: Option<DateTime<Utc>>) -> Value {
     }
 }
 
-fn newest(candidates: &[Option<DateTime<Utc>>]) -> i64 {
-    candidates
-        .iter()
-        .flatten()
-        .map(|at| at.timestamp_millis())
-        .max()
-        .unwrap_or(1)
-}
-
 fn row_to<T: serde::de::DeserializeOwned>(row: &RegistryRow) -> Option<T> {
     let value = Value::Object(row.fields.clone().into_iter().collect());
     match serde_json::from_value::<T>(value) {

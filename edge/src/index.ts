@@ -21,16 +21,13 @@
  *   GET  /device/:deviceId/status
  *   PUT  /blob/:chatId/:partId        — tool-output sidecar (chat2-sync A2)
  *   GET  /blob/:chatId/:partId
- *   GET  /chat2/:chatId/ws            — chat2 log-relay room (wss, chat2-sync B)
- *   GET|POST /chat2/:chatId/checkpoint — client-built doc snapshot (Range-resumable GET)
- *   GET|POST /chat2/:chatId/rows      — plain-HTTPS log pull/push
- *   GET|PUT  /chat2/:chatId/tail      — host-published sidecars, served verbatim
- *   GET|PUT  /chat2/:chatId/diff
- *   GET  /chat2/:chatId/stats
- *   POST /chat2/:chatId/reset
- *   /chat3/:chatId/*                  — same surface as /chat2, Organization-shared;
- *                                       `chat3` is the retained legacy namespace
- *                                       reads/writes, host-user checkpoint
+ *   GET  /chat3/:chatId/ws            — Organization-shared chat room (wss)
+ *   GET|POST /chat3/:chatId/checkpoint — client-built doc snapshot (Range-resumable GET)
+ *   GET|POST /chat3/:chatId/rows      — plain-HTTPS log pull/push
+ *   GET|PUT  /chat3/:chatId/tail      — host-published sidecars, served verbatim
+ *   GET|PUT  /chat3/:chatId/diff
+ *   GET  /chat3/:chatId/stats
+ *   POST /chat3/:chatId/reset
  */
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
@@ -162,50 +159,11 @@ export default {
     const auth = await authenticate(env, request);
     if (!auth) return json({ error: "unauthenticated" }, 401);
 
-    // ── chat2 rooms (docs/chat2-sync.md B): dumb log relays, one per chat.
-    //    Claim-on-first-join ownership enforced in the DO (chat ids are
-    //    client-minted). The DO handles /ws, /checkpoint (GET Range-resumable
-    //    + POST floor-guarded), host-published /tail + /diff sidecars,
-    //    /stats, /reset. ──────────────────────────────────────────────────────
-    if (parts[0] === "chat2" && parts[1] && ID_RE.test(parts[1]) && parts[2]) {
-      const room = `chat2/${parts[1]}`;
-      if (parts[2] === "ws" && parts.length === 3) {
-        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-          return json({ error: "expected websocket" }, 426);
-        }
-        return forward(
-          env.CHAT_ROOMS,
-          room,
-          request,
-          auth.userId,
-          "/ws",
-          `?chatId=${parts[1]}${deviceParam(url)}`
-        );
-      }
-      const routes: Record<string, string[]> = {
-        checkpoint: ["GET", "POST"],
-        // Pull/push over plain HTTPS (the airplane-wifi transport): GET
-        // /rows?after= collapses connect→hello→state→rowsReq→backfill into
-        // one round trip; POST /rows is the batchId-deduped push twin.
-        rows: ["GET", "POST"],
-        tail: ["GET", "PUT"],
-        diff: ["GET", "PUT"],
-        stats: ["GET"],
-        reset: ["POST"]
-      };
-      if (parts.length === 3 && routes[parts[2]]?.includes(request.method)) {
-        // Query carries through (`seqCovered` on POST /checkpoint), as do
-        // headers (`x-chat2-frontier`, `range`).
-        return forward(env.CHAT_ROOMS, room, request, auth.userId, `/${parts[2]}`, url.search);
-      }
-      return json({ error: "not found" }, 404);
-    }
-
-    // ── `chat3` legacy namespace: Organization-shared sessions. Same ChatRoom
-    //    routes as `chat2`, but the room name carries the caller's verified
-    //    Organization id. Every Organization member may join/push/read; only the
-    //    host user (claimed via `?role=host` on join or bootstrap checkpoint)
-    //    may checkpoint, publish sidecars, or reset. ─────────────────────────
+    // ── Organization-shared chat rooms (`chat3` is a historical namespace
+    //    name — the room name carries the caller's verified Organization id).
+    //    Every Organization member may join/push/read; only the host user
+    //    (claimed via `?role=host` on join or bootstrap checkpoint) may
+    //    checkpoint, publish sidecars, or reset. ──────────────────────────
     if (parts[0] === "chat3" && parts[1] && ID_RE.test(parts[1]) && parts[2]) {
       if (!auth.organizationId) return json({ error: "forbidden" }, 403);
       const room = `chat3/${auth.organizationId}/${parts[1]}`;
