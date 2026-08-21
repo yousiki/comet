@@ -32,10 +32,6 @@ zeron-syntax = { path = "crates/syntax" }
 
 # CRDT
 loro = "1.13"
-# Wire protocol for the SessionRoom DO rooms — official Rust twin of the npm
-# `loro-protocol` package the TS edge speaks (same monorepo, byte-identical
-# frames, cross-checked by its js_snapshots tests).
-loro-protocol = "0.3"
 
 # gpui — the wingleeio/zed fork: upstream f14fea9 + commits on
 # `comet/edge-fade-horizontal` (tip of `comet/line-wrap-closing-punctuation`
