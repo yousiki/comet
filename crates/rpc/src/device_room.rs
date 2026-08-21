@@ -245,6 +245,19 @@ async fn token_changed(changes: &mut Option<tokio::sync::watch::Receiver<u64>>) 
     }
 }
 
+/// Resolves when the device-sharing declaration flips; pends forever when no
+/// declaration is wired or its sender is gone (nothing left to redeclare).
+async fn shared_flipped(changes: &mut Option<watch::Receiver<bool>>) {
+    match changes {
+        Some(changes) => {
+            if changes.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// A fixed token (dev mode / tests).
 pub struct StaticToken(pub String);
 
@@ -270,6 +283,11 @@ pub struct HostRelayConfig {
     pub token: Arc<dyn TokenSource>,
     /// Reconnect delay after a session ends (a small jitter is added).
     pub retry: Duration,
+    /// Device-sharing declaration (Settings → Devices), stamped on the host
+    /// join URL so the DeviceRoom DO can admit same-Organization clients only
+    /// while the device is shared. `None` = no declaration (the DO then admits
+    /// nobody but the owner). A flip redials so the DO learns it immediately.
+    pub shared: Option<watch::Receiver<bool>>,
 }
 
 impl HostRelayConfig {
@@ -283,6 +301,7 @@ impl HostRelayConfig {
             device_id: device_id.into(),
             token,
             retry: Duration::from_secs(5),
+            shared: None,
         }
     }
 }
@@ -306,6 +325,7 @@ impl HostRelay {
             let mut wake = zeron_sync::wake::subscribe();
             let mut online = zeron_sync::wake::subscribe_online();
             let mut token_changes = config.token.subscribe();
+            let mut shared_changes = config.shared.clone();
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
             // host sessions (hibernation/deploys). Every second the host is
             // away, client dials bounce with "readiness check failed" (user
@@ -315,13 +335,19 @@ impl HostRelay {
             let mut delay = HOST_REJOIN_MIN;
             loop {
                 if let Some(token) = config.token.token().await {
-                    let url = device_room_ws_url(
+                    let mut url = device_room_ws_url(
                         &config.edge_url,
                         &config.device_id,
                         "host",
                         None,
                         &token,
                     );
+                    if let Some(shared) = &mut shared_changes {
+                        // Mark seen BEFORE dialing: a flip that races the dial
+                        // still fires `changed()` below and redials.
+                        let value = *shared.borrow_and_update();
+                        url.push_str(if value { "&shared=1" } else { "&shared=0" });
+                    }
                     let started = tokio::time::Instant::now();
                     let outcome = {
                         let session = host_session(&url, &service, &on_nudge);
@@ -339,6 +365,15 @@ impl HostRelay {
                                         );
                                         break Ok(());
                                     }
+                                }
+                                _ = shared_flipped(&mut shared_changes) => {
+                                    // Redial so the join URL redeclares sharing —
+                                    // the DO's admission gate reads the stored
+                                    // declaration, so it must never go stale.
+                                    tracing::info!(
+                                        "device-room: sharing changed; redeclaring to the relay"
+                                    );
+                                    break Ok(());
                                 }
                             }
                         }
@@ -372,6 +407,9 @@ impl HostRelay {
                     // A sibling dial succeeded = the network is back.
                     _ = online.recv() => { delay = HOST_REJOIN_MIN; }
                     _ = token_changed(&mut token_changes) => { delay = HOST_REJOIN_MIN; }
+                    // A sharing flip must not wait out a retry window — the
+                    // DO's admission gate reads the joined declaration.
+                    _ = shared_flipped(&mut shared_changes) => { delay = HOST_REJOIN_MIN; }
                 }
             }
         });
@@ -590,9 +628,18 @@ pub struct DeviceLink {
 
 impl DeviceLink {
     pub async fn connect(url: &str) -> Result<Self, RpcError> {
-        let ws = zeron_sync::dial::connect_ws(url)
-            .await
-            .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
+        let ws = zeron_sync::dial::connect_ws(url).await.map_err(|e| {
+            // A 403 handshake is an authorization verdict (device-room owner /
+            // Organization gate), not a reachability problem — surface it as
+            // such so callers skip retry and backoff (mirrors chat_client's
+            // map_ws_connect_error).
+            match &e {
+                zeron_sync::dial::WsError::Http(response) if response.status().as_u16() == 403 => {
+                    RpcError::AccessDenied("device room refused the connection (HTTP 403)".into())
+                }
+                _ => RpcError::Transport(format!("device room unreachable: {e}")),
+            }
+        })?;
         let (mut sink, mut stream) = ws.split();
         let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
         let (in_tx, in_rx) = mpsc::channel::<String>(256);
@@ -926,6 +973,12 @@ impl LinkCache {
                     return Ok(link.client());
                 }
                 Err(err) => {
+                    if matches!(err, RpcError::AccessDenied(_)) {
+                        // Authorization verdicts are terminal: retrying the same
+                        // credentials cannot succeed, and counting them as dial
+                        // failures would disguise "no access" as "unreachable".
+                        return Err(err);
+                    }
                     tracing::debug!(device = %device_id, attempt, error = %err, "peer: dial attempt failed");
                     last_err = Some(err);
                 }

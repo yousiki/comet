@@ -475,7 +475,10 @@ impl EngineCore {
         edge_url: &str,
         token: Arc<dyn zeron_rpc::TokenSource>,
     ) -> zeron_rpc::HostRelay {
-        let config = zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), token);
+        let mut config = zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), token);
+        // Declare device sharing on the join URL: the DO admits same-Organization
+        // clients only while this says shared (undeclared = owner-only).
+        config.shared = Some(self.registry.shared_watch());
         let doc_host = self.doc_host.clone();
         let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change

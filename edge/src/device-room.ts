@@ -117,6 +117,24 @@ export class DeviceRoom implements DurableObject {
     );
   }
 
+  private deleteMeta(key: string): void {
+    this.ctx.storage.sql.exec("DELETE FROM meta WHERE key = ?", key);
+  }
+
+  /** Sharing turned off: close every member (non-owner client) socket. The
+   * owner's own clients stay — sharing never gates the owner. */
+  private closeMemberClients(owner: string): void {
+    for (const ws of this.ctx.getWebSockets()) {
+      const state = ws.deserializeAttachment() as SocketState | null;
+      if (!state || state.role !== "client" || state.userId === owner) continue;
+      try {
+        ws.close(4403, "device sharing revoked");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
   /** The host socket to route to: the freshest one that has proven itself
    * alive within [`HOST_LIVENESS_MS`]. `undefined` = no live host, which is
    * what makes clients see `host_offline` instead of hanging on a corpse.
@@ -156,10 +174,29 @@ export class DeviceRoom implements DurableObject {
         // members can nudge. `ownerOrg` remains the historical storage key.
         if (!owner) this.setMeta("owner", userId);
         else if (owner !== userId) return new Response("forbidden", { status: 403 });
+        // The LATEST host join is authoritative for both admission inputs —
+        // stale values must not outlive it: an Organization-less join clears
+        // the recorded Organization, and an undeclared `shared` (older
+        // daemon) reads as "0" so member admission fails safe.
         const organizationId = request.headers.get(AUTH_ORGANIZATION_HEADER);
         if (organizationId) this.setMeta("ownerOrg", organizationId);
-      } else {
-        if (!owner || owner !== userId) return new Response("forbidden", { status: 403 });
+        else this.deleteMeta("ownerOrg");
+        const shared = url.searchParams.get("shared") === "1" ? "1" : "0";
+        this.setMeta("shared", shared);
+        // Admission gates only the handshake: turning sharing off must also
+        // revoke members' LIVE sockets, or an open terminal would keep using
+        // the newly-unshared host indefinitely.
+        if (shared !== "1") this.closeMemberClients(userId);
+      } else if (
+        !clientJoinAllowed({
+          owner,
+          userId,
+          ownerOrganizationId: this.getMeta("ownerOrg"),
+          callerOrganizationId: request.headers.get(AUTH_ORGANIZATION_HEADER),
+          shared: this.getMeta("shared")
+        })
+      ) {
+        return new Response("forbidden", { status: 403 });
       }
       const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
       const pair = new WebSocketPair();
@@ -348,6 +385,28 @@ export const pickLiveHost = <T>(
     if (!best || host.lastSeenAt > best.lastSeenAt) best = host;
   }
   return best && now - best.lastSeenAt <= HOST_LIVENESS_MS ? best.ws : undefined;
+};
+
+/** Client-role admission: the owner always; an Organization member only while
+ * the host's latest join declared the device shared (Settings → Devices).
+ * No declaration (older host, or never claimed) = owner-only — refusing is
+ * the safe default because an unshared device must never be reachable by
+ * members (ARCHITECTURE.md §2 device membership). Pure so the gate is
+ * testable without a DO. */
+export const clientJoinAllowed = (args: {
+  owner: string | undefined;
+  userId: string;
+  ownerOrganizationId: string | undefined;
+  callerOrganizationId: string | null;
+  shared: string | undefined;
+}): boolean => {
+  if (!args.owner) return false;
+  if (args.owner === args.userId) return true;
+  return (
+    args.shared === "1" &&
+    !!args.ownerOrganizationId &&
+    args.ownerOrganizationId === args.callerOrganizationId
+  );
 };
 
 const encodeRelayError = (code: string): Uint8Array =>

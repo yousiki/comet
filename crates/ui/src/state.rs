@@ -575,6 +575,10 @@ pub(crate) fn rpc_error_notice(err: &RpcError) -> String {
         RpcError::UnknownMethod(_) => {
             "This device runs an older zeron — update it to use this feature".to_string()
         }
+        RpcError::AccessDenied(_) => {
+            "Not authorized to access this device — it may be unshared, or running an older zeron"
+                .to_string()
+        }
         other => other.to_string(),
     }
 }
