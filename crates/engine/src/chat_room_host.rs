@@ -1,7 +1,8 @@
-//! chat2 host wiring (docs/chat2-sync.md C3): the engine-side implementations
-//! of [`zeron_sync::chat_client::ChatDocSink`] and
+//! Chat-room host wiring (docs/chat2-sync.md C3): the engine-side
+//! implementations of [`zeron_sync::chat_client::ChatDocSink`] and
 //! [`zeron_sync::chat_client::CheckpointFetcher`], binding a
-//! [`crate::doc_host::ChatDocHandle`]'s live doc to a chat2 room.
+//! [`crate::doc_host::ChatDocHandle`]'s live doc to its chat room.
+//! ("chat2" names the row protocol these rooms speak, not a generation.)
 //!
 //! The C2 rule is enforced HERE: every sink method persists doc content AND
 //! the room cursor in one `save_snapshot_with_cursor` transaction, so a
@@ -18,10 +19,11 @@ use zeron_sync::{DocsStore, SyncError};
 
 use crate::doc_host::EdgeConfig;
 
-/// Minimum synchronized-room epoch. Values below 2 are legacy fat/s2 docs;
-/// values at or above 2 identify the room generation whose cursor is stored
-/// beside the thin snapshot (2 = chat2, 3 = organization-shared chat3).
-pub const CHAT2_DOC_EPOCH: u32 = 2;
+/// Minimum thin-doc epoch. The epoch stored beside a snapshot names the room
+/// generation its cursor belongs to (historical: 2 = chat2, 3 = chat3); a
+/// stored epoch below the chat's generation resets the cursor and requeues
+/// the full local log on open.
+pub const THIN_DOC_EPOCH: u32 = 2;
 
 /// [`ChatDocSink`] over a live [`SessionDoc`] + the cursor-bearing store.
 ///
@@ -106,7 +108,7 @@ impl EngineChatSink {
         replay_from_zero: Arc<AtomicBool>,
         replay_fence: Arc<Mutex<()>>,
     ) -> Self {
-        let target_room_gen = room_gen.max(CHAT2_DOC_EPOCH);
+        let target_room_gen = room_gen.max(THIN_DOC_EPOCH);
         let client_generation = lifecycle_generation.load(Ordering::Acquire);
         Self {
             doc: Arc::downgrade(doc),
@@ -121,7 +123,7 @@ impl EngineChatSink {
             replay_fence,
             persist: std::sync::Mutex::new(PersistState {
                 cursor: initial_cursor,
-                epoch: initial_epoch.max(CHAT2_DOC_EPOCH).min(target_room_gen),
+                epoch: initial_epoch.max(THIN_DOC_EPOCH).min(target_room_gen),
             }),
         }
     }
@@ -695,16 +697,16 @@ mod frontier_tests {
                 "pending-row",
                 &receiver.export_snapshot().unwrap(),
                 0,
-                CHAT2_DOC_EPOCH,
+                THIN_DOC_EPOCH,
             )
             .unwrap();
         let sink = EngineChatSink::new(
             &receiver,
             store.clone(),
             "pending-row",
-            CHAT2_DOC_EPOCH,
+            THIN_DOC_EPOCH,
             0,
-            CHAT2_DOC_EPOCH,
+            THIN_DOC_EPOCH,
         );
 
         // Export only the second change from one peer. Its first change is a
@@ -734,7 +736,7 @@ mod frontier_tests {
             .load_snapshot_with_cursor("pending-row")
             .unwrap()
             .unwrap();
-        assert_eq!((cursor, epoch), (9, CHAT2_DOC_EPOCH));
+        assert_eq!((cursor, epoch), (9, THIN_DOC_EPOCH));
         assert!(
             receiver.doc().get_map("meta").get("dependent").is_none(),
             "parked ops must stay invisible until their dependency lands"
@@ -749,16 +751,16 @@ mod frontier_tests {
                 "pending-checkpoint",
                 &checkpoint_receiver.export_snapshot().unwrap(),
                 0,
-                CHAT2_DOC_EPOCH,
+                THIN_DOC_EPOCH,
             )
             .unwrap();
         let checkpoint_sink = EngineChatSink::new(
             &checkpoint_receiver,
             store.clone(),
             "pending-checkpoint",
-            CHAT2_DOC_EPOCH,
+            THIN_DOC_EPOCH,
             0,
-            CHAT2_DOC_EPOCH,
+            THIN_DOC_EPOCH,
         );
         let checkpoint_error = checkpoint_sink
             .apply_checkpoint(&dependent_only, 8)

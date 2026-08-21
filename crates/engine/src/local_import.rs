@@ -5,7 +5,7 @@
 //! the synced profile — through the same write paths every live mutation
 //! uses, so nothing here invents a second persistence or sync mechanism:
 //!
-//!  - chat docs land via `save_snapshot_with_cursor(chat_id, bytes, 0, CHAT2_DOC_EPOCH)`,
+//!  - chat docs land via `save_snapshot_with_cursor(chat_id, bytes, 0, THIN_DOC_EPOCH)`,
 //!    which is exactly the "born chat2" shape: cursor 0 makes the first room
 //!    join push the doc's full update log from VV zero (doc_host first-contact
 //!    push), and epoch 2 keeps `DocHost::open` off the s2 discard-and-adopt
@@ -29,7 +29,7 @@ use zeron_doc::{REGISTRY_DOC_ID, RegistryDoc};
 use zeron_sync::DocsStore;
 
 use crate::EngineError;
-use crate::chat2_host::CHAT2_DOC_EPOCH;
+use crate::chat_room_host::THIN_DOC_EPOCH;
 use crate::registry_host::RegistryHost;
 use crate::run_journal::journal_paths;
 use crate::uploads::Uploads;
@@ -407,7 +407,7 @@ impl LocalImporter {
                 &chat.id,
                 &bytes,
                 0,
-                CHAT2_DOC_EPOCH,
+                THIN_DOC_EPOCH,
             )?;
         }
 

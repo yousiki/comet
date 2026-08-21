@@ -962,8 +962,8 @@ impl DocHost {
         let persist_epoch = durable_before
             .as_ref()
             .map(|(_, _, epoch)| *epoch)
-            .unwrap_or(crate::chat2_host::CHAT2_DOC_EPOCH)
-            .max(crate::chat2_host::CHAT2_DOC_EPOCH)
+            .unwrap_or(crate::chat_room_host::THIN_DOC_EPOCH)
+            .max(crate::chat_room_host::THIN_DOC_EPOCH)
             .min(handle.room_gen);
         let Ok(snapshot) = handle.doc.export_snapshot() else {
             return;
@@ -1291,7 +1291,7 @@ impl DocHost {
         });
     }
 
-    fn persist_cutover_snapshot_locked(
+    fn persist_snapshot_locked(
         &self,
         handle: &ChatDocHandle,
         target_gen: u32,
@@ -1310,7 +1310,8 @@ impl DocHost {
             .store
             .load_snapshot_with_cursor(&handle.chat_id)?;
 
-        if handle.room_gen >= crate::chat2_host::CHAT2_DOC_EPOCH && target_gen > handle.room_gen {
+        if handle.room_gen >= crate::chat_room_host::THIN_DOC_EPOCH && target_gen > handle.room_gen
+        {
             let (bytes, epoch) = match stored {
                 Some((target, _, epoch)) if epoch >= target_gen => {
                     let merged = loro::LoroDoc::new();
@@ -1346,7 +1347,7 @@ impl DocHost {
             .as_ref()
             .is_some_and(|(_, _, epoch)| *epoch > handle.room_gen);
         if newer_lineage {
-            if handle.room_gen < crate::chat2_host::CHAT2_DOC_EPOCH {
+            if handle.room_gen < crate::chat_room_host::THIN_DOC_EPOCH {
                 let rollback_id = format!("{}.pre-chat2", handle.chat_id);
                 if !self.inner.store.has_snapshot(&rollback_id)? {
                     self.inner.store.save_snapshot(&rollback_id, &source)?;
@@ -1356,13 +1357,13 @@ impl DocHost {
         }
 
         if handle.replay_from_zero.load(Ordering::Acquire)
-            && handle.room_gen >= crate::chat2_host::CHAT2_DOC_EPOCH
+            && handle.room_gen >= crate::chat_room_host::THIN_DOC_EPOCH
         {
             let epoch = stored
                 .as_ref()
                 .map(|(_, _, epoch)| *epoch)
-                .unwrap_or(crate::chat2_host::CHAT2_DOC_EPOCH)
-                .max(crate::chat2_host::CHAT2_DOC_EPOCH)
+                .unwrap_or(crate::chat_room_host::THIN_DOC_EPOCH)
+                .max(crate::chat_room_host::THIN_DOC_EPOCH)
                 .min(handle.room_gen);
             self.inner
                 .store
@@ -1430,7 +1431,7 @@ impl DocHost {
         // thin-lineage epoch. Remote catch-up alone must not suppress the
         // crash-time full-local replay.
         let chat2_epoch = stored_epoch
-            .max(crate::chat2_host::CHAT2_DOC_EPOCH)
+            .max(crate::chat_room_host::THIN_DOC_EPOCH)
             .min(room_gen);
         let doc = match stored {
             Some((bytes, cursor, epoch)) => {
@@ -1465,7 +1466,7 @@ impl DocHost {
                         chat_id,
                         &snapshot,
                         0,
-                        crate::chat2_host::CHAT2_DOC_EPOCH,
+                        crate::chat_room_host::THIN_DOC_EPOCH,
                     );
                     if purge_fence.load(Ordering::Acquire) {
                         let _ = self.inner.store.delete_snapshot(chat_id);
@@ -1645,7 +1646,7 @@ impl DocHost {
         let replay_from_zero = handle.replay_from_zero.clone();
         let replay_fence = handle.replay_fence.clone();
         self.spawn_worker(async move {
-            let sink = Arc::new(crate::chat2_host::EngineChatSink::new_with_lifecycle(
+            let sink = Arc::new(crate::chat_room_host::EngineChatSink::new_with_lifecycle(
                 &doc,
                 store,
                 chat.clone(),
@@ -1663,7 +1664,7 @@ impl DocHost {
             // task's own strong ref dies when the join resolves.
             drop(doc);
             let prefix = ROOM_PREFIX;
-            let fetcher = Arc::new(crate::chat2_host::EdgeCheckpointFetcher::new(
+            let fetcher = Arc::new(crate::chat_room_host::EdgeCheckpointFetcher::new(
                 http,
                 edge.clone(),
                 chat.clone(),
@@ -1691,7 +1692,7 @@ impl DocHost {
                 // fetch) — bootstraps in ~1 RTT and keeps syncing at backoff
                 // cadence on networks that never pass the WS upgrade. With
                 // the transport, connect resolves immediately (local-first).
-                let transport = Arc::new(crate::chat2_host::EdgeChatTransport::new(
+                let transport = Arc::new(crate::chat_room_host::EdgeChatTransport::new(
                     host.inner.http.clone(),
                     edge.clone(),
                     chat.clone(),
@@ -2189,10 +2190,10 @@ impl DocHost {
                 // The client replay queue is process-local. Persist the full
                 // thin lineage at cursor zero before detaching it so restart
                 // remains correct even if the host buffer never survives.
-                if current.room_gen >= crate::chat2_host::CHAT2_DOC_EPOCH {
+                if current.room_gen >= crate::chat_room_host::THIN_DOC_EPOCH {
                     current.replay_from_zero.store(true, Ordering::Release);
                 }
-                self.persist_cutover_snapshot_locked(&current, current.room_gen)?;
+                self.persist_snapshot_locked(&current, current.room_gen)?;
                 current.retired.store(true, Ordering::Release);
                 drop(lock(&current.chat2_local_sub).take());
                 let parked = self.detach_chat2_client_locked(&current);
@@ -3913,7 +3914,7 @@ impl DocHost {
         {
             handle.replay_from_zero.store(true, Ordering::Release);
         }
-        if let Err(err) = self.persist_cutover_snapshot_locked(handle, handle.room_gen) {
+        if let Err(err) = self.persist_snapshot_locked(handle, handle.room_gen) {
             tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
         }
     }
@@ -4403,7 +4404,7 @@ mod agent_send_tests {
         let frozen = Arc::new(AtomicBool::new(false));
         let replay = Arc::new(AtomicBool::new(false));
         let replay_fence = Arc::new(Mutex::new(()));
-        let sink = crate::chat2_host::EngineChatSink::new_with_lifecycle(
+        let sink = crate::chat_room_host::EngineChatSink::new_with_lifecycle(
             &old_doc,
             store.clone(),
             "late-sink",
