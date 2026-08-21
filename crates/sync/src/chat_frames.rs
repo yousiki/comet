@@ -101,6 +101,11 @@ pub struct StateHeader {
     pub row_count: u64,
     #[serde(default)]
     pub row_bytes: u64,
+    /// Room incarnation, bumped by /reset and stable otherwise. The paging
+    /// fence compares it across truncated pulls — the checkpoint triple alone
+    /// cannot distinguish two incarnations of a checkpointless room.
+    #[serde(default)]
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

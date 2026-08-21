@@ -1598,7 +1598,7 @@ impl WsDerivedRegistryTransport {
     async fn leaf_url(
         provider: &Arc<dyn zeron_sync::UrlProvider>,
         leaf: &str,
-    ) -> Result<reqwest::Url, zeron_sync::SyncError> {
+    ) -> Result<(reqwest::Url, Option<String>), zeron_sync::SyncError> {
         let ws = provider.url().await?;
         let mut u = reqwest::Url::parse(&ws)
             .map_err(|e| zeron_sync::SyncError::Protocol(format!("bad ws url: {e}")))?;
@@ -1612,7 +1612,23 @@ impl WsDerivedRegistryTransport {
         };
         let new_path = format!("{base}/{leaf}");
         u.set_path(&new_path);
-        Ok(u)
+        // Move the WS URL's ?token= into a bearer header (HTTP supports
+        // headers; query strings can reach request logs). Other params
+        // (device) stay.
+        let token = u
+            .query_pairs()
+            .find(|(k, _)| k == "token")
+            .map(|(_, v)| v.into_owned());
+        let kept: Vec<(String, String)> = u
+            .query_pairs()
+            .filter(|(k, _)| k != "token")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        u.query_pairs_mut().clear();
+        for (k, v) in kept {
+            u.query_pairs_mut().append_pair(&k, &v);
+        }
+        Ok((u, token))
     }
 }
 
@@ -1625,13 +1641,16 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
         let client = self.client.clone();
         let beat = self.shared.load(std::sync::atomic::Ordering::Acquire);
         Box::pin(async move {
-            let mut u = Self::leaf_url(&provider, "rows").await?;
+            let (mut u, token) = Self::leaf_url(&provider, "rows").await?;
             u.query_pairs_mut().append_pair("since", &since.to_string());
             if beat {
                 u.query_pairs_mut().append_pair("beat", "1");
             }
-            let resp = client
-                .get(u)
+            let mut req = client.get(u);
+            if let Some(token) = token {
+                req = req.bearer_auth(token);
+            }
+            let resp = req
                 .send()
                 .await
                 .map_err(|e| zeron_sync::SyncError::WebSocket(e.to_string()))?;
@@ -1654,11 +1673,15 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
         let provider = self.url.clone();
         let client = self.client.clone();
         Box::pin(async move {
-            let u = Self::leaf_url(&provider, "push").await?;
-            let resp = client
+            let (u, token) = Self::leaf_url(&provider, "push").await?;
+            let mut req = client
                 .post(u)
                 .header("content-type", "application/json")
-                .body(body)
+                .body(body);
+            if let Some(token) = token {
+                req = req.bearer_auth(token);
+            }
+            let resp = req
                 .send()
                 .await
                 .map_err(|e| zeron_sync::SyncError::WebSocket(e.to_string()))?;

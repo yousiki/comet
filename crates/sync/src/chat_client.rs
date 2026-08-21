@@ -197,7 +197,8 @@ pub fn plan_catch_up(
     }
 }
 
-/// Fully decoded plain-HTTPS rows response. Unlike the WebSocket stream, this
+/// Fully decoded plain-HTTPS rows response, possibly stitched from several
+/// truncated pages (see `fetch_http_rows`). Unlike the WebSocket stream, this
 /// body is an atomic proof: staged POST acks may be retired only after every
 /// length-prefixed frame and the terminal frontier have been validated.
 struct HttpRowsResponse {
@@ -207,7 +208,17 @@ struct HttpRowsResponse {
     head_seq: u64,
 }
 
-fn decode_http_rows_response(body: &[u8]) -> Result<HttpRowsResponse, String> {
+/// One GET /rows body. `head_seq` is `None` when the server hit its
+/// ROWS_BODY_CAP and ended the body WITHOUT ROWS_DONE — deliberate truncation,
+/// not an error: the next page resumes after the last row received.
+struct HttpRowsPage {
+    state: wire::StateHeader,
+    frontier: Vec<u8>,
+    rows: Vec<(wire::RowHeader, Vec<u8>)>,
+    head_seq: Option<u64>,
+}
+
+fn decode_http_rows_page(body: &[u8]) -> Result<HttpRowsPage, String> {
     let mut frames = Vec::new();
     let mut off = 0usize;
     while off < body.len() {
@@ -264,13 +275,90 @@ fn decode_http_rows_response(body: &[u8]) -> Result<HttpRowsResponse, String> {
             _ => return Err("unexpected frame in HTTP rows response".into()),
         }
     }
-    let head_seq = done.ok_or_else(|| "HTTP rows response lacks ROWS_DONE".to_string())?;
-    Ok(HttpRowsResponse {
+    Ok(HttpRowsPage {
         state,
         frontier: state_frame.payload,
         rows,
-        head_seq,
+        head_seq: done,
     })
+}
+
+enum HttpPullError {
+    Transport(SyncError),
+    Malformed(String),
+}
+
+/// Defensive ceiling on truncated pages per pull: at ~4 MiB a page, 32 pages
+/// is a 128 MiB backlog — far past any real log (checkpoints prune rows).
+/// Hitting it means a server bug, and erroring beats pulling forever.
+const MAX_HTTP_ROWS_PAGES: usize = 32;
+
+/// Pull rows, following truncation pagination. GET /rows bounds its buffered
+/// body at ROWS_BODY_CAP (4 MiB); past the cap the server ends the response
+/// WITHOUT ROWS_DONE and expects the client to resume after the last row it
+/// received. Pages are stitched into one response so the atomic-proof
+/// validation downstream is unchanged. The FINAL page's STATE/ROWS_DONE pair
+/// is authoritative (the DO builds both in one synchronous read); rows from
+/// stale earlier pages surface as validation failures and retry cleanly.
+async fn fetch_http_rows(
+    transport: &dyn ChatTransport,
+    pull_since: u64,
+) -> Result<HttpRowsResponse, HttpPullError> {
+    let mut rows: Vec<(wire::RowHeader, Vec<u8>)> = Vec::new();
+    let mut after = pull_since;
+    let mut prev_state: Option<wire::StateHeader> = None;
+    for _ in 0..MAX_HTTP_ROWS_PAGES {
+        let body = transport
+            .fetch_rows(after)
+            .await
+            .map_err(HttpPullError::Transport)?;
+        let page = decode_http_rows_page(&body).map_err(HttpPullError::Malformed)?;
+        // Cross-page incarnation fence: a /reset (or checkpoint) between pages
+        // could otherwise stitch rows from two room incarnations into one
+        // numerically-contiguous response. The epoch is the authoritative
+        // fence (/reset bumps it; a checkpointless room's triple is (0,0,0)
+        // on both sides of a reset); the checkpoint triple additionally
+        // catches a concurrent checkpoint pruning rows mid-pull; head_seq
+        // only ever grows. Any drift = restart the pull rather than certify
+        // a mixed history.
+        if let Some(prev) = prev_state {
+            if page.state.epoch != prev.epoch
+                || page.state.seq_floor != prev.seq_floor
+                || page.state.checkpoint_seq != prev.checkpoint_seq
+                || page.state.checkpoint_size != prev.checkpoint_size
+                || page.state.head_seq < prev.head_seq
+            {
+                return Err(HttpPullError::Malformed(
+                    "room state changed between HTTP rows pages".into(),
+                ));
+            }
+        }
+        prev_state = Some(page.state);
+        let page_last = page.rows.last().map(|(row, _)| row.seq);
+        rows.extend(page.rows);
+        if let Some(head_seq) = page.head_seq {
+            return Ok(HttpRowsResponse {
+                state: page.state,
+                frontier: page.frontier,
+                rows,
+                head_seq,
+            });
+        }
+        // A truncated page always advances: MAX_ROW_BYTES (1 MiB) is far
+        // below the cap, so the server fits at least one row before
+        // truncating. No progress = server bug; erroring beats spinning.
+        match page_last {
+            Some(last) if last > after => after = last,
+            _ => {
+                return Err(HttpPullError::Malformed(
+                    "truncated HTTP rows page made no progress".into(),
+                ));
+            }
+        }
+    }
+    Err(HttpPullError::Malformed(format!(
+        "HTTP rows still truncated after {MAX_HTTP_ROWS_PAGES} pages"
+    )))
 }
 
 /// Verify that the response proves one contiguous local frontier through its
@@ -852,6 +940,7 @@ impl ChatClient {
             checkpoint_size: 0,
             row_count: 0,
             row_bytes: 0,
+            epoch: 0,
         });
         ChatStatsSnapshot {
             connected: self.flags.connected.load(Relaxed),
@@ -1186,19 +1275,16 @@ async fn offline_sync_once(
         }
     }
 
-    let body = match transport.fetch_rows(pull_since).await {
-        Ok(body) => body,
-        Err(err) => {
+    let response = match fetch_http_rows(transport.as_ref(), pull_since).await {
+        Ok(response) => response,
+        Err(HttpPullError::Transport(err)) => {
             signal_if_access_denied(&err, &flags, &events);
             tracing::warn!(error = %err, "chat2: http pull failed; will retry");
             round_guard.finish();
             let _ = nudge.try_send(());
             return;
         }
-    };
-    let response = match decode_http_rows_response(&body) {
-        Ok(response) => response,
-        Err(err) => {
+        Err(HttpPullError::Malformed(err)) => {
             tracing::warn!(error = %err, "chat2: incomplete/malformed http pull; will retry");
             round_guard.finish();
             let _ = nudge.try_send(());

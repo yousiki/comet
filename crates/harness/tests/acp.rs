@@ -227,6 +227,22 @@ async fn config_options_apply_requested_model_and_effort() {
     );
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
+
+#[tokio::test]
+async fn resumed_first_class_model_is_switched_before_prompt() {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:model-api");
+    req.resume = Some("existing-grok-session".into());
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "model switched".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
 #[tokio::test]
 async fn permission_requests_auto_accept_the_preferred_allow_option() {
     let (controls, _steer, _token) = controls();
@@ -535,6 +551,32 @@ async fn models_fall_back_to_the_static_catalog_when_the_probe_fails() {
     let models = harness.models().await.expect("static fallback");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, vec!["default"], "{models:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn opencode_model_timeout_is_not_hidden_by_the_static_catalog() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("slow-opencode.sh");
+    std::fs::write(&script, "#!/bin/sh\nexec sleep 1000\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let harness = AcpHarness::opencode()
+        .with_executable(&script)
+        .with_graces(Duration::from_millis(10), Duration::from_millis(10))
+        .with_model_discovery_timeout(Duration::from_millis(20));
+    let error = harness
+        .models()
+        .await
+        .expect_err("OpenCode must surface discovery failure so the picker can retry");
+    assert!(
+        error
+            .to_string()
+            .contains("OpenCode model discovery did not complete within"),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]
