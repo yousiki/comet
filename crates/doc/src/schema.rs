@@ -580,9 +580,7 @@ impl SessionDoc {
                             loro::ValueOrContainer::Value(v) => serde_json::to_value(v).ok(),
                             _ => None,
                         })
-                        .and_then(|j| {
-                            serde_json::from_value::<zeron_proto::ToolCall>(j).ok()
-                        })
+                        .and_then(|j| serde_json::from_value::<zeron_proto::ToolCall>(j).ok())
                         .is_some_and(|c| c.is_subagent_spawn());
                     if !is_spawn {
                         return Ok(false);

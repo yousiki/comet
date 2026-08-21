@@ -288,8 +288,11 @@ actor ChatRoomClient {
         // incarnation. A /reset between pages whose new log grew past `after`
         // could otherwise splice old rows onto the new log and slide under
         // the contiguity proof below (applyRow's parked-import detection is
-        // the last line of defense, not the plan).
-        var pageState: (seqFloor: UInt64, checkpointSeq: UInt64,
+        // the last line of defense, not the plan). `epoch` is the real fence
+        // (+1 per /reset — a checkpointless room resets to the same
+        // (0,0,0) tuple); the tuple + headSeq comparisons stay to catch
+        // concurrent checkpoint prunes.
+        var pageState: (epoch: UInt64, seqFloor: UInt64, checkpointSeq: UInt64,
                         checkpointSize: UInt64, headSeq: UInt64)?
         for _ in 0..<32 {
             guard let request = await rowsRequest(after) else {
@@ -314,7 +317,8 @@ actor ChatRoomClient {
             // Any STATE drift across pages (or a headSeq regression) is
             // treated as malformed: drop the cycle and retry clean.
             if let prev = pageState {
-                guard page.state.seqFloor == prev.seqFloor,
+                guard page.state.epoch == prev.epoch,
+                      page.state.seqFloor == prev.seqFloor,
                       page.state.checkpointSeq == prev.checkpointSeq,
                       page.state.checkpointSize == prev.checkpointSize,
                       page.headSeq >= prev.headSeq else {
@@ -322,7 +326,7 @@ actor ChatRoomClient {
                     return
                 }
             }
-            pageState = (page.state.seqFloor, page.state.checkpointSeq,
+            pageState = (page.state.epoch, page.state.seqFloor, page.state.checkpointSeq,
                          page.state.checkpointSize, page.headSeq)
             if truncated {
                 guard let lastSeq = page.rows.last?.seq, lastSeq > after else {
@@ -1119,6 +1123,7 @@ actor ChatRoomClient {
     /// its next cycle re-requests from the held cursor.
     private func maybeRepairGap(gen: Int) async {
         guard gapRepair, gen == generation, socket != nil, stateReceived else { return }
+        let version = resetVersion
         gapRepair = false
         gapRepairs += 1
         guard gapRepairs <= 3 else {
@@ -1127,10 +1132,13 @@ actor ChatRoomClient {
             return
         }
         let after = await delegate.cursor()
-        // Revalidate after the MainActor hop: a reset/redial in the reentrancy
-        // window bumped the generation — a stale rowsReq must not land on the
-        // replacement (possibly pre-hello) socket.
-        guard gen == generation, socket != nil, !closed else { return }
+        // Revalidate after the MainActor hop. Generation alone is not enough:
+        // confirmReset bumps resetVersion and clears stateReceived BEFORE its
+        // own clampCursor await and only restarts the socket (generation+1)
+        // after — a stale rowsReq must not slip out in that window, nor land
+        // on the replacement (possibly pre-hello) socket.
+        guard gen == generation, isCurrent(version: version), stateReceived,
+              socket != nil else { return }
         roomLog.info("chat2 \(self.chatId, privacy: .public): backfilling over a row gap (after=\(after), attempt \(self.gapRepairs))")
         await send(ChatWire.encode(ChatFrameType.rowsReq,
                                    header: ["after": after, "excludeOwn": false]))

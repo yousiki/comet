@@ -3846,7 +3846,6 @@ fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
         .collect()
 }
 
-
 /// Attach the (single) open popover overlay to its trigger chip.
 fn attach_overlay(
     chip: gpui::Stateful<gpui::Div>,

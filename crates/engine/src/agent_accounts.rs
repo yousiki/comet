@@ -1180,11 +1180,7 @@ impl AgentAccounts {
         usage
     }
 
-    async fn claude_usage(
-        &self,
-        slot: &Slot,
-        is_active: bool,
-    ) -> Option<UsageSnapshot> {
+    async fn claude_usage(&self, slot: &Slot, is_active: bool) -> Option<UsageSnapshot> {
         let oauth = slot.credentials.get("claudeAiOauth")?;
         let mut access_token = str_field(oauth, "accessToken")?;
         let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
@@ -1275,7 +1271,10 @@ impl AgentAccounts {
         // so a plan change shows up on the next forced refresh without a
         // re-login.
         let plan_label = codex_plan(str_field(&body, "plan_type").as_deref());
-        Some(UsageSnapshot { windows, plan_label })
+        Some(UsageSnapshot {
+            windows,
+            plan_label,
+        })
     }
 
     /// Refresh a saved Claude slot's expired access token so its usage stays

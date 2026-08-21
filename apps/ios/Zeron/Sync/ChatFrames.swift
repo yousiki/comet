@@ -73,6 +73,10 @@ struct ChatStateHeader: Equatable {
     var checkpointSize: UInt64
     var rowCount: UInt64
     var rowBytes: UInt64
+    /// Room incarnation counter: +1 on every /reset, stable otherwise.
+    /// Rooms predating the meta record send nothing — absent decodes as 0
+    /// (same as the edge's serde default).
+    var epoch: UInt64
 
     init?(_ header: [String: Any]) {
         func u64(_ key: String) -> UInt64 { (header[key] as? NSNumber)?.uint64Value ?? 0 }
@@ -83,6 +87,7 @@ struct ChatStateHeader: Equatable {
         checkpointSize = u64("checkpointSize")
         rowCount = u64("rowCount")
         rowBytes = u64("rowBytes")
+        epoch = u64("epoch")
     }
 }
 
@@ -136,6 +141,8 @@ private struct ChatHTTPStateBody: Decodable {
     var checkpointSize: UInt64
     var rowCount: UInt64?
     var rowBytes: UInt64?
+    /// Absent on pre-meta rooms — treat as 0 (edge-side serde default).
+    var epoch: UInt64?
 }
 
 private struct ChatHTTPRowBody: Decodable {

@@ -226,7 +226,8 @@ export class ChatRoom implements DurableObject {
             checkpointSeq: stats.checkpointSeq,
             checkpointSize: stats.checkpointSize,
             rowCount: stats.rowCount,
-            rowBytes: stats.rowBytes
+            rowBytes: stats.rowBytes,
+            epoch: Number(getMeta(sql, "epoch") ?? "0")
           },
           frontier
         )
@@ -364,10 +365,15 @@ export class ChatRoom implements DurableObject {
       if (denied) return deny(denied);
       // Operator wipe. Recovery is host-driven: the host detects
       // `headSeq < cursor` on its next hello and re-seeds via checkpoint —
-      // same shape as the registry reset recipe.
+      // same shape as the registry reset recipe. The epoch survives the wipe
+      // incremented: it is the incarnation fence clients compare across
+      // paginated pulls (a reset between pages must not let two log
+      // histories stitch into one numerically-contiguous response).
+      const epoch = Number(getMeta(sql, "epoch") ?? "0");
       sql.exec("DELETE FROM rows");
       sql.exec("DELETE FROM meta");
       sql.exec("DELETE FROM blobs");
+      setMeta(sql, "epoch", String(epoch + 1));
       for (const ws of this.ctx.getWebSockets()) {
         try {
           ws.close(4410, "chat room reset");
@@ -450,7 +456,8 @@ export class ChatRoom implements DurableObject {
         checkpointSeq: stats.checkpointSeq,
         checkpointSize: stats.checkpointSize,
         rowCount: stats.rowCount,
-        rowBytes: stats.rowBytes
+        rowBytes: stats.rowBytes,
+        epoch: Number(getMeta(sql, "epoch") ?? "0")
       },
       frontier
     );

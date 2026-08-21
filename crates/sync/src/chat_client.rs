@@ -315,11 +315,15 @@ async fn fetch_http_rows(
         let page = decode_http_rows_page(&body).map_err(HttpPullError::Malformed)?;
         // Cross-page incarnation fence: a /reset (or checkpoint) between pages
         // could otherwise stitch rows from two room incarnations into one
-        // numerically-contiguous response. The checkpoint triple is stable
-        // across a plain pull; head_seq only ever grows. Any drift = restart
-        // the pull rather than certify a mixed history.
+        // numerically-contiguous response. The epoch is the authoritative
+        // fence (/reset bumps it; a checkpointless room's triple is (0,0,0)
+        // on both sides of a reset); the checkpoint triple additionally
+        // catches a concurrent checkpoint pruning rows mid-pull; head_seq
+        // only ever grows. Any drift = restart the pull rather than certify
+        // a mixed history.
         if let Some(prev) = prev_state {
-            if page.state.seq_floor != prev.seq_floor
+            if page.state.epoch != prev.epoch
+                || page.state.seq_floor != prev.seq_floor
                 || page.state.checkpoint_seq != prev.checkpoint_seq
                 || page.state.checkpoint_size != prev.checkpoint_size
                 || page.state.head_seq < prev.head_seq
@@ -936,6 +940,7 @@ impl ChatClient {
             checkpoint_size: 0,
             row_count: 0,
             row_bytes: 0,
+            epoch: 0,
         });
         ChatStatsSnapshot {
             connected: self.flags.connected.load(Relaxed),
