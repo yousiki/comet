@@ -20,7 +20,7 @@ import os
 /// Sync must never fail silently (2026-07-31: a send that never left the
 /// device was indistinguishable from a working one — `try?` all the way
 /// down). Visible in Console.app / `log stream` under this subsystem.
-let roomLog = Logger(subsystem: "sh.zeron.ios", category: "sync")
+let roomLog = Logger(subsystem: "sh.zeron.Zeron", category: "sync")
 
 enum ChatRoomEvent: Sendable {
     /// Joined (or re-joined) and the initial catch-up (checkpoint if needed +
@@ -284,6 +284,13 @@ actor ChatRoomClient {
         var stitched: [ChatHTTPPullRow] = []
         var complete: ChatHTTPPullBatch?
         var after = pullSince
+        // STATE of the previous page — every page must come from ONE room
+        // incarnation. A /reset between pages whose new log grew past `after`
+        // could otherwise splice old rows onto the new log and slide under
+        // the contiguity proof below (applyRow's parked-import detection is
+        // the last line of defense, not the plan).
+        var pageState: (seqFloor: UInt64, checkpointSeq: UInt64,
+                        checkpointSize: UInt64, headSeq: UInt64)?
         for _ in 0..<32 {
             guard let request = await rowsRequest(after) else {
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): http pull skipped — no URL (token unavailable)")
@@ -304,6 +311,19 @@ actor ChatRoomClient {
                 roomLog.error("chat2 \(self.chatId, privacy: .public): http pull body malformed (\(body.count)B)")
                 return
             }
+            // Any STATE drift across pages (or a headSeq regression) is
+            // treated as malformed: drop the cycle and retry clean.
+            if let prev = pageState {
+                guard page.state.seqFloor == prev.seqFloor,
+                      page.state.checkpointSeq == prev.checkpointSeq,
+                      page.state.checkpointSize == prev.checkpointSize,
+                      page.headSeq >= prev.headSeq else {
+                    roomLog.error("chat2 \(self.chatId, privacy: .public): http pull STATE changed between pages (reset mid-pagination?); will retry")
+                    return
+                }
+            }
+            pageState = (page.state.seqFloor, page.state.checkpointSeq,
+                         page.state.checkpointSize, page.headSeq)
             if truncated {
                 guard let lastSeq = page.rows.last?.seq, lastSeq > after else {
                     roomLog.error("chat2 \(self.chatId, privacy: .public): http pull truncated page made no progress (after=\(after)); will retry")
@@ -367,8 +387,9 @@ actor ChatRoomClient {
             contained = await delegate.containsFrontier(stateFrame.payload)
             guard isCurrent(version: cycleVersion) else { return }
         }
-        if case .checkpointThenRows = chatPlanCatchUp(cursor: planAfter, state: state,
-                                                      frontierContained: contained) {
+        let plan = chatPlanCatchUp(cursor: planAfter, state: state,
+                                   frontierContained: contained)
+        if case .checkpointThenRows = plan {
             // The local doc lacks the checkpoint's frontier. Route through
             // completeCheckpointFetch — NOT an inline fetch: the socket
             // handshake may race this pull, see fetchInFlight set, skip its
@@ -400,6 +421,16 @@ actor ChatRoomClient {
             return
         }
         guard isCurrent(version: cycleVersion) else { return }
+        // Same raise as handleState's setCursor: on .rowsOnly the frontier
+        // proof above says the doc already holds the checkpoint, so the
+        // cursor may jump to the plan's `after`. Without it, every pulled row
+        // above the stale cursor reads as a contiguity gap and HTTP-only
+        // polling never converges. (.checkpointThenRows needs nothing here —
+        // the successful applyCheckpoint above already advanced the cursor.)
+        if case .rowsOnly(let planRaise) = plan, planRaise > planAfter {
+            await delegate.setCursor(planRaise)
+            guard isCurrent(version: cycleVersion) else { return }
+        }
         for row in pull.rows {
             guard isCurrent(version: cycleVersion) else { return }
             guard await applyRowFrame(row.frame, recoveryCursor: recoveryCursor,
@@ -917,6 +948,13 @@ actor ChatRoomClient {
         switch plan {
         case .rowsOnly(let a):
             after = a
+            // The plan's `after` IS the cursor now — down (server reset /
+            // amnesty already applied) or UP (a contained checkpoint covers
+            // the skipped span; the doc provably holds its frontier). Without
+            // the raise, the backfill's first row (`after + 1`) reads as a
+            // contiguity gap against a stale cursor.
+            await delegate.setCursor(after)
+            guard gen == generation, isCurrent(version: sessionVersion) else { return }
         case .checkpointThenRows(let a):
             // Fetch in PARALLEL with the row backfill: the rows request goes
             // out below immediately, rows landing mid-download buffer (see
@@ -938,12 +976,14 @@ actor ChatRoomClient {
                 }
             }
             after = a
+            // Deliberately NO setCursor here: the persisted cursor must not
+            // claim the checkpoint before its import lands (the C2 rule — a
+            // fetch failure or a kill mid-download would leave a cursor over
+            // state the doc doesn't hold). applyCheckpoint advances the
+            // cursor to `seq` on success, and every row on this socket
+            // buffers in checkpointBuffer until the drain, so contiguity is
+            // judged against the post-import cursor — no false gap.
         }
-        // The plan's `after` IS the cursor now — down (server reset /
-        // amnesty already applied) or UP (a contained checkpoint covers the
-        // skipped span). Without the raise, the backfill's first row
-        // (`after + 1`) reads as a contiguity gap against a stale cursor.
-        await delegate.setCursor(after)
         await send(ChatWire.encode(ChatFrameType.rowsReq,
                                    header: ["after": after, "excludeOwn": resumed]))
         // Pending pushes go before catch-up completes: batchId dedupe makes
@@ -1087,6 +1127,10 @@ actor ChatRoomClient {
             return
         }
         let after = await delegate.cursor()
+        // Revalidate after the MainActor hop: a reset/redial in the reentrancy
+        // window bumped the generation — a stale rowsReq must not land on the
+        // replacement (possibly pre-hello) socket.
+        guard gen == generation, socket != nil, !closed else { return }
         roomLog.info("chat2 \(self.chatId, privacy: .public): backfilling over a row gap (after=\(after), attempt \(self.gapRepairs))")
         await send(ChatWire.encode(ChatFrameType.rowsReq,
                                    header: ["after": after, "excludeOwn": false]))

@@ -86,7 +86,7 @@ struct AuthClient {
 // MARK: - Keychain storage
 
 enum Keychain {
-    private static let service = "sh.zeron.ios"
+    private static let service = "sh.zeron.Zeron"
 
     static func save(_ value: String, key: String) {
         let data = Data(value.utf8)

@@ -799,6 +799,10 @@ mod tests {
             r#"{ "enabled": ["claude-code"] }"#,
         )
         .unwrap();
+        // The unknown legacy key must PARSE (serde ignores it), not fall back
+        // to defaults through a parse error — pin that directly.
+        serde_json::from_str::<HarnessPrefsFile>(r#"{ "enabled": ["claude-code"], "disabled": [] }"#)
+            .expect("legacy key is ignored, not a parse error");
         let registry = HarnessRegistry::new();
         test_slot(&registry, HarnessId::ClaudeCode, true);
         test_slot(&registry, HarnessId::Codex, true);

@@ -35,7 +35,7 @@ final class RegistryStore {
     /// client's 30s TTL, measured from RECEIPT — beats carry the sender's
     /// wall clock, which we never trust for freshness).
     static let presenceTtlMs: Int64 = 30_000
-    /// Dial-gate thresholds (workspace_host.rs PRESENCE_FRESH_MS /
+    /// Dial-gate thresholds (registry_host.rs PRESENCE_FRESH_MS /
     /// DIAL_GATE_DARK_MS / DIAL_GATE_WARMUP_MS, PR #168).
     static let presenceLiveFreshMs: Int64 = 45_000
     static let dialGateDarkMs: Int64 = 5 * 60_000
@@ -271,7 +271,7 @@ final class RegistryStore {
         return nowMs() - received < Self.presenceTtlMs
     }
 
-    /// Dial-gate verdict (workspace_host.rs peer_liveness): `dark` requires
+    /// Dial-gate verdict (registry_host.rs peer_liveness): `dark` requires
     /// POSITIVE evidence of absence — a joined, warmed-up registry room and a
     /// freshest heartbeat older than 5 minutes. Registry-down and every
     /// ambiguity stay `unknown`, so a rows-down/relay-up incident shape can

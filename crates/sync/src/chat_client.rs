@@ -306,12 +306,30 @@ async fn fetch_http_rows(
 ) -> Result<HttpRowsResponse, HttpPullError> {
     let mut rows: Vec<(wire::RowHeader, Vec<u8>)> = Vec::new();
     let mut after = pull_since;
+    let mut prev_state: Option<wire::StateHeader> = None;
     for _ in 0..MAX_HTTP_ROWS_PAGES {
         let body = transport
             .fetch_rows(after)
             .await
             .map_err(HttpPullError::Transport)?;
         let page = decode_http_rows_page(&body).map_err(HttpPullError::Malformed)?;
+        // Cross-page incarnation fence: a /reset (or checkpoint) between pages
+        // could otherwise stitch rows from two room incarnations into one
+        // numerically-contiguous response. The checkpoint triple is stable
+        // across a plain pull; head_seq only ever grows. Any drift = restart
+        // the pull rather than certify a mixed history.
+        if let Some(prev) = prev_state {
+            if page.state.seq_floor != prev.seq_floor
+                || page.state.checkpoint_seq != prev.checkpoint_seq
+                || page.state.checkpoint_size != prev.checkpoint_size
+                || page.state.head_seq < prev.head_seq
+            {
+                return Err(HttpPullError::Malformed(
+                    "room state changed between HTTP rows pages".into(),
+                ));
+            }
+        }
+        prev_state = Some(page.state);
         let page_last = page.rows.last().map(|(row, _)| row.seq);
         rows.extend(page.rows);
         if let Some(head_seq) = page.head_seq {

@@ -83,7 +83,7 @@ final class NetworkReliabilityTests: XCTestCase {
     @MainActor
     func testRetryReissuesADeadSendAttemptExactlyOnce() throws {
         let config = AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,
-                               userId: "u", orgId: "o", deviceId: "phone",
+                               userId: "u", organizationId: "o", deviceId: "phone",
                                deviceName: "phone", tokens: nil, devBearer: "u@o")
         let store = SessionStore(chatId: "c-reissue", config: config)
         let commands = store.doc.getList(id: "commands")

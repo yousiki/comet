@@ -160,7 +160,7 @@ final class DeviceRpcPending {
     }
 }
 
-/// Registry-presence verdict gating peer dials (workspace_host.rs
+/// Registry-presence verdict gating peer dials (registry_host.rs
 /// PeerLiveness, PR #168): a `dark` verdict fails peer calls fast with ZERO
 /// dials; every ambiguity stays `unknown` so a rows-down/relay-up incident
 /// shape can never park the relay.

@@ -277,8 +277,8 @@ final class AppModel {
     /// engine's 1s compute_connectivity, phone edition).
     private func startConnectivity() {
         connectivity.registryConnected = { [weak self] in
-            guard let self, self.demo == nil, let workspace = self.workspace else { return true }
-            return workspace.connected
+            guard let self, self.demo == nil, let registry = self.registry else { return true }
+            return registry.connected
         }
         connectivity.chatRooms = { [weak self] in
             guard let self else { return [] }
@@ -665,7 +665,7 @@ final class AppModel {
         let store = SessionStore(chatId: chat.id, config: config)
         store.hostDeviceId = chat.deviceId
         store.hostLiveness = { [weak self] deviceId in
-            self?.workspace?.peerLiveness(deviceId) ?? .unknown
+            self?.registry?.peerLiveness(deviceId) ?? .unknown
         }
         sessionStores[chat.id] = store
         store.start()
@@ -742,7 +742,7 @@ final class AppModel {
             let store = SessionStore(chatId: chat.id, config: config)
             store.hostDeviceId = chat.deviceId
             store.hostLiveness = { [weak self] deviceId in
-                self?.workspace?.peerLiveness(deviceId) ?? .unknown
+                self?.registry?.peerLiveness(deviceId) ?? .unknown
             }
             sessionStores[chat.id] = store
             store.start(holdDial: true)

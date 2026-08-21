@@ -400,14 +400,14 @@ struct NewSessionView: View {
             // nothing created (no stranded empty chat in the sidebar).
             var legacyPaths: [String] = []
             if !staged.isEmpty, !queued, model.demo == nil {
-                guard let workspace = model.workspace else {
+                guard let registry = model.registry else {
                     busy = false
                     return
                 }
                 do {
                     for att in staged {
                         let uploadId = UUID().uuidString.lowercased()
-                        let uploaded = try await workspace.uploadAttachment(
+                        let uploaded = try await registry.uploadAttachment(
                             deviceId: space.deviceId, name: att.name, data: att.data,
                             uploadId: uploadId)
                         AttachmentImageCache.shared.seed(deviceId: space.deviceId, path: uploaded,
