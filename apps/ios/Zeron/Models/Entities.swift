@@ -12,6 +12,9 @@ struct DeviceRow: Identifiable, Hashable {
     var platform: String
     var lastSeenAt: Int64?
     var createdAt: Int64?
+    /// Engine version stamped by the device ("0.2.21"); informational only —
+    /// this fork has no version gates (no-backward-compat).
+    var version: String?
 }
 
 struct Space: Identifiable, Hashable {
@@ -286,6 +289,15 @@ struct RepoRef: Codable, Hashable, Identifiable {
 
 let commandDefaultTtlMs: Int64 = 86_400_000
 
+/// zeron-proto WorktreeSpec (agent.rs, PR #159): a worktree the HOST
+/// materializes at command-drain time — the client never blocks on a
+/// CreateWorktree relay RPC before a send. Old hosts ignore the field and run
+/// in `cwd` (the repo's main checkout): degraded, never hung.
+struct WorktreeSpec: Codable, Hashable {
+    var repoPath: String
+    var base: String
+}
+
 /// zeron-proto RunRequest (agent.rs:81). `reasoning` is lowercase
 /// ("high"/"xhigh"/…), `sandbox` kebab-case ("workspace-write"), harness ids
 /// kebab-case ("claude-code").
@@ -303,10 +315,15 @@ struct RunRequest: Codable {
     var autoApprove: Bool = true
     var resume: String?
     /// Absolute paths of image attachments already staged on the run device
-    /// (UploadChunk/UploadCommit). The same paths ride the prompt text as
-    /// `Attached images (local files …)` refs — this field additionally lets
+    /// (UploadChunk/UploadCommit) — or `pending://{uploadId}/{name}` refs on
+    /// the queued flow, which the host resolves to absolute
+    /// paths once the bytes land. The same refs ride the prompt text as
+    /// `Attached images (local files …)` lines — this field additionally lets
     /// a harness inline the bytes as image content blocks.
     var attachments: [String] = []
+    /// Worktree for the host to materialize at drain time (PR #159). Omitted
+    /// from the JSON when nil, so old hosts see the legacy shape.
+    var worktree: WorktreeSpec?
 }
 
 enum SessionCommandPayload {

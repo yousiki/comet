@@ -4,7 +4,7 @@
 //! Layout is zeron's: collapsible drag-resizable sidebar (208–400px, default
 //! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
 //! content outlet, and a reserved h-6 status strip so later content never
-//! shifts; right pane scaffold (360–760px, default 520), hidden by default.
+//! shifts; right pane scaffold (360px floor, default 520), hidden by default.
 //! Widths/collapsed state persist to `ui-settings.json` (debounced).
 //!
 //! Resize handles use gpui's drag-and-drop pattern (an `on_drag` with an empty
@@ -47,7 +47,7 @@ use crate::settings::organization::{
 };
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
+    CHAT_PANEL_MIN, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
@@ -252,6 +252,20 @@ impl SettingsSection {
 pub enum Route {
     Chat,
     Settings(SettingsSection),
+}
+
+/// Maximum width the right pane may occupy while retaining the conversation
+/// floor. On unusually small windows this deliberately falls below the right
+/// pane's preferred minimum: the chat remains usable and the side surface
+/// yields the scarce space.
+fn right_pane_max_width(viewport: f32, sidebar: f32) -> f32 {
+    (viewport - sidebar - CHAT_PANEL_MIN).max(0.0)
+}
+
+/// Width used by right-pane takeover. Unlike manual resizing, takeover is
+/// intentionally allowed to consume the conversation column completely.
+fn right_pane_takeover_width(viewport: f32, sidebar: f32) -> f32 {
+    (viewport - sidebar).max(0.0)
 }
 
 /// One right-pane surface tab (t3code RightPanelSurface, narrowed to our two
@@ -1540,7 +1554,8 @@ pub struct Shell {
     /// to zero. Session-local view state — never persisted, reset on close.
     right_pane_expanded: bool,
     /// Viewport width stamped each frame at render — the expanded panel's
-    /// width target ([`Self::right_target`] has no `Window`).
+    /// width target and the physical ceiling for free-form resizing
+    /// ([`Self::right_target`] has no `Window`).
     viewport_width: f32,
     terminal_tween: Option<WidthTween>,
     /// Last observed `window.is_fullscreen()` (`None` before first paint) —
@@ -2302,14 +2317,18 @@ impl Shell {
     fn right_target(&self, cx: &App) -> f32 {
         if !self.right_pane_open(cx) {
             0.0
-        } else if self.right_pane_expanded {
-            // Takeover: everything right of the sidebar; the conversation
-            // column (flex_1) collapses to zero behind it. Rides the sidebar's
-            // width tween so a sidebar toggle mid-takeover stays seamless.
-            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-            (self.viewport_width - sidebar_now).max(RIGHT_PANE_MIN)
         } else {
-            self.settings.right_pane_width
+            // Manual sizing preserves a usable conversation column. Takeover
+            // intentionally consumes it completely. Both ride the sidebar
+            // tween so toggling it remains seamless.
+            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+            if self.right_pane_expanded {
+                right_pane_takeover_width(self.viewport_width, sidebar_now)
+            } else {
+                self.settings
+                    .right_pane_width
+                    .min(right_pane_max_width(self.viewport_width, sidebar_now))
+            }
         }
     }
 
@@ -2818,9 +2837,14 @@ impl Shell {
     ) {
         let viewport = f32::from(window.viewport_size().width);
         let width = viewport - f32::from(event.event.position.x);
-        // zeron caps the pane at 52% of the window on top of the absolute range.
-        let max = RIGHT_PANE_MAX.min(viewport * 0.52);
-        self.settings.right_pane_width = width.clamp(RIGHT_PANE_MIN, max.max(RIGHT_PANE_MIN));
+        // No arbitrary percentage ceiling, but retain the chat's usable 300px
+        // floor instead of allowing the conversation to collapse to zero.
+        let max = right_pane_max_width(viewport, self.sidebar_target());
+        self.settings.right_pane_width = if max >= RIGHT_PANE_MIN {
+            width.clamp(RIGHT_PANE_MIN, max)
+        } else {
+            max
+        };
         self.right_tween = None;
         self.schedule_save(cx);
         cx.notify();
@@ -4559,8 +4583,15 @@ impl Shell {
         motion::lerp(from, to, RESIZE.progress(raw))
     }
 
-    /// Animated width container: tweens 200ms ease-out on collapse/expand, and
-    /// clips a fixed-width inner so content never reflows mid-transition.
+    fn tween_active(&self, tween: Option<WidthTween>) -> bool {
+        tween.is_some_and(|tween| {
+            !self.reduced_motion
+                && tween.started.elapsed() < RESIZE.total().mul_f32(motion::speed_scale())
+        })
+    }
+
+    /// Animated width container: tweens 200ms ease-out on collapse/expand and
+    /// clips the surface as it follows the current width.
     fn pane_container(
         &self,
         tween: Option<WidthTween>,
@@ -7748,7 +7779,11 @@ impl Shell {
                     let panel = self.right_terminal_panel(cx);
                     // Keep the embedded panel's own active tab aligned with
                     // the resolved surface (fallbacks can move it).
-                    panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
+                    let resize_suspended = self.tween_active(self.right_tween);
+                    panel.update(cx, |panel, cx| {
+                        panel.set_resize_suspended(resize_suspended);
+                        panel.select_tab_by_key(tab, cx);
+                    });
                     panel.into_any_element()
                 }
                 RightSurface::Subagent(id) if self.subagent_tabs.contains_key(&id) => {
@@ -7817,21 +7852,7 @@ impl Shell {
         // Flush panel (user request — the inset card is gone): full window
         // height with a left hairline, glass-friendly like the terminal dock
         // (translucent over the frost; solid otherwise). The resize grabber
-        // floats over the border seam.
-        let handle = self
-            .resize_handle(
-                "right-pane-resize",
-                || RightPaneResize,
-                |shell, _| shell.settings.right_pane_width = RIGHT_PANE_DEFAULT,
-                cx,
-            )
-            .absolute()
-            .top_0()
-            .bottom_0()
-            // INSIDE the width-clipped container (a negative inset was
-            // clipped into unreachability — user-reported dead resize),
-            // overlapping the panel's left border.
-            .left(px(0.0));
+        // lives outside this clipped container, on the root layout's seam.
         let panel_bg = if theme.is_glass() {
             bg.opacity(0.4)
         } else {
@@ -7854,18 +7875,10 @@ impl Shell {
             .pt(px(Theme::TITLEBAR_HEIGHT))
             .child(content);
         let target = self.right_target(cx);
-        // Takeover mode has no drag width — the handle would fight the
-        // viewport-derived target.
-        let handle = (!self.right_pane_expanded).then_some(handle);
         self.pane_container(
             self.right_tween,
             target,
-            div()
-                .h_full()
-                .relative()
-                .child(panel)
-                .children(handle)
-                .into_any_element(),
+            div().h_full().relative().child(panel).into_any_element(),
         )
     }
 
@@ -9132,6 +9145,7 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.viewport_width = f32::from(window.viewport_size().width);
         let theme = Theme::of(cx);
         // The shell tone (zeron `.frost`): the surface the sidebar sits on and
         // the main panel floats over as an inset rounded card. On macOS the
@@ -9294,6 +9308,9 @@ impl Render for Shell {
                 self.viewport_width = viewport;
                 let main_width =
                     (viewport - self.sidebar_target() - self.right_target(cx) - 10.0).max(0.0);
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_available_width(main_width, cx)
+                });
                 // Clearance excludes the terminal dock: the transcript
                 // viewport ends at the dock's top (see the underlay in
                 // `render_main`), so only the chrome above it overlaps.
@@ -9317,6 +9334,24 @@ impl Render for Shell {
                 // around the diff column) — the per-session open flags stay
                 // intact for the return trip.
                 let on_chat = matches!(self.route, Route::Chat);
+                let right_open = on_chat && self.right_pane_open(cx);
+                // Takeover mode derives its width from the viewport, so a
+                // manual drag handle would fight the expanded target.
+                let right_handle = (right_open && !self.right_pane_expanded).then(|| {
+                    self.resize_handle(
+                        "right-pane-resize",
+                        || RightPaneResize,
+                        |shell, _| shell.settings.right_pane_width = RIGHT_PANE_DEFAULT,
+                        cx,
+                    )
+                    // A forgiving transparent hit target centered on the
+                    // seam; the panel's 1px border remains the visual divider.
+                    .w(px(12.0))
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(-6.0))
+                });
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
                 } else {
@@ -9351,6 +9386,20 @@ impl Render for Shell {
                     .flex_none()
                     .relative()
                     .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
+                // Keep the right resize target outside the pane's
+                // overflow-hidden width container. This mirrors the sidebar
+                // seam and lets the target straddle both adjacent panes.
+                let right_seam: AnyElement = if let Some(handle) = right_handle {
+                    div()
+                        .w(px(0.0))
+                        .h_full()
+                        .flex_none()
+                        .relative()
+                        .child(handle)
+                        .into_any_element()
+                } else {
+                    Empty.into_any_element()
+                };
                 let title_bar = self.render_title_bar(cx);
                 // Sidebar tone: a slightly lighter column behind the sidebar,
                 // spanning the FULL window height (under the traffic lights,
@@ -9385,6 +9434,7 @@ impl Render for Shell {
                             .child(sidebar)
                             .child(sidebar_seam)
                             .child(card)
+                            .child(right_seam)
                             .child(right),
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
@@ -10233,6 +10283,22 @@ mod tests {
                 })
             ));
         });
+    }
+
+    #[test]
+    fn right_pane_ceiling_preserves_the_chat_floor() {
+        assert_eq!(right_pane_max_width(1200.0, 256.0), 644.0);
+        assert_eq!(1200.0 - 256.0 - 644.0, CHAT_PANEL_MIN);
+        // The chat floor wins over the right pane's preferred 360px minimum
+        // when the whole window is unusually narrow.
+        assert_eq!(right_pane_max_width(800.0, 256.0), 244.0);
+        assert_eq!(800.0 - 256.0 - 244.0, CHAT_PANEL_MIN);
+    }
+
+    #[test]
+    fn right_pane_takeover_consumes_the_chat_column() {
+        assert_eq!(right_pane_takeover_width(1200.0, 256.0), 944.0);
+        assert_eq!(1200.0 - 256.0 - 944.0, 0.0);
     }
 
     #[tokio::test]

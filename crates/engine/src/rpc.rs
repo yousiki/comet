@@ -1427,6 +1427,9 @@ impl RpcService for EngineRpc {
             methods::WATCH_CONNECTIVITY => Ok(RpcReply::Stream(watch_stream(
                 self.doc_host.watch_connectivity(),
             ))),
+            methods::WATCH_TRANSFERS => Ok(RpcReply::Stream(watch_stream(
+                self.doc_host.watch_transfers(),
+            ))),
             methods::WATCH_CHATS => Ok(RpcReply::Stream(watch_stream(self.registry.watch_chats()))),
             methods::WATCH_DEVICES => Ok(RpcReply::Stream(watch_stream(
                 self.registry.watch_devices(),
