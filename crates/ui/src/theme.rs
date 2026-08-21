@@ -50,10 +50,6 @@ impl Appearance {
         matches!(self, Self::Dark)
     }
 
-    pub fn is_light(self) -> bool {
-        matches!(self, Self::Light)
-    }
-
     /// Map a gpui window appearance onto ours (both vibrant variants are just
     /// the blurred flavour of the same tone).
     pub fn from_window(appearance: gpui::WindowAppearance) -> Self {

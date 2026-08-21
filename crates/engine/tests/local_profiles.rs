@@ -277,24 +277,13 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
 }
 
 #[tokio::test]
-async fn synced_accounts_isolate_uploads_and_assign_the_legacy_cache_once() {
+async fn synced_accounts_isolate_their_uploads() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let legacy_root = dir.path().join("uploads");
-    std::fs::create_dir(&legacy_root).expect("legacy uploads root");
-    let legacy_upload = legacy_root.join("legacy.png");
-    std::fs::write(&legacy_upload, b"legacy").expect("legacy attachment");
 
     let first_profile = EngineProfile::synced(dir.path(), "org-a", "user-a");
     let first_upload = {
         let core = assemble(first_profile.clone());
         assert_eq!(core.uploads.dir(), first_profile.uploads_root());
-        assert_eq!(
-            core.uploads
-                .read_chunk(legacy_upload.to_str().unwrap(), 0, &[])
-                .expect("legacy owner can read the compatibility cache")
-                .data,
-            "bGVnYWN5"
-        );
         core.uploads
             .append("shared-upload", "YWNjb3VudC1h", Some(0))
             .expect("stage first account upload");
@@ -312,13 +301,11 @@ async fn synced_accounts_isolate_uploads_and_assign_the_legacy_cache_once() {
         let core = assemble(second_profile.clone());
         assert_eq!(core.uploads.dir(), second_profile.uploads_root());
         assert_ne!(core.uploads.dir(), first_profile.uploads_root());
-        for path in [legacy_upload.to_str().unwrap(), &first_upload] {
-            let error = core
-                .uploads
-                .read_chunk(path, 0, &[])
-                .expect_err("another account must not read the attachment");
-            assert!(error.to_string().contains("outside the upload cache"));
-        }
+        let error = core
+            .uploads
+            .read_chunk(&first_upload, 0, &[])
+            .expect_err("another account must not read the attachment");
+        assert!(error.to_string().contains("outside the upload cache"));
         core.uploads
             .append("shared-upload", "YWNjb3VudC1i", Some(0))
             .expect("stage second account upload with the same id");
@@ -339,13 +326,6 @@ async fn synced_accounts_isolate_uploads_and_assign_the_legacy_cache_once() {
             .expect("first account can reopen its scoped upload")
             .data,
         "YWNjb3VudC1h"
-    );
-    assert_eq!(
-        core.uploads
-            .read_chunk(legacy_upload.to_str().unwrap(), 0, &[])
-            .expect("legacy ownership survives account switches")
-            .data,
-        "bGVnYWN5"
     );
     let error = core
         .uploads

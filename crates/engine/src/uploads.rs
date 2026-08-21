@@ -111,28 +111,13 @@ pub struct Uploads {
 }
 
 impl Uploads {
-    /// Use the historical device-global uploads directory.
-    pub fn new(data_dir: &Path) -> Self {
-        Self::from_root(&data_dir.join("uploads"))
-    }
-
     /// Use an already-resolved profile uploads directory.
     pub fn from_root(dir: &Path) -> Self {
-        Self::from_root_with_fallback(dir, None)
-    }
-
-    /// Use a profile root for all writes and an optional legacy read-only root.
-    pub fn from_root_with_fallback(dir: &Path, legacy_read_root: Option<&Path>) -> Self {
         Self {
             inner: Arc::new(UploadsInner {
                 tmp: dir.join("tmp"),
                 dir: dir.to_path_buf(),
-                read_only_roots: std::sync::RwLock::new(
-                    legacy_read_root
-                        .into_iter()
-                        .map(Path::to_path_buf)
-                        .collect(),
-                ),
+                read_only_roots: std::sync::RwLock::new(Vec::new()),
             }),
         }
     }

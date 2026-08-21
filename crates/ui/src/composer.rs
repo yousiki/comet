@@ -367,12 +367,6 @@ pub fn flip_morph_step(
     })
 }
 
-/// Engines at or above this version understand `pending://` attachment refs
-/// and QueueCommand `transfers` (send-is-a-local-write attachments). Gated on
-/// BOTH the local engine (an IPC daemon may be older than this UI) and, for
-/// remotely-hosted chats, the host device's stamped registry version.
-const QUEUED_ATTACHMENTS_MIN: (u64, u64, u64) = (0, 2, 12);
-
 /// What the send button is right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendButtonMode {
@@ -4634,18 +4628,6 @@ impl Composer {
                 .or_else(|| local_device_id.clone())
                 .unwrap_or_else(|| "local".to_string())
         };
-        // Uploads/read-backs target the chat's HOST device (forwardable RPCs);
-        // for a new chat that's the target device (None when it's local).
-        let host_device_id = if is_new {
-            target_device_id
-                .clone()
-                .filter(|id| local_device_id.as_deref() != Some(id.as_str()))
-        } else {
-            self.state
-                .read(cx)
-                .selected_chat_row()
-                .map(|c| c.device_id.clone())
-        };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
@@ -4677,24 +4659,8 @@ impl Composer {
         // and let the engine push the bytes to a remote host afterwards —
         // staging must never gate the queue (2026-08-19 incident: a send
         // died with a zombie peer link because the upload sat in front of
-        // QueueCommand). Requires every engine involved to understand the
-        // ref scheme — the local engine (an IPC daemon may be older than
-        // this UI) and, for remotely-hosted chats, the host; anything older
-        // keeps the legacy blocking upload.
-        let host_is_remote = host_device_id
-            .as_deref()
-            .is_some_and(|id| local_device_id.as_deref() != Some(id));
-        let queued_flow = !staged.is_empty() && {
-            let state = self.state.read(cx);
-            let local_ok = local_device_id
-                .as_deref()
-                .is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN));
-            let host_ok = !host_is_remote
-                || host_device_id
-                    .as_deref()
-                    .is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN));
-            local_ok && host_ok
-        };
+        // QueueCommand).
+        let queued_flow = !staged.is_empty();
         // Upload identities minted NOW: in the queued flow the `pending://`
         // ref IS the persisted transport until the host rewrites it, so the
         // id must exist before any bytes move.
@@ -4709,18 +4675,11 @@ impl Composer {
         // refresh replaces with the host's absolute paths. Either way the
         // staged bytes are seeded into the transcript cache under every
         // device key the transcript consults.
-        let echo_paths: Vec<String> = if queued_flow {
-            staged
-                .iter()
-                .zip(&upload_ids)
-                .map(|(att, id)| format!("pending://{id}/{}", att.name))
-                .collect()
-        } else {
-            staged
-                .iter()
-                .map(|att| format!("pending/{}/{}", att.id, att.name))
-                .collect()
-        };
+        let echo_paths: Vec<String> = staged
+            .iter()
+            .zip(&upload_ids)
+            .map(|(att, id)| format!("pending://{id}/{}", att.name))
+            .collect();
         let echo_text = attachments::with_attachments(&text, &echo_paths);
         // Queued flow also seeds the UPLOAD ALIAS: the host rewrites the
         // persisted ref to `{its uploads dir}/{id8}-{name}` — an absolute
@@ -4823,15 +4782,11 @@ impl Composer {
                 // Queued flow: commit the bytes to the LOCAL engine's uploads
                 // dir (fast, offline-safe) — the queued command carries the
                 // `pending://` refs and the engine delivers the bytes to a
-                // remote host afterwards, retrying until they land. Legacy
-                // flow (old engines): stage on the host device up front,
-                // bounded by a total budget so a degraded link fails the send
-                // loudly instead of grinding through silent per-chunk retries
-                // for minutes.
+                // remote host afterwards, retrying until they land.
                 let mut content = text.clone();
                 let mut attachment_paths: Vec<String> = Vec::new();
                 let mut transfers: Vec<serde_json::Value> = Vec::new();
-                if !staged.is_empty() && queued_flow {
+                if queued_flow {
                     // Local staging is disk-speed; publish progress anyway so
                     // huge files still narrate.
                     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -4868,88 +4823,6 @@ impl Composer {
                     // The echo refs ARE the persisted refs — no refresh pass.
                     attachment_paths = echo_paths.clone();
                     content = echo_text.clone();
-                } else if !staged.is_empty() {
-                    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                    let total: u64 = staged.iter().map(|a| a.bytes().len() as u64).sum();
-                    {
-                        let progress = progress.clone();
-                        this.update(cx, |composer, cx| {
-                            composer.state.update(cx, |s, cx| {
-                                s.begin_upload_progress(total, progress);
-                                cx.notify();
-                            });
-                        })
-                        .ok();
-                    }
-                    for (att, upload_id) in staged.iter().zip(&upload_ids) {
-                        match attachments::upload_attachment(
-                            &engine,
-                            cx.background_executor(),
-                            host_device_id.as_deref(),
-                            upload_id,
-                            att,
-                            Some(progress.clone()),
-                        )
-                        .await
-                        {
-                            Ok(path) => attachment_paths.push(path),
-                            Err(err) => {
-                                tracing::warn!(name = %att.name, error = %err, "attachment upload failed");
-                                return Err(
-                                    "Couldn't upload the attachment — the device may be offline."
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
-                    // Seed the transcript cache from local bytes so the sent
-                    // bubble's thumbnails never round-trip (seedTranscript-
-                    // Attachment in the original send path).
-                    let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
-                    for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(
-                            &attachment_namespace,
-                            &seed_device,
-                            path,
-                            &att.name,
-                            att.image.clone(),
-                        );
-                        if seed_device != device_id {
-                            attachments::seed_attachment(
-                                &attachment_namespace,
-                                &device_id,
-                                path,
-                                &att.name,
-                                att.image.clone(),
-                            );
-                        }
-                    }
-                    content = attachments::with_attachments(&text, &attachment_paths);
-                    // Refresh the echo in place with the attachment refs
-                    // (same id, same clock — the bubble grows its thumbnails
-                    // without flickering).
-                    let refreshed = SessionMessageEntry {
-                        id: message_id.clone(),
-                        role: zeron_doc::MessageRole::User,
-                        parts: vec![MessagePart::Text {
-                            id: "t0".into(),
-                            text: content.clone(),
-                        }],
-                        created_at,
-                        device_id: "local".into(),
-                        user_id: None,
-                        status: None,
-                        continuation_of: None,
-                    };
-                    let echo_chat_id = chat_id.clone();
-                    this.update(cx, |composer, cx| {
-                        composer.state.update(cx, |s, cx| {
-                            s.remove_echo(&echo_chat_id, &message_id);
-                            s.push_echo(&echo_chat_id, refreshed);
-                            cx.notify();
-                        });
-                    })
-                    .ok();
                 }
 
                 // Resolve the working directory: existing chats keep theirs;

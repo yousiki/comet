@@ -5,7 +5,7 @@
 //! the synced profile — through the same write paths every live mutation
 //! uses, so nothing here invents a second persistence or sync mechanism:
 //!
-//!  - chat docs land via `save_snapshot_with_cursor(chat_id, bytes, 0, CHAT2_DOC_EPOCH)`,
+//!  - chat docs land via `save_snapshot_with_cursor(chat_id, bytes, 0, THIN_DOC_EPOCH)`,
 //!    which is exactly the "born chat2" shape: cursor 0 makes the first room
 //!    join push the doc's full update log from VV zero (doc_host first-contact
 //!    push), and epoch 2 keeps `DocHost::open` off the s2 discard-and-adopt
@@ -14,8 +14,7 @@
 //!    `import_space_row` (live upserts: persisted, pushed, watched).
 //!  - attachments are NOT copied or rewritten. Transcripts embed absolute
 //!    paths under the local profile's uploads root, so that root becomes a
-//!    read-only jail root of the synced profile — the exact mechanism the
-//!    legacy-uploads adoption already uses (`EngineProfile::claim_legacy_uploads_root`).
+//!    read-only jail root of the synced profile (`Uploads::add_read_only_root`).
 //!    The marker file re-arms the root on every later synced boot.
 //!
 //! Idempotence is structural: a chat/space whose row already exists in the
@@ -30,7 +29,7 @@ use zeron_doc::{REGISTRY_DOC_ID, RegistryDoc};
 use zeron_sync::DocsStore;
 
 use crate::EngineError;
-use crate::chat2_host::CHAT2_DOC_EPOCH;
+use crate::chat_room_host::THIN_DOC_EPOCH;
 use crate::registry_host::RegistryHost;
 use crate::run_journal::journal_paths;
 use crate::uploads::Uploads;
@@ -408,7 +407,7 @@ impl LocalImporter {
                 &chat.id,
                 &bytes,
                 0,
-                CHAT2_DOC_EPOCH,
+                THIN_DOC_EPOCH,
             )?;
         }
 
@@ -426,11 +425,10 @@ impl LocalImporter {
         }
 
         // Row last: once it appears in watchers the chat is clickable, and by
-        // then its doc + journal are already in place. Chat2 lineage is
-        // explicit so `DocHost::open` never routes the import down the legacy
-        // s2 adopt branch.
+        // then its doc + journal are already in place. Imported chats join
+        // gen 3 (organization-shared chat3) like every other chat.
         let mut row = chat.clone();
-        row.room_gen = Some(CHAT2_DOC_EPOCH);
+        row.room_gen = Some(3);
         self.inner.registry.import_chat_row(&row)?;
         Ok(copied)
     }

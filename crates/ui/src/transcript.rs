@@ -2201,11 +2201,6 @@ impl Transcript {
         cx.notify();
     }
 
-    /// Whether the transcript is currently pinned to the bottom.
-    pub fn is_pinned(&self) -> bool {
-        self.pinned
-    }
-
     /// Whether the shell should float the "Scroll to bottom" pill (scrolled
     /// more than [`SCROLL_BUTTON_THRESHOLD_PX`] off the end, unpinned).
     pub fn jump_button_shown(&self) -> bool {

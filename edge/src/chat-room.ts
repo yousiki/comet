@@ -63,8 +63,8 @@ const QUOTA_MAX_BYTES = 8 * 1024 * 1024;
 interface SocketState {
   userId: string;
   device: string;
-  /** Historical serialized attachment field. Explicit on new sockets; missing
-   * on pre-deploy attachments, where disabling excludeOwn is data-safe. */
+  /** Historical serialized attachment field (kept so hibernated sockets from
+   * older deploys still deserialize). Always true on new sockets. */
   orgChat?: boolean;
   /** Set once a valid hello established the session. */
   ready?: boolean;
@@ -109,11 +109,10 @@ export class ChatRoom implements DurableObject {
     if (!userId) return json({ error: "unauthenticated" }, 401);
 
     const sql = this.ctx.storage.sql;
-    // Organization-shared legacy `chat3` rooms use host-user discipline via
-    // authorizeChatRoom; legacy `chat2`
-    // rooms keep the single-owner discipline, claiming on the first
-    // authenticated contact. The header is Worker-controlled
-    // (deleted-then-set on every forward).
+    // Only Organization-shared `chat3` rooms are routable — the Worker stamps
+    // the room kind (deleted-then-set on every forward). The retired
+    // single-owner `chat2` namespace has no route any more; a request without
+    // the header can only be a stale hibernated socket's, and is denied.
     const organizationSharedRoom =
       request.headers.get(ROOM_KIND_HEADER) === LEGACY_ORGANIZATION_CHAT_ROOM_KIND;
     const roleHost = url.searchParams.get("role") === "host";
@@ -129,20 +128,12 @@ export class ChatRoom implements DurableObject {
       }
       return response;
     };
-    /** null = allowed (a shared-room host claim is persisted as a side effect). */
+    /** null = allowed (a host claim is persisted as a side effect). */
     const gate = (op: ChatOp): Response | null => {
-      if (organizationSharedRoom) {
-        const verdict = authorizeChatRoom(op, userId, getMeta(sql, "hostUser") ?? null, roleHost);
-        if (!verdict.allow) return json({ error: "forbidden" }, 403);
-        if (verdict.claimHost) setMeta(sql, "hostUser", userId);
-        return null;
-      }
-      // Claim on first authenticated contact, then stay owner-only forever.
-      // The /rows twins must be able to claim too: otherwise a brand-new chat
-      // deadlocks on networks where the WebSocket upgrade never succeeds.
-      const owner = getMeta(sql, "owner");
-      if (!owner) setMeta(sql, "owner", userId);
-      else if (owner !== userId) return json({ error: "forbidden" }, 403);
+      if (!organizationSharedRoom) return json({ error: "forbidden" }, 403);
+      const verdict = authorizeChatRoom(op, userId, getMeta(sql, "hostUser") ?? null, roleHost);
+      if (!verdict.allow) return json({ error: "forbidden" }, 403);
+      if (verdict.claimHost) setMeta(sql, "hostUser", userId);
       return null;
     };
 
@@ -224,12 +215,6 @@ export class ChatRoom implements DurableObject {
       // so clients reuse their existing decoder.
       const afterRaw = Number(url.searchParams.get("after") ?? "0");
       const after = Number.isInteger(afterRaw) && afterRaw >= 0 ? afterRaw : 0;
-      const device = url.searchParams.get("device") ?? "";
-      const exclude = excludedDevice(
-        organizationSharedRoom,
-        url.searchParams.get("excludeOwn") === "1",
-        device
-      );
       const stats = logStats(sql);
       const frontier = this.blobs.get(FRONTIER_BLOB) ?? new Uint8Array(0);
       const frames: Uint8Array[] = [
@@ -246,7 +231,7 @@ export class ChatRoom implements DurableObject {
           frontier
         )
       ];
-      for (const row of rowsAfter(sql, after, exclude)) {
+      for (const row of rowsAfter(sql, after, undefined)) {
         frames.push(
           encodeFrame(
             FRAME.row,
@@ -426,7 +411,7 @@ export class ChatRoom implements DurableObject {
     // The URL `device` param (Worker-validated against ID_RE) is the ONLY
     // device source. The hello header's copy is ignored so attribution cannot
     // change after the authenticated upgrade. Quotas/outcomes also include
-    // `userId`, and Organization-shared rooms disable raw-device `excludeOwn` below.
+    // `userId`, and replay rows are never filtered by raw device.
     void header;
     state.ready = true;
     ws.serializeAttachment(state);
@@ -457,15 +442,11 @@ export class ChatRoom implements DurableObject {
       return;
     }
     const after = typeof header.after === "number" && header.after >= 0 ? header.after : 0;
-    // In an Organization-shared room `device` is caller-selected, not identity-bound. Another
-    // member may legitimately or maliciously reuse it; filtering by the raw
-    // value would hide that member's rows forever. Re-importing our own Loro
-    // rows is a no-op, so chat3 disables this bandwidth-only optimization.
-    // Old serialized attachments have `orgChat === undefined`; fail safe and
-    // disable exclusion until their next reconnect stamps the room kind.
-    const exclude = excludedDevice(state.orgChat, header.excludeOwn === true, state.device);
+    // `device` is caller-selected, not identity-bound, in an Organization-
+    // shared room; never filter replay rows by it (re-importing our own
+    // Loro rows is a no-op anyway).
     const sql = this.ctx.storage.sql;
-    for (const row of rowsAfter(sql, after, exclude)) {
+    for (const row of rowsAfter(sql, after, undefined)) {
       send(ws, FRAME.row, { seq: row.seq, device: row.device, batchId: row.batchId }, row.bytes);
     }
     send(ws, FRAME.rowsDone, { headSeq: headSeq(sql) });
@@ -625,16 +606,6 @@ export class ChatRoom implements DurableObject {
  * device string (or a blank one) must never share a window or a ledger row. */
 const attributionKey = (state: SocketState): string =>
   `${state.userId}:${state.device === "" ? "(unknown)" : state.device}`;
-
-/** Legacy `chat2` may omit its own device's replay rows. Organization-shared `chat3` must
- * not: device ids are not bound to user identity, so a collision would hide a
- * foreign member's update. */
-const excludedDevice = (
-  organizationSharedRoom: boolean | undefined,
-  requested: boolean,
-  device: string
-): string | undefined =>
-  requested && organizationSharedRoom === false && device !== "" ? device : undefined;
 
 const send = (
   ws: WebSocket,

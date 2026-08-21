@@ -27,8 +27,7 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
   diff sync, doc hosting. Pure Rust daemon, fully functional headless.
 - **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC whether the engine is in-process or a separate daemon. Organized around **Projects** — device-and-folder pairs represented as `Space` on the wire — local or synced according to the active profile. The sidebar is the data: an attention-sorted Sessions list, filtered by a searchable Project dropdown ("All Projects" included) that also hosts Project management. The horizontal tabs are a **device-local viewport** onto that list (`ui-settings.json` `openTabs`, cross-Project): closing a tab is local-only — archiving is an explicit sidebar action — and a sidebar click (re)opens a session as a tab. The new-session canvas carries a Project picker (defaulting to the sidebar filter, else the last selected Project); new sessions are minted onto the picked Project's device via relay-forwardable RPCs.
 - **Edge (TypeScript, ported from zeron `apps/edge`)**: Worker + ChatRoom DO (per chat, the
-  chat2 row protocol; the legacy SessionRoom DO remains deployed only for pre-cutover clients —
-  no current client dials it) + DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth.
+  chat2 row protocol) + DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth.
   Absorbs the old `apps/server` responsibilities (WorkOS code exchange/refresh,
   organizations) so
   **Postgres, the Hono server, and the WebRTC/signaling stack are all gone**.

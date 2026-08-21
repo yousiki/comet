@@ -26,8 +26,6 @@ const CAPTURED_ENV: &[&str] = &[
     "ZERON_EDGE_URL",
     "ZERON_EDGE_TOKEN",
     "ZERON_ORGANIZATION_ID",
-    // Legacy install-time override kept so existing service recipes still work.
-    "ZERON_ORG_ID",
     "ZERON_WORKOS_CLIENT_ID",
     "ZERON_WORKOS_API_BASE",
     "ZERON_IPC_PORT",
@@ -382,7 +380,6 @@ mod tests {
     #[test]
     fn captured_env_keeps_canonical_and_legacy_organization_overrides() {
         assert!(CAPTURED_ENV.contains(&"ZERON_ORGANIZATION_ID"));
-        assert!(CAPTURED_ENV.contains(&"ZERON_ORG_ID"));
     }
 
     #[test]

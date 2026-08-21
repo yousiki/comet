@@ -670,7 +670,6 @@ impl ChatClient {
             redial_rx,
             presence_rx,
             flags: flags.clone(),
-            resumed: false,
             cursor_amnesty_done: std::sync::atomic::AtomicBool::new(false),
             transport,
             sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -794,12 +793,6 @@ impl ChatClient {
             .collect()
     }
 
-    /// Publish this device's presence beat with an opaque payload (cursor
-    /// positions etc. — relayed verbatim, never stored).
-    pub fn send_presence(&self, at: i64, payload: Vec<u8>) {
-        let _ = self.presence_out.try_send((at, payload));
-    }
-
     /// Liveness hint: probe the room now (deadline-checked).
     pub fn probe(&self) {
         let _ = self.probe.try_send(());
@@ -808,15 +801,6 @@ impl ChatClient {
     /// Escalation: tear the session down and dial a fresh socket.
     pub fn redial(&self) {
         let _ = self.redial.try_send(());
-    }
-
-    /// The host posted a checkpoint covering `seq_covered` (C3 policy):
-    /// fold it into the cached server view so the thresholds don't re-trip
-    /// on stale hello-time numbers every quiesce tick (the DO doesn't
-    /// broadcast state after a checkpoint commit).
-    pub fn note_checkpoint(&self, seq_covered: u64, size: u64) {
-        let mut shared = lock(&self.shared);
-        Self::note_checkpoint_locked(&mut shared, seq_covered, size);
     }
 
     /// Non-blocking variant for callers that hold an engine chat-slot guard.
@@ -947,18 +931,6 @@ struct Actor {
     /// cancels and aborts it instead of leaving old transport work alive.
     offline_cancel: CancellationToken,
     offline_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// False until the first backfill of THIS client instance completes.
-    /// (Continuity is instance-scoped: a host that restores an older doc
-    /// snapshot must construct a fresh `ChatClient` — C3 wiring contract.)
-    /// The first
-    /// backfill must NOT exclude own rows: after a restart the pending queue
-    /// is gone, and a restored-backup/copied-device doc may be missing its
-    /// own post-backup writes — they exist only on the server. Loro
-    /// re-import of rows the doc does hold is a no-op, so redownloading own
-    /// bytes once is pure safety. Same-process reconnects have queue
-    /// continuity and skip them (the reconnect-after-offline-work path the
-    /// spec optimizes).
-    resumed: bool,
 }
 
 enum SessionEnd {
@@ -1743,16 +1715,7 @@ impl Actor {
         // checkpoint imports — row seqs are all > checkpointSeq, so ordering
         // is preserved, and the persisted cursor can't advance past state it
         // doesn't contain because nothing applies until the import lands.
-        let rows_req = wire::encode(
-            frame_type::ROWS_REQ,
-            &wire::RowsReqHeader {
-                after,
-                // First backfill of this process redownloads own rows (see
-                // `Actor::resumed`); reconnects skip them.
-                exclude_own: self.resumed,
-            },
-            &[],
-        );
+        let rows_req = wire::encode(frame_type::ROWS_REQ, &wire::RowsReqHeader { after }, &[]);
         if pipe.tx.send(rows_req).await.is_err() {
             return SessionEnd::Reconnect;
         }
@@ -1877,7 +1840,6 @@ impl Actor {
                 seq
             }
         };
-        self.resumed = true;
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
@@ -2062,14 +2024,7 @@ impl Actor {
             attempt = *repairs,
             "chat2: backfilling over a row gap"
         );
-        let req = wire::encode(
-            frame_type::ROWS_REQ,
-            &wire::RowsReqHeader {
-                after,
-                exclude_own: false,
-            },
-            &[],
-        );
+        let req = wire::encode(frame_type::ROWS_REQ, &wire::RowsReqHeader { after }, &[]);
         pipe.tx.send(req).await.is_ok()
     }
 
@@ -2120,9 +2075,9 @@ impl Actor {
                 let Ok(row) = serde_json::from_value::<wire::RowHeader>(frame.header) else {
                     return false;
                 };
-                // Own-device rows can still arrive (live relay of a racing
-                // second socket, or a server that ignored excludeOwn) — Loro
-                // re-import is a no-op; the cursor advance is what matters.
+                // Own-device rows also arrive (the server never filters
+                // replay rows) — Loro re-import is a no-op; the cursor
+                // advance is what matters.
                 // CONTIGUITY RULE: the cursor claims "every row ≤ cursor is
                 // reflected in the doc", so it may only walk, never jump. A
                 // gap means rows we never received (live broadcast mid-join)

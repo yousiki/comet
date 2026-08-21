@@ -55,12 +55,6 @@ pub fn terminal_bg_for(appearance: Appearance) -> Hsla {
     }
 }
 
-/// Terminal background in the appearance currently installed — the
-/// context-free form, same shape as [`crate::theme::ink`].
-pub fn terminal_bg() -> Hsla {
-    terminal_bg_for(current_appearance())
-}
-
 /// The panel fill behind the grid. On glass the opaque tone thins to a
 /// translucent wash so the blurred desktop reads through like the rest of the
 /// chrome (same move as [`Theme::card_glass_bg`]); opaque platforms keep the

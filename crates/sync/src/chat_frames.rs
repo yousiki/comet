@@ -76,7 +76,6 @@ pub struct HelloHeader<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct RowsReqHeader {
     pub after: u64,
-    pub exclude_own: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,22 +128,8 @@ pub struct AckHeader {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PresenceInHeader {
-    pub device: String,
-    pub at: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProbeOkHeader {
     pub head_seq: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ErrorHeader {
-    pub code: String,
-    #[serde(default)]
-    pub message: String,
 }
 
 #[cfg(test)]

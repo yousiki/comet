@@ -1,7 +1,7 @@
-// `chat3` legacy namespace (Organization-shared sessions) E2E against a deployed worker.
-// Covers what chat3 changes over chat2: Organization gating, member
-// open access, host-user discipline, shared blob keyspace — and leans on
-// chat2-check.mjs for the shared frame-protocol details (same DO code).
+// Organization-shared chat rooms (`chat3` namespace) E2E against a deployed
+// worker: Organization gating, member open access, host-user discipline,
+// shared blob keyspace. Frame-protocol details are covered by the workerd
+// vitest tier and scripts/pullpush-check.mjs.
 // Usage: node chat3-check.mjs <baseUrl>
 import { randomUUID, randomBytes } from "node:crypto";
 

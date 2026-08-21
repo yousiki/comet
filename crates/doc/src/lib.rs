@@ -1,4 +1,4 @@
-//! zeron-doc — session docs, the registry, and the legacy workspace schema.
+//! zeron-doc — session docs and the registry.
 //!
 //! Port of zeron's `packages/session-doc`. The schema SHAPE (container names, part maps with
 //! LoroText bodies, command entries) is kept identical to the TS implementation so the edge's
@@ -10,18 +10,16 @@
 
 pub mod commands;
 pub mod constants;
-pub mod legacy_workspace;
 pub mod parts;
-pub mod rebuild;
 pub mod registry;
+pub mod rows;
 pub mod schema;
 pub mod transcript_delta;
 
 pub use commands::*;
 pub use constants::*;
-pub use legacy_workspace::*;
 pub use parts::*;
-pub use rebuild::*;
 pub use registry::*;
+pub use rows::*;
 pub use schema::*;
 pub use transcript_delta::*;

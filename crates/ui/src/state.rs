@@ -34,9 +34,7 @@ use zeron_proto::{
     AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
     EngineInfo, HarnessId, ProfileIdentity, ProfileScope, Session, Space,
 };
-use zeron_rpc::{
-    RpcClient, RpcError, RpcReply, RpcService, RpcSubscription, connect_ws, memory_client, methods,
-};
+use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
 use crate::change_requests::{
     ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
@@ -567,46 +565,6 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
     }
 }
 
-/// Call a canonical RPC method, retrying its legacy spelling only when the
-/// connected engine explicitly reports that the canonical method is unknown.
-///
-/// In particular, transport, timeout, and application failures must not replay
-/// mutations whose first attempt may already have committed.
-pub(crate) async fn call_with_legacy_method(
-    client: &RpcClient,
-    canonical_method: &'static str,
-    legacy_method: &'static str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value, RpcError> {
-    match client.call(canonical_method, params.clone()).await {
-        Err(RpcError::UnknownMethod(method)) if method == canonical_method => {
-            client.call(legacy_method, params).await
-        }
-        result => result,
-    }
-}
-
-/// Subscribe through a renamed RPC method with the same UnknownMethod-only
-/// fallback contract as [`call_with_legacy_method`]. A checked subscription is
-/// required so an old engine's rejection is observable before the stream is
-/// handed to the caller.
-pub(crate) async fn subscribe_with_legacy_method(
-    client: &RpcClient,
-    canonical_method: &'static str,
-    legacy_method: &'static str,
-    params: serde_json::Value,
-) -> Result<RpcSubscription, RpcError> {
-    match client
-        .subscribe_checked(canonical_method, params.clone())
-        .await
-    {
-        Err(RpcError::UnknownMethod(method)) if method == canonical_method => {
-            client.subscribe_checked(legacy_method, params).await
-        }
-        result => result,
-    }
-}
-
 /// Translate an RPC failure for user-facing error slots. `UnknownMethod` is
 /// the version-skew case — the target device runs an older zeron than this
 /// UI — and the raw "unknown method: X" wire string reads like a bug instead
@@ -655,14 +613,12 @@ fn default_member_role() -> String {
     "member".into()
 }
 
-/// Parse a canonical `ListOrganizations` reply, with read compatibility for
-/// the legacy `{orgs: [...]}` envelope and the oldest bare-array response.
+/// Parse a `ListOrganizations` reply (`{organizations: [...]}`).
 pub fn parse_organizations(value: &serde_json::Value) -> Vec<OrganizationRow> {
-    let organizations = value
+    value
         .get("organizations")
-        .or_else(|| value.get("orgs"))
-        .unwrap_or(value);
-    serde_json::from_value(organizations.clone()).unwrap_or_default()
+        .and_then(|organizations| serde_json::from_value(organizations.clone()).ok())
+        .unwrap_or_default()
 }
 
 /// Organization names must be non-empty (trimmed) and reasonably short.
@@ -1096,35 +1052,12 @@ impl AppState {
         self.send_pending(chat_id, now) && self.chat_delivery_degraded(chat_id)
     }
 
-    pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
-        // A local-only profile has no remote device identity to distinguish.
-        // Keep the engine's legacy sentinel out of the UI while preserving real
-        // hostnames and user-assigned device names.
-        if self.profile_scope == Some(ProfileScope::Local)
-            && let Some(local_id) = self.local_device_id.as_deref()
-            && let Some(device) = devices.iter_mut().find(|device| device.id == local_id)
-            && device.name == "unknown-device"
-        {
-            device.name = "Local".to_string();
-        }
+    pub fn apply_devices(&mut self, devices: Vec<Device>) {
         for device in &devices {
             self.change_requests
                 .clear_unsupported_on_version_change(&device.id, device.version.as_deref());
         }
         self.devices = devices;
-    }
-
-    /// True when `device_id`'s engine (per its registry device row) is at
-    /// least `min`. Unknown devices and unstamped versions are conservatively
-    /// false — feature gates fall back to the legacy path rather than speak a
-    /// protocol the peer may not understand.
-    pub fn device_version_at_least(&self, device_id: &str, min: (u64, u64, u64)) -> bool {
-        self.devices
-            .iter()
-            .find(|d| d.id == device_id)
-            .and_then(|d| d.version.as_deref())
-            .and_then(version_triple)
-            .is_some_and(|v| v >= min)
     }
 
     /// First project on the composer's picked device (falling back through
@@ -2043,8 +1976,6 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
     })
 }
 
-pub use zeron_proto::version_triple;
-
 fn spawn_change_request_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
@@ -2437,33 +2368,6 @@ mod tests {
 
     struct LegacyIdentityRpc;
 
-    struct RenamedMethodRpc {
-        calls: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
-    }
-
-    #[async_trait]
-    impl RpcService for RenamedMethodRpc {
-        async fn handle(
-            &self,
-            method: &str,
-            params: serde_json::Value,
-        ) -> Result<RpcReply, RpcError> {
-            self.calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((method.to_string(), params));
-            match method {
-                "Canonical" | "CanonicalStream" => Err(RpcError::UnknownMethod(method.into())),
-                "Legacy" => RpcReply::value(&serde_json::json!({ "source": "legacy" })),
-                "LegacyStream" => Ok(RpcReply::Stream(
-                    futures::stream::iter([serde_json::json!({ "done": 1 })]).boxed(),
-                )),
-                "RejectedMutation" => Err(RpcError::Failed("rejected".into())),
-                other => Err(RpcError::UnknownMethod(other.into())),
-            }
-        }
-    }
-
     #[async_trait]
     impl RpcService for LegacyIdentityRpc {
         async fn handle(
@@ -2528,80 +2432,6 @@ mod tests {
                 Some(&AuthState::SignedOut),
             ),
             GatePhase::SignIn
-        );
-    }
-
-    #[tokio::test]
-    async fn renamed_unary_method_retries_only_an_explicit_unknown_method() {
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = memory_client(Arc::new(RenamedMethodRpc {
-            calls: calls.clone(),
-        }));
-        let params = serde_json::json!({ "organizationId": "org-target" });
-
-        let value = call_with_legacy_method(&client, "Canonical", "Legacy", params.clone())
-            .await
-            .expect("legacy spelling succeeds");
-        assert_eq!(value, serde_json::json!({ "source": "legacy" }));
-        assert_eq!(
-            *calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![
-                ("Canonical".into(), params.clone()),
-                ("Legacy".into(), params.clone()),
-            ]
-        );
-
-        calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        let error = call_with_legacy_method(&client, "RejectedMutation", "Legacy", params)
-            .await
-            .expect_err("application rejection must be returned");
-        assert!(matches!(error, RpcError::Failed(message) if message == "rejected"));
-        assert_eq!(
-            calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_slice(),
-            &[(
-                "RejectedMutation".into(),
-                serde_json::json!({ "organizationId": "org-target" })
-            )],
-            "a non-UnknownMethod mutation error must never replay the legacy RPC"
-        );
-    }
-
-    #[tokio::test]
-    async fn renamed_stream_method_uses_checked_unknown_method_fallback() {
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = memory_client(Arc::new(RenamedMethodRpc {
-            calls: calls.clone(),
-        }));
-
-        let mut subscription = subscribe_with_legacy_method(
-            &client,
-            "CanonicalStream",
-            "LegacyStream",
-            serde_json::json!({}),
-        )
-        .await
-        .expect("legacy stream spelling succeeds");
-        assert_eq!(
-            subscription.recv().await,
-            Some(serde_json::json!({ "done": 1 }))
-        );
-        assert_eq!(subscription.recv().await, None);
-        assert_eq!(
-            calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .map(|(method, _)| method.as_str())
-                .collect::<Vec<_>>(),
-            ["CanonicalStream", "LegacyStream"]
         );
     }
 
@@ -3289,24 +3119,6 @@ mod tests {
             created_at: None,
             version: None,
         }
-    }
-
-    #[test]
-    fn local_profile_hides_the_unknown_device_sentinel() {
-        let mut state = AppState::new();
-        state.profile_scope = Some(ProfileScope::Local);
-        state.local_device_id = Some("local".into());
-
-        state.apply_devices(vec![
-            device("local", "unknown-device"),
-            device("remote", "unknown-device"),
-        ]);
-
-        assert_eq!(state.device_name("local"), Some("Local"));
-        assert_eq!(state.device_name("remote"), Some("unknown-device"));
-
-        state.apply_devices(vec![device("local", "José's MacBook Pro")]);
-        assert_eq!(state.device_name("local"), Some("José's MacBook Pro"));
     }
 
     #[test]
@@ -4127,63 +3939,13 @@ mod tests {
             ["Alpha", "beta"],
             "case-insensitive sort + dedupe by organization id"
         );
-        assert_eq!(
+        assert!(parse_organizations(&serde_json::json!("nope")).is_empty());
+        assert!(
             parse_organizations(&serde_json::json!({ "orgs": [
                 { "id": "legacy", "organizationId": "legacy-org", "name": "Legacy" }
-            ]}))[0]
-                .organization_id,
-            "legacy-org"
-        );
-        assert_eq!(
-            parse_organizations(&serde_json::json!([
-                { "id": "bare", "organizationId": "bare-org", "name": "Bare" }
-            ]))[0]
-                .organization_id,
-            "bare-org"
-        );
-        assert_eq!(
-            parse_organizations(&serde_json::json!({
-                "organizations": [
-                    { "id": "canonical", "organizationId": "canonical-org", "name": "Canonical" }
-                ],
-                "orgs": [
-                    { "id": "legacy", "organizationId": "legacy-org", "name": "Legacy" }
-                ]
-            }))[0]
-                .organization_id,
-            "canonical-org",
-            "the canonical envelope wins when both spellings are present"
-        );
-        assert!(parse_organizations(&serde_json::json!("nope")).is_empty());
-    }
-
-    #[test]
-    fn version_triple_parses_and_gates_device_features() {
-        assert_eq!(version_triple("0.2.12"), Some((0, 2, 12)));
-        assert_eq!(version_triple("0.2.12-beta.1"), Some((0, 2, 12)));
-        assert_eq!(version_triple("1.0.0+build7"), Some((1, 0, 0)));
-        assert_eq!(version_triple("0.2"), None);
-        assert_eq!(version_triple("garbage"), None);
-
-        let mut s = AppState::default();
-        assert!(
-            !s.device_version_at_least("d1", (0, 2, 12)),
-            "unknown device conservatively fails the gate"
-        );
-        s.devices = vec![Device {
-            id: "d1".into(),
-            name: "laptop".into(),
-            platform: "macos".into(),
-            last_seen_at: None,
-            created_at: None,
-            version: Some("0.2.12".into()),
-        }];
-        assert!(s.device_version_at_least("d1", (0, 2, 12)));
-        assert!(!s.device_version_at_least("d1", (0, 2, 13)));
-        s.devices[0].version = None;
-        assert!(
-            !s.device_version_at_least("d1", (0, 2, 12)),
-            "unstamped version conservatively fails the gate"
+            ]}))
+            .is_empty(),
+            "the retired legacy envelope is no longer read"
         );
     }
 

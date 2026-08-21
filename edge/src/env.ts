@@ -1,11 +1,11 @@
 export interface Env {
-  SESSION_ROOMS: DurableObjectNamespace;
   DEVICE_ROOMS: DurableObjectNamespace;
   /** Organization registries. `reg1/{organizationId}/{userId}` and `reg2/*`
    * are retained legacy Durable Object namespaces. */
   REGISTRY_ROOMS: DurableObjectNamespace;
-  /** chat2 session rooms (`chat2/{chatId}`) — dumb authenticated log relays
-   * replacing SessionRoom's loro-aware s2 rooms (docs/chat2-sync.md). */
+  /** Chat rooms — dumb authenticated log relays (docs/chat2-sync.md), one DO
+   * instance per room name: `chat2/{chatId}` (retired single-owner namespace)
+   * and `chat3/{organizationId}/{chatId}` (Organization-shared). */
   CHAT_ROOMS: DurableObjectNamespace;
   BLOBS: R2Bucket;
   /** Release artifacts (headless tarballs, dmgs, latest.txt) served at
@@ -28,15 +28,12 @@ export interface Env {
  * the Worker (design §2: "DO never sees an unauthenticated frame"). */
 export const AUTH_USER_HEADER = "x-zeron-auth-user";
 
-/** Header the Worker stamps on requests forwarded into legacy workspace-doc
- * rooms (`ws/{organizationId}`) and Organization-shared legacy `chat3` rooms.
- * Its values are historical wire protocol and must remain stable. */
+/** Header the Worker stamps on requests forwarded into Organization-shared
+ * `chat3` rooms. Its value is historical wire protocol and must remain
+ * stable. */
 export const ROOM_KIND_HEADER = "x-zeron-room-kind";
-export const LEGACY_WORKSPACE_ROOM_KIND = "workspace";
 export const LEGACY_ORGANIZATION_CHAT_ROOM_KIND = "org-chat";
-export type RoomKind =
-  | typeof LEGACY_WORKSPACE_ROOM_KIND
-  | typeof LEGACY_ORGANIZATION_CHAT_ROOM_KIND;
+export type RoomKind = typeof LEGACY_ORGANIZATION_CHAT_ROOM_KIND;
 
 /** Header the Worker stamps with the caller's verified Organization id.
  * The `x-zeron-auth-org` value is a legacy internal wire name and must remain

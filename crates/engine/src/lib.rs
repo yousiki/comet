@@ -19,7 +19,7 @@ use zeron_sync::DocsStore;
 pub mod agent_accounts;
 pub mod auth;
 pub mod change_requests;
-pub mod chat2_host;
+pub mod chat_room_host;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
@@ -41,17 +41,16 @@ pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrganizationMembership};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
-    CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
-    capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
-    read_diff_file_text, snapshot_tree, working_diff_base,
+    CheckoutDiffSync, DiffFileTextPair, DiffSnapshot, TurnSnapshot, capture_commit_diff,
+    capture_diff, capture_diff_against, capture_turn_diff, merge_base, read_diff_file_text,
+    snapshot_tree, working_diff_base,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use registry_host::{
-    DEFAULT_ORGANIZATION_ID, DEFAULT_USER_ID, LEGACY_WORKSPACE_V2_DOC_ID, RegistryHost,
-    RegistryHostConfig,
+    DEFAULT_ORGANIZATION_ID, DEFAULT_USER_ID, RegistryHost, RegistryHostConfig,
 };
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
@@ -66,8 +65,6 @@ pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
-
-pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -181,7 +178,6 @@ pub struct EngineConfig {
     /// Harness for doc-command runs on chats without a registry `config` row.
     pub default_harness: HarnessId,
     /// Organization that scopes the registry. `None` = `$ZERON_ORGANIZATION_ID` or the dev default.
-    /// `$ZERON_ORG_ID` remains a read-only legacy fallback.
     /// In WorkOS mode the signed-in session's organization wins.
     pub organization_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
@@ -281,7 +277,6 @@ impl EngineCore {
         };
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
-        let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         let device_id = load_or_create_device_id(data_dir)?;
         // This device's harness enablement (Settings → Agents) rides the
         // engine data dir — per-device, like the CLI installs it gates.
@@ -318,18 +313,14 @@ impl EngineCore {
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
         }
-        doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
         doc_host.set_repos(repos.clone());
         let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
         let terminals = Terminals::new();
-        let uploads = Uploads::from_root_with_fallback(
-            profile.uploads_root(),
-            legacy_uploads_root.as_deref(),
-        );
+        let uploads = Uploads::from_root(profile.uploads_root());
         // A recorded local→synced import grants this account the local
         // profile's uploads root read-only — transcripts imported earlier
-        // embed absolute paths under it (same shape as the legacy adoption).
+        // embed absolute paths under it.
         if profile.scope() != ProfileScope::Local
             && let Some(root) = local_import::marker_grants_read_root(
                 data_dir,
@@ -360,7 +351,7 @@ impl EngineCore {
             harness_registry.clone(),
             repos.clone(),
         ));
-        let diff_sync = CheckoutDiffSync::start(repos.clone(), registry.clone(), &device_id, edge);
+        let diff_sync = CheckoutDiffSync::start(repos.clone(), registry.clone(), &device_id);
         // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
         let turn_diff = diff_sync.clone();
         sessions.set_turn_listener(Arc::new(move |chat_id, cwd| {
@@ -1473,18 +1464,12 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Canonical Organization env lookup with the historical abbreviation as a
-/// read-only compatibility fallback.
+/// Canonical Organization env lookup.
 pub(crate) fn organization_env_or(default: &str) -> String {
-    for key in ["ZERON_ORGANIZATION_ID", "ZERON_ORG_ID"] {
-        if let Ok(value) = std::env::var(key) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return value.to_string();
-            }
-        }
+    match std::env::var("ZERON_ORGANIZATION_ID") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => default.to_string(),
     }
-    default.to_string()
 }
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.

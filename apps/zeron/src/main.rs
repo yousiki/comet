@@ -86,11 +86,6 @@ fn organization_id_from_env() -> Option<String> {
     std::env::var("ZERON_ORGANIZATION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("ZERON_ORG_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
 }
 
 /// WorkOS client id resolution: explicit env wins (empty string = dev mode);

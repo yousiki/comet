@@ -81,14 +81,6 @@ impl EdgeFaded {
         self
     }
 
-    /// [`Self::fade_overflow_y`] for the HORIZONTAL edges — gates
-    /// [`Self::fade_left`]/[`Self::fade_right`] on the handle's x overflow at
-    /// paint time (the right-pane surface-tab strip).
-    pub fn fade_overflow_x(mut self, handle: &ScrollHandle) -> Self {
-        self.scroll_x = Some(handle.clone());
-        self
-    }
-
     /// Pull the fade's TOP edge `px` inside the wrapper: gpui clamps the ramp
     /// to 0 past an active edge, so content between the wrapper's real top
     /// and the inset edge paints fully transparent — content under opaque-ish

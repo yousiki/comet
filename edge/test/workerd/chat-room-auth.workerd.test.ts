@@ -42,42 +42,19 @@ const decodeRowsBody = async (response: Response): Promise<Frame[]> => {
 };
 
 describe("ChatRoom HTTP rows authorization", () => {
-  it("claims legacy chat2 rows on first HTTP contact, then keeps them owner-only", async () => {
-    const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("legacy-rows-owner"));
+  it("denies any request that lacks the Organization room-kind header", async () => {
+    const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("headerless-rows-denied"));
 
-    expect((await stub.fetch(request("/rows", "alice", "GET"))).status).toBe(200);
+    expect((await stub.fetch(request("/rows", "alice", "GET"))).status).toBe(403);
     expect(
       (
         await stub.fetch(
-          request("/rows?device=alice-dev&batchId=after-pull-claim", "alice", "POST", {
+          request("/rows?device=alice-dev&batchId=headerless", "alice", "POST", {
             body: new Uint8Array([1])
           })
         )
       ).status
-    ).toBe(200);
-
-    expect((await stub.fetch(request("/rows", "bob", "GET"))).status).toBe(403);
-    expect(
-      (
-        await stub.fetch(
-          request("/rows?device=bob-dev&batchId=bob-1", "bob", "POST", {
-            body: new Uint8Array([3])
-          })
-        )
-      ).status
     ).toBe(403);
-
-    const pushFirst = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("legacy-rows-push-first"));
-    expect(
-      (
-        await pushFirst.fetch(
-          request("/rows?device=alice-dev&batchId=first-contact", "alice", "POST", {
-            body: new Uint8Array([4])
-          })
-        )
-      ).status
-    ).toBe(200);
-    expect((await pushFirst.fetch(request("/rows", "bob", "GET"))).status).toBe(403);
   });
 
   it("lets verified Organization members pull and push chat3 rows without a host claim", async () => {
@@ -160,6 +137,8 @@ describe("ChatRoom HTTP rows authorization", () => {
         )
       ).status
     ).toBe(200);
+    // A historical excludeOwn=1 hint is ignored: rows are never filtered by
+    // raw device id (not identity-bound in Organization-shared rooms).
     const orgFrames = await decodeRowsBody(
       await organizationStub.fetch(
         request(`/rows?after=0&device=${sharedDevice}&excludeOwn=1`, "alice", "GET", {
@@ -168,32 +147,5 @@ describe("ChatRoom HTTP rows authorization", () => {
       )
     );
     expect(orgFrames.filter((frame) => frame.type === FRAME.row)).toHaveLength(1);
-
-    // Legacy single-owner rooms retain the bandwidth optimization.
-    const legacyStub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("legacy-rows-exclude-own"));
-    expect(
-      (
-        await legacyStub.fetch(
-          request("/checkpoint?seqCovered=0", "alice", "POST", {
-            body: new Uint8Array([9])
-          })
-        )
-      ).status
-    ).toBe(200);
-    expect(
-      (
-        await legacyStub.fetch(
-          request(`/rows?device=${sharedDevice}&batchId=alice-row`, "alice", "POST", {
-            body: new Uint8Array([8])
-          })
-        )
-      ).status
-    ).toBe(200);
-    const legacyFrames = await decodeRowsBody(
-      await legacyStub.fetch(
-        request(`/rows?after=0&device=${sharedDevice}&excludeOwn=1`, "alice", "GET")
-      )
-    );
-    expect(legacyFrames.filter((frame) => frame.type === FRAME.row)).toHaveLength(0);
   });
 });

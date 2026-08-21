@@ -142,7 +142,11 @@ async fn local_work_imports_into_synced_profile_once() {
         .expect("read chat")
         .expect("imported chat row");
     assert_eq!(row.title.as_deref(), Some("Fix the flaky test"));
-    assert_eq!(row.room_gen, Some(2), "imported chats must be chat2-born");
+    assert_eq!(
+        row.room_gen,
+        Some(3),
+        "imported chats join the current room generation"
+    );
     assert_eq!(row.space_id.as_deref(), Some("space-1"));
     assert!(
         synced
@@ -239,27 +243,6 @@ async fn import_without_local_profile_is_a_clean_no_op() {
     let (imported_chats, imported_spaces, ..) = summary(&events);
     assert_eq!((imported_chats, imported_spaces), (0, 0));
 
-    synced.shutdown().await;
-}
-
-#[tokio::test]
-async fn previous_import_local_workspace_wire_method_remains_accepted() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
-    let client = zeron_rpc::memory_client(synced.rpc_service());
-    let mut events = client
-        .subscribe(
-            zeron_rpc::methods::LEGACY_IMPORT_LOCAL_PROFILE,
-            serde_json::json!({}),
-        )
-        .await
-        .expect("legacy import stream");
-
-    let mut last = None;
-    while let Some(event) = events.recv().await {
-        last = Some(event);
-    }
-    assert_eq!(last.expect("summary")["kind"], "summary");
     synced.shutdown().await;
 }
 

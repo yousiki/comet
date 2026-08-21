@@ -36,7 +36,6 @@ const testEnv = (chatRooms: DurableObjectNamespace): Env => ({
   AUTH_MODE: "dev",
   WORKOS_CLIENT_ID: "test",
   CHAT_ROOMS: chatRooms,
-  SESSION_ROOMS: {} as DurableObjectNamespace,
   DEVICE_ROOMS: {} as DurableObjectNamespace,
   REGISTRY_ROOMS: {} as DurableObjectNamespace,
   BLOBS: {} as R2Bucket,

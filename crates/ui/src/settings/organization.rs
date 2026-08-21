@@ -21,8 +21,7 @@ use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
 use crate::settings::widgets;
 use crate::state::{
-    AppState, OrganizationRow, call_with_legacy_method, organization_name_valid,
-    parse_organizations, sort_memberships,
+    AppState, OrganizationRow, organization_name_valid, parse_organizations, sort_memberships,
 };
 use crate::theme::Theme;
 
@@ -87,25 +86,22 @@ impl OrganizationMutation {
         }
     }
 
-    pub fn rpc(&self) -> (&'static str, &'static str, serde_json::Value) {
+    pub fn rpc(&self) -> (&'static str, serde_json::Value) {
         match self {
             Self::Select {
                 organization_id, ..
             } => (
                 methods::SELECT_ORGANIZATION,
-                methods::LEGACY_SELECT_ORGANIZATION,
                 serde_json::json!({ "organizationId": organization_id }),
             ),
             Self::Create { name } => (
                 methods::CREATE_ORGANIZATION,
-                methods::LEGACY_CREATE_ORGANIZATION,
                 serde_json::json!({ "name": name }),
             ),
             Self::Delete {
                 organization_id, ..
             } => (
                 methods::DELETE_ORGANIZATION,
-                methods::LEGACY_DELETE_ORGANIZATION,
                 serde_json::json!({ "organizationId": organization_id }),
             ),
         }
@@ -211,13 +207,10 @@ impl OrganizationPage {
             Loadable::Ready(Vec::new())
         };
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let organizations = call_with_legacy_method(
-                engine.client(),
-                methods::LIST_ORGANIZATIONS,
-                methods::LEGACY_LIST_ORGANIZATIONS,
-                serde_json::json!({}),
-            )
-            .await;
+            let organizations = engine
+                .client()
+                .call(methods::LIST_ORGANIZATIONS, serde_json::json!({}))
+                .await;
             let members = match &organization_id {
                 Some(organization_id) => Some(
                     engine
@@ -935,7 +928,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn organization_mutations_pair_canonical_and_legacy_rpc_methods() {
+    fn organization_mutations_map_to_their_rpc_methods() {
         let cases = [
             (
                 OrganizationMutation::Select {
@@ -943,7 +936,6 @@ mod tests {
                     label: "Target".into(),
                 },
                 methods::SELECT_ORGANIZATION,
-                methods::LEGACY_SELECT_ORGANIZATION,
                 serde_json::json!({ "organizationId": "org-target" }),
             ),
             (
@@ -951,7 +943,6 @@ mod tests {
                     name: "New Organization".into(),
                 },
                 methods::CREATE_ORGANIZATION,
-                methods::LEGACY_CREATE_ORGANIZATION,
                 serde_json::json!({ "name": "New Organization" }),
             ),
             (
@@ -960,15 +951,13 @@ mod tests {
                     label: "Old".into(),
                 },
                 methods::DELETE_ORGANIZATION,
-                methods::LEGACY_DELETE_ORGANIZATION,
                 serde_json::json!({ "organizationId": "org-old" }),
             ),
         ];
 
-        for (mutation, expected_canonical, expected_legacy, expected_params) in cases {
-            let (canonical, legacy, params) = mutation.rpc();
-            assert_eq!(canonical, expected_canonical);
-            assert_eq!(legacy, expected_legacy);
+        for (mutation, expected_method, expected_params) in cases {
+            let (method, params) = mutation.rpc();
+            assert_eq!(method, expected_method);
             assert_eq!(params, expected_params);
         }
     }

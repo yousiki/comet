@@ -12,34 +12,23 @@
 //! Liveness: `lastSeenAt` is a row write on boot/shutdown ONLY — the periodic 15s
 //! heartbeat rides the room's presence frames (memory-only on the DO), so staying
 //! online never grows server state.
-//!
-//! Migration: first boot after the update finds no `registry1` snapshot, reads
-//! the legacy `workspace2` Loro snapshot, and seeds the registry from it as
-//! pending upserts (historical HLCs — live writes always win). The overlay
-//! serves the full sidebar before any server contact; the old `ws4` rooms are
-//! simply never joined again. The legacy snapshot is kept for rollback.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use chrono::Utc;
 use tokio::sync::watch;
 
-use zeron_doc::{DeletedDevice, DeletedSpace, LegacyWorkspaceDoc, REGISTRY_DOC_ID, RegistryDoc};
+use zeron_doc::{DeletedDevice, DeletedSpace, REGISTRY_DOC_ID, RegistryDoc};
 use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
 use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
 use crate::{EngineError, now_ms};
 
-/// Legacy Loro workspace snapshot row — now only read once, as the migration
-/// source for the registry seed. Kept on disk for rollback.
-pub const LEGACY_WORKSPACE_V2_DOC_ID: &str = "workspace2";
 /// Per-profile device-share opt-out marker (DocsStore row, value `b"0"`).
 /// Present = this device must NOT register itself in this profile's registry:
 /// no device row, no presence beats, never a host. Absent = shared (default).
 const DEVICE_SHARE_DOC_ID: &str = "device-share1";
-/// Legacy (pre-spaces) snapshot row — best-effort deleted on open.
-const LEGACY_WORKSPACE_DOC_ID: &str = "workspace";
 /// Organization used when none is configured (matches dev-mode bearers).
 pub const DEFAULT_ORGANIZATION_ID: &str = "dev-org";
 /// User used when none is configured (dev mode without a bearer).
@@ -215,52 +204,8 @@ impl RegistryHost {
         let mut doc = match store.load_snapshot(REGISTRY_DOC_ID)? {
             Some(bytes) => RegistryDoc::from_bytes(&bytes, &config.device_id)
                 .map_err(|e| EngineError::Other(format!("registry snapshot load failed: {e}")))?,
-            None => {
-                // MIGRATION (instant, one-time): seed from the legacy Loro
-                // legacy workspace snapshot when one exists. Seeds are pending upserts
-                // with historical HLCs — the overlay serves the full sidebar
-                // immediately, the room converges on first join, and any live
-                // write beats a migrated value. The legacy snapshot stays on
-                // disk for rollback.
-                let mut doc = RegistryDoc::new(&config.device_id);
-                match store.load_snapshot(LEGACY_WORKSPACE_V2_DOC_ID) {
-                    Ok(Some(bytes)) => {
-                        let raw = loro::LoroDoc::new();
-                        match raw.import(&bytes) {
-                            Ok(_) => {
-                                let legacy = LegacyWorkspaceDoc::from_doc(raw);
-                                match legacy.read_all() {
-                                    Ok(state) => match doc.seed_from_legacy_workspace(&state) {
-                                        Ok(rows) => {
-                                            tracing::info!(
-                                                rows,
-                                                "migrated legacy workspace doc into the registry"
-                                            );
-                                        }
-                                        Err(err) => {
-                                            tracing::warn!(error = %err, "legacy workspace migration seed failed");
-                                        }
-                                    },
-                                    Err(err) => {
-                                        tracing::warn!(error = %err, "legacy workspace read failed; starting empty");
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                tracing::warn!(error = %err, "legacy workspace import failed; starting empty");
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(error = %err, "legacy workspace snapshot load failed; starting empty");
-                    }
-                }
-                doc
-            }
+            None => RegistryDoc::new(&config.device_id),
         };
-        // Destructive-break hygiene: the pre-spaces row stays unreachable.
-        store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
 
         // Boot: upsert our own device row — unless sharing is opted out for
         // this profile, in which case any row a previously-shared boot left
@@ -988,15 +933,9 @@ impl RegistryHost {
                 last_message_at: None,
                 created_at: Utc::now(),
                 harness_session_id: None,
-                // Born on the current room generation: a brand-new chat has
-                // an empty doc — nothing to seed, no migration race to lose.
-                // 3 = Organization-shared chat3 whenever an edge is configured; only
-                // pre-existing chats go through the host migration sweep.
-                room_gen: Some(if self.inner.config.edge.is_some() {
-                    3
-                } else {
-                    2
-                }),
+                // Every chat is born on gen 3 (Organization-shared chat3
+                // rooms) — the only generation this fork still dials.
+                room_gen: Some(3),
                 harness_session_cwd: None,
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
@@ -1589,18 +1528,13 @@ async fn registry_task(weak: Weak<RegistryHostInner>, mut changed_rx: watch::Rec
 
 fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> String {
     existing_name
-        .filter(|name| {
-            let name = name.trim();
-            !name.is_empty() && name != crate::LEGACY_UNKNOWN_DEVICE_NAME
-        })
+        .filter(|name| !name.trim().is_empty())
         .unwrap_or(detected_name)
         .to_string()
 }
 
 /// This device's registry row as a (re)registration writes it. A user-set name
-/// (RenameDevice is LWW from any device) survives restarts; the old fallback
-/// sentinel is repaired with the platform-resolved name because it was never a
-/// user-selected name.
+/// (RenameDevice is LWW from any device) survives restarts.
 fn own_device_row(
     config: &RegistryHostConfig,
     existing: Option<&Device>,
@@ -1759,14 +1693,6 @@ mod tests {
         assert_eq!(by_chat("chat-own").status, SessionStatus::Working); // local wins
         assert_eq!(by_chat("chat-teammate").device_id, "dev-bob"); // foreign kept
         assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn boot_repairs_the_legacy_unknown_device_sentinel() {
-        assert_eq!(
-            device_name_on_boot(Some("unknown-device"), "MacBook Pro"),
-            "MacBook Pro"
-        );
     }
 
     #[test]

@@ -52,8 +52,8 @@ use crate::settings::{
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator,
-    OrganizationRow, call_with_legacy_method, format_time_ago, organization_name_valid,
-    parse_organizations, sort_memberships, subscribe_with_legacy_method,
+    OrganizationRow, format_time_ago, organization_name_valid, parse_organizations,
+    sort_memberships,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -3372,13 +3372,10 @@ impl Shell {
         let current = self.current_organization_id(cx);
         self.user_menu_organizations = Loadable::Loading;
         self.user_menu_organizations_task = Some(cx.spawn(async move |this, cx| {
-            let result = call_with_legacy_method(
-                engine.client(),
-                methods::LIST_ORGANIZATIONS,
-                methods::LEGACY_LIST_ORGANIZATIONS,
-                serde_json::json!({}),
-            )
-            .await;
+            let result = engine
+                .client()
+                .call(methods::LIST_ORGANIZATIONS, serde_json::json!({}))
+                .await;
             this.update(cx, |shell, cx| {
                 shell.user_menu_organizations_task = None;
                 shell.user_menu_organizations = match result {
@@ -3501,13 +3498,9 @@ impl Shell {
             selection_confirmed: false,
         });
         let original_organization = self.current_organization_id(cx);
-        let (method, legacy_method, params) = mutation.rpc();
+        let (method, params) = mutation.rpc();
         let request = Tokio::spawn(cx, async move {
-            tokio::time::timeout(
-                RUNTIME_CHANGE_TIMEOUT,
-                call_with_legacy_method(engine.client(), method, legacy_method, params),
-            )
-            .await
+            tokio::time::timeout(RUNTIME_CHANGE_TIMEOUT, engine.client().call(method, params)).await
         });
         self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
             let result = request.await;
@@ -4250,14 +4243,11 @@ impl Shell {
         self.runtime_change_error = None;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
         let stream = Tokio::spawn(cx, async move {
-            let mut items = subscribe_with_legacy_method(
-                engine.client(),
-                methods::IMPORT_LOCAL_PROFILE,
-                methods::LEGACY_IMPORT_LOCAL_PROFILE,
-                serde_json::json!({}),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            let mut items = engine
+                .client()
+                .subscribe_checked(methods::IMPORT_LOCAL_PROFILE, serde_json::json!({}))
+                .await
+                .map_err(|error| error.to_string())?;
             while let Some(item) = items.recv().await {
                 let _ = tx.send(item);
             }
@@ -4456,13 +4446,10 @@ impl Shell {
         };
         gate.organizations = Loadable::Loading;
         gate.task = Some(cx.spawn(async move |this, cx| {
-            let result = call_with_legacy_method(
-                engine.client(),
-                methods::LIST_ORGANIZATIONS,
-                methods::LEGACY_LIST_ORGANIZATIONS,
-                serde_json::json!({}),
-            )
-            .await;
+            let result = engine
+                .client()
+                .call(methods::LIST_ORGANIZATIONS, serde_json::json!({}))
+                .await;
             this.update(cx, |shell, cx| {
                 if let Some(gate) = shell.organization_gate.as_mut() {
                     gate.organizations = match result {
@@ -4496,13 +4483,13 @@ impl Shell {
         gate.submitting = true;
         gate.error = None;
         gate.task = Some(cx.spawn(async move |this, cx| {
-            let result = call_with_legacy_method(
-                engine.client(),
-                methods::CREATE_ORGANIZATION,
-                methods::LEGACY_CREATE_ORGANIZATION,
-                serde_json::json!({ "name": name }),
-            )
-            .await;
+            let result = engine
+                .client()
+                .call(
+                    methods::CREATE_ORGANIZATION,
+                    serde_json::json!({ "name": name }),
+                )
+                .await;
             this.update(cx, |shell, cx| {
                 if let Some(gate) = shell.organization_gate.as_mut() {
                     gate.submitting = false;
@@ -4529,13 +4516,13 @@ impl Shell {
         gate.submitting = true;
         gate.error = None;
         gate.task = Some(cx.spawn(async move |this, cx| {
-            let result = call_with_legacy_method(
-                engine.client(),
-                methods::SELECT_ORGANIZATION,
-                methods::LEGACY_SELECT_ORGANIZATION,
-                serde_json::json!({ "organizationId": organization_id }),
-            )
-            .await;
+            let result = engine
+                .client()
+                .call(
+                    methods::SELECT_ORGANIZATION,
+                    serde_json::json!({ "organizationId": organization_id }),
+                )
+                .await;
             this.update(cx, |shell, cx| {
                 if let Some(gate) = shell.organization_gate.as_mut() {
                     gate.submitting = false;

@@ -3,10 +3,6 @@
  * JWKS) before any DO forwarding or R2 access. WebSocket upgrades carry the
  * token as `?token=` (WS clients cannot always set headers); plain requests
  * use `Authorization: Bearer`.
- *
- * Legacy workspace rooms (`ws/{organizationId}`) authorize on the token's
- * WorkOS `org_id` wire claim, present when the session is scoped to a Comet
- * Organization. Membership requires that claim to equal the URL Organization.
  */
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { Env } from "./env";

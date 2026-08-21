@@ -10,11 +10,6 @@
 //! it from a frame delta or from wall-clock elapsed time and get identical
 //! output.
 
-/// Zeron loader pulse period.
-pub const ZERON_PULSE_MS: u64 = 2_400;
-/// Gradient matrix spinner wave period.
-pub const GRADIENT_SPIN_MS: u64 = 750;
-
 /// Cells in the zeron wave loader.
 pub const ZERON_CELLS: usize = 5;
 /// Side length of the gradient spinner matrix.
