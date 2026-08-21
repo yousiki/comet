@@ -104,6 +104,41 @@ pub(crate) fn context_window() -> ModelOption {
     }
 }
 
+/// Claude Code's `--permission-mode` select, carried by every model (codex
+/// `service_tier` parity). `dontAsk` is omitted (CI-oriented allowlist mode;
+/// zeron sessions are interactive). Choice ids are the CLI's own mode names;
+/// `default` is the CLI's legacy spelling of "manual" and what the harness
+/// always passed before this option existed.
+fn permission_mode() -> ModelOption {
+    ModelOption {
+        id: "permissionMode".into(),
+        label: "Permissions".into(),
+        choices: vec![
+            ModelOptionChoice {
+                id: "default".into(),
+                label: "Manual".into(),
+            },
+            ModelOptionChoice {
+                id: "acceptEdits".into(),
+                label: "Accept Edits".into(),
+            },
+            ModelOptionChoice {
+                id: "plan".into(),
+                label: "Plan".into(),
+            },
+            ModelOptionChoice {
+                id: "auto".into(),
+                label: "Auto".into(),
+            },
+            ModelOptionChoice {
+                id: "bypassPermissions".into(),
+                label: "Bypass".into(),
+            },
+        ],
+        default_choice: "default".into(),
+    }
+}
+
 const FULL_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Low,
     ReasoningLevel::Medium,
@@ -130,8 +165,9 @@ fn model(
     label: &str,
     description: &str,
     ladder: &[ReasoningLevel],
-    options: Vec<ModelOption>,
+    mut options: Vec<ModelOption>,
 ) -> Model {
+    options.push(permission_mode());
     Model {
         id: id.into(),
         label: label.into(),
@@ -234,6 +270,18 @@ mod tests {
         assert!(supports_xhigh("claude-opus-4-7-20260101"));
         assert!(!supports_xhigh("claude-opus-4-5"));
         assert!(!supports_xhigh("claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn every_model_offers_permission_mode() {
+        for m in static_models() {
+            let opt = m
+                .options
+                .iter()
+                .find(|o| o.id == "permissionMode")
+                .unwrap_or_else(|| panic!("{} missing permissionMode", m.id));
+            assert_eq!(opt.default_choice, "default");
+        }
     }
 
     #[test]

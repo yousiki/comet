@@ -103,6 +103,28 @@ fn resolve_claude_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+/// `--permission-mode` argv from the `permissionMode` model option.
+/// `auto_approve` (internal unattended runs, e.g. title generation) and an
+/// explicit bypass pick both get the CLI's full yolo pair; an unknown or stale
+/// choice id falls back to `default` so it can't fail the spawn.
+fn permission_args(
+    options: &serde_json::Map<String, Value>,
+    auto_approve: bool,
+) -> &'static [&'static str] {
+    let mode = options.get("permissionMode").and_then(Value::as_str);
+    match (auto_approve, mode) {
+        (true, _) | (false, Some("bypassPermissions")) => &[
+            "--permission-mode",
+            "bypassPermissions",
+            "--dangerously-skip-permissions",
+        ],
+        (false, Some("acceptEdits")) => &["--permission-mode", "acceptEdits"],
+        (false, Some("plan")) => &["--permission-mode", "plan"],
+        (false, Some("auto")) => &["--permission-mode", "auto"],
+        _ => &["--permission-mode", "default"],
+    }
+}
+
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
     match options.get(key) {
         Some(Value::Bool(b)) => *b,
@@ -209,15 +231,10 @@ impl ClaudeHarness {
         if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
             cmd.args(["--effort", effort]);
         }
-        if request.auto_approve {
-            cmd.args([
-                "--permission-mode",
-                "bypassPermissions",
-                "--dangerously-skip-permissions",
-            ]);
-        } else {
-            cmd.args(["--permission-mode", "default"]);
-        }
+        cmd.args(permission_args(
+            &request.model_options,
+            request.auto_approve,
+        ));
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
         }
@@ -880,6 +897,31 @@ fn updated_input_with_answers(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn permission_mode_option_maps_to_argv() {
+        let mut opts = serde_json::Map::new();
+        assert_eq!(
+            permission_args(&opts, false),
+            ["--permission-mode", "default"]
+        );
+        assert!(permission_args(&opts, true).contains(&"--dangerously-skip-permissions"));
+        for mode in ["acceptEdits", "plan", "auto"] {
+            opts.insert("permissionMode".into(), json!(mode));
+            assert_eq!(permission_args(&opts, false), ["--permission-mode", mode]);
+        }
+        opts.insert("permissionMode".into(), json!("bypassPermissions"));
+        assert!(permission_args(&opts, false).contains(&"--dangerously-skip-permissions"));
+        // Unknown/stale choice ids fall back rather than failing the spawn.
+        opts.insert("permissionMode".into(), json!("dontAsk"));
+        assert_eq!(
+            permission_args(&opts, false),
+            ["--permission-mode", "default"]
+        );
+        // auto_approve (internal one-shot runs) wins over an explicit pick.
+        opts.insert("permissionMode".into(), json!("plan"));
+        assert!(permission_args(&opts, true).contains(&"bypassPermissions"));
+    }
 
     #[test]
     fn parses_questions_tolerantly() {
