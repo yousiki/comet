@@ -1052,35 +1052,12 @@ impl AppState {
         self.send_pending(chat_id, now) && self.chat_delivery_degraded(chat_id)
     }
 
-    pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
-        // A local-only profile has no remote device identity to distinguish.
-        // Keep the engine's legacy sentinel out of the UI while preserving real
-        // hostnames and user-assigned device names.
-        if self.profile_scope == Some(ProfileScope::Local)
-            && let Some(local_id) = self.local_device_id.as_deref()
-            && let Some(device) = devices.iter_mut().find(|device| device.id == local_id)
-            && device.name == "unknown-device"
-        {
-            device.name = "Local".to_string();
-        }
+    pub fn apply_devices(&mut self, devices: Vec<Device>) {
         for device in &devices {
             self.change_requests
                 .clear_unsupported_on_version_change(&device.id, device.version.as_deref());
         }
         self.devices = devices;
-    }
-
-    /// True when `device_id`'s engine (per its registry device row) is at
-    /// least `min`. Unknown devices and unstamped versions are conservatively
-    /// false — feature gates fall back to the legacy path rather than speak a
-    /// protocol the peer may not understand.
-    pub fn device_version_at_least(&self, device_id: &str, min: (u64, u64, u64)) -> bool {
-        self.devices
-            .iter()
-            .find(|d| d.id == device_id)
-            .and_then(|d| d.version.as_deref())
-            .and_then(version_triple)
-            .is_some_and(|v| v >= min)
     }
 
     /// First project on the composer's picked device (falling back through
@@ -1998,8 +1975,6 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
         }
     })
 }
-
-pub use zeron_proto::version_triple;
 
 fn spawn_change_request_watch(
     cx: &mut Context<AppState>,
@@ -3147,24 +3122,6 @@ mod tests {
     }
 
     #[test]
-    fn local_profile_hides_the_unknown_device_sentinel() {
-        let mut state = AppState::new();
-        state.profile_scope = Some(ProfileScope::Local);
-        state.local_device_id = Some("local".into());
-
-        state.apply_devices(vec![
-            device("local", "unknown-device"),
-            device("remote", "unknown-device"),
-        ]);
-
-        assert_eq!(state.device_name("local"), Some("Local"));
-        assert_eq!(state.device_name("remote"), Some("unknown-device"));
-
-        state.apply_devices(vec![device("local", "José's MacBook Pro")]);
-        assert_eq!(state.device_name("local"), Some("José's MacBook Pro"));
-    }
-
-    #[test]
     fn device_version_change_reenables_change_request_capability() {
         let mut state = AppState::new();
         state
@@ -3989,36 +3946,6 @@ mod tests {
             ]}))
             .is_empty(),
             "the retired legacy envelope is no longer read"
-        );
-    }
-
-    #[test]
-    fn version_triple_parses_and_gates_device_features() {
-        assert_eq!(version_triple("0.2.12"), Some((0, 2, 12)));
-        assert_eq!(version_triple("0.2.12-beta.1"), Some((0, 2, 12)));
-        assert_eq!(version_triple("1.0.0+build7"), Some((1, 0, 0)));
-        assert_eq!(version_triple("0.2"), None);
-        assert_eq!(version_triple("garbage"), None);
-
-        let mut s = AppState::default();
-        assert!(
-            !s.device_version_at_least("d1", (0, 2, 12)),
-            "unknown device conservatively fails the gate"
-        );
-        s.devices = vec![Device {
-            id: "d1".into(),
-            name: "laptop".into(),
-            platform: "macos".into(),
-            last_seen_at: None,
-            created_at: None,
-            version: Some("0.2.12".into()),
-        }];
-        assert!(s.device_version_at_least("d1", (0, 2, 12)));
-        assert!(!s.device_version_at_least("d1", (0, 2, 13)));
-        s.devices[0].version = None;
-        assert!(
-            !s.device_version_at_least("d1", (0, 2, 12)),
-            "unstamped version conservatively fails the gate"
         );
     }
 

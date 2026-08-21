@@ -297,7 +297,6 @@ mod tests {
         assert_eq!(core.uploads.dir(), expected.store_root().join("uploads"));
         assert!(expected.store_root().is_dir());
         if std::env::var("ZERON_ORGANIZATION_ID").is_err()
-            && std::env::var("ZERON_ORG_ID").is_err()
             && std::env::var("ZERON_USER_ID").is_err()
         {
             assert_eq!(

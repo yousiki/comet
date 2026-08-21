@@ -236,14 +236,6 @@ impl Repos {
             .map(drop)
     }
 
-    /// The absolute Git `HEAD` file for event-driven external branch reconciliation.
-    pub async fn git_head_path(&self, path: &Path) -> Result<PathBuf, EngineError> {
-        let git_dir = self
-            .git(&["rev-parse", "--absolute-git-dir"], Some(path))
-            .await?;
-        Ok(PathBuf::from(git_dir).join("HEAD"))
-    }
-
     /// Canonical identity shared by every chat operating in this exact worktree:
     /// `sha256(deviceId ‖ NUL ‖ canonical git dir)`.
     pub async fn checkout_identity(&self, path: &Path) -> Result<CheckoutIdentity, EngineError> {

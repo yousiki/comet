@@ -66,8 +66,6 @@ pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
 
-pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";
-
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("doc: {0}")]
@@ -180,7 +178,6 @@ pub struct EngineConfig {
     /// Harness for doc-command runs on chats without a registry `config` row.
     pub default_harness: HarnessId,
     /// Organization that scopes the registry. `None` = `$ZERON_ORGANIZATION_ID` or the dev default.
-    /// `$ZERON_ORG_ID` remains a read-only legacy fallback.
     /// In WorkOS mode the signed-in session's organization wins.
     pub organization_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
@@ -1467,18 +1464,12 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Canonical Organization env lookup with the historical abbreviation as a
-/// read-only compatibility fallback.
+/// Canonical Organization env lookup.
 pub(crate) fn organization_env_or(default: &str) -> String {
-    for key in ["ZERON_ORGANIZATION_ID", "ZERON_ORG_ID"] {
-        if let Ok(value) = std::env::var(key) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return value.to_string();
-            }
-        }
+    match std::env::var("ZERON_ORGANIZATION_ID") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => default.to_string(),
     }
-    default.to_string()
 }
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.

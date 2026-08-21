@@ -1528,18 +1528,13 @@ async fn registry_task(weak: Weak<RegistryHostInner>, mut changed_rx: watch::Rec
 
 fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> String {
     existing_name
-        .filter(|name| {
-            let name = name.trim();
-            !name.is_empty() && name != crate::LEGACY_UNKNOWN_DEVICE_NAME
-        })
+        .filter(|name| !name.trim().is_empty())
         .unwrap_or(detected_name)
         .to_string()
 }
 
 /// This device's registry row as a (re)registration writes it. A user-set name
-/// (RenameDevice is LWW from any device) survives restarts; the old fallback
-/// sentinel is repaired with the platform-resolved name because it was never a
-/// user-selected name.
+/// (RenameDevice is LWW from any device) survives restarts.
 fn own_device_row(
     config: &RegistryHostConfig,
     existing: Option<&Device>,
@@ -1698,14 +1693,6 @@ mod tests {
         assert_eq!(by_chat("chat-own").status, SessionStatus::Working); // local wins
         assert_eq!(by_chat("chat-teammate").device_id, "dev-bob"); // foreign kept
         assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn boot_repairs_the_legacy_unknown_device_sentinel() {
-        assert_eq!(
-            device_name_on_boot(Some("unknown-device"), "MacBook Pro"),
-            "MacBook Pro"
-        );
     }
 
     #[test]

@@ -793,12 +793,6 @@ impl ChatClient {
             .collect()
     }
 
-    /// Publish this device's presence beat with an opaque payload (cursor
-    /// positions etc. — relayed verbatim, never stored).
-    pub fn send_presence(&self, at: i64, payload: Vec<u8>) {
-        let _ = self.presence_out.try_send((at, payload));
-    }
-
     /// Liveness hint: probe the room now (deadline-checked).
     pub fn probe(&self) {
         let _ = self.probe.try_send(());
@@ -807,15 +801,6 @@ impl ChatClient {
     /// Escalation: tear the session down and dial a fresh socket.
     pub fn redial(&self) {
         let _ = self.redial.try_send(());
-    }
-
-    /// The host posted a checkpoint covering `seq_covered` (C3 policy):
-    /// fold it into the cached server view so the thresholds don't re-trip
-    /// on stale hello-time numbers every quiesce tick (the DO doesn't
-    /// broadcast state after a checkpoint commit).
-    pub fn note_checkpoint(&self, seq_covered: u64, size: u64) {
-        let mut shared = lock(&self.shared);
-        Self::note_checkpoint_locked(&mut shared, seq_covered, size);
     }
 
     /// Non-blocking variant for callers that hold an engine chat-slot guard.

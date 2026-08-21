@@ -98,8 +98,6 @@ const RELAY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(5
 const RELAY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 const RELAY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const RELAY_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-/// Hosts below this stamped engine version don't serve `RelayCommand`.
-const RELAY_MIN_VERSION: (u64, u64, u64) = (0, 2, 12);
 
 /// Edge connection config. The bearer is a **provider**, never a snapshot:
 /// every room (re)connect and HTTP request re-reads it, so WorkOS access-token
@@ -2841,17 +2839,6 @@ impl DocHost {
         chat_id: &str,
         entry: &SessionCommandEntry,
     ) -> Result<&'static str, String> {
-        let supported = self
-            .registry()
-            .and_then(|ws| ws.read_devices().ok())
-            .into_iter()
-            .flatten()
-            .find(|d| d.id == target)
-            .and_then(|d| d.version.as_deref().and_then(zeron_proto::version_triple))
-            .is_some_and(|v| v >= RELAY_MIN_VERSION);
-        if !supported {
-            return Err("host does not support relay delivery (version gate)".into());
-        }
         let links = self
             .inner
             .links

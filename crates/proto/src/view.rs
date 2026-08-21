@@ -515,23 +515,6 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     summary
 }
 
-/// The status-dot palette, as oklch triples (L, C, H°).
-///
-/// Colors live here rather than in the viewport because the *meaning* of a
-/// dot is part of the protocol, not the presentation — a given status must
-/// read the same on every surface. `zeron-ui` has the oklch→sRGB math.
-pub mod dot {
-    /// Running. Pink, not amber: the harsh yellow read as a warning, and running
-    /// is routine (user request).
-    pub const WORKING: (f32, f32, f32) = (0.718, 0.202, 349.761);
-    /// Asking a question. Indigo — must read differently from "busy" at a glance.
-    pub const AWAITING: (f32, f32, f32) = (0.673, 0.182, 276.935);
-    /// Errored. Red-400.
-    pub const ERRORED: (f32, f32, f32) = (0.704, 0.191, 22.216);
-    /// Finished but unseen. Emerald — reads as "ready for you".
-    pub const COMPLETED: (f32, f32, f32) = (0.765, 0.177, 163.223);
-}
-
 // ---------------------------------------------------------------------------
 // Checkout selection (new sessions)
 // ---------------------------------------------------------------------------
