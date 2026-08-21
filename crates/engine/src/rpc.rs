@@ -963,7 +963,6 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_DRIVES
             | methods::SEARCH_FILES
             | methods::READ_WORKING_DIRECTORY_FILE
-            | methods::LEGACY_READ_WORKSPACE_FILE
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             // Checkout diffs are produced on the device holding the checkout.
@@ -1083,17 +1082,13 @@ impl AuthRpc {
                 | methods::COMPLETE_SIGN_IN
                 | methods::SIGN_OUT
                 | methods::LIST_ORGANIZATIONS
-                | methods::LEGACY_LIST_ORGANIZATIONS
                 | methods::CREATE_ORGANIZATION
-                | methods::LEGACY_CREATE_ORGANIZATION
                 | methods::SELECT_ORGANIZATION
-                | methods::LEGACY_SELECT_ORGANIZATION
                 | methods::LIST_MEMBERS
                 | methods::INVITE_MEMBER
                 | methods::SET_MEMBER_ROLE
                 | methods::REMOVE_MEMBER
                 | methods::DELETE_ORGANIZATION
-                | methods::LEGACY_DELETE_ORGANIZATION
         )
     }
 }
@@ -1133,19 +1128,15 @@ impl RpcService for AuthRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            methods::LIST_ORGANIZATIONS | methods::LEGACY_LIST_ORGANIZATIONS => {
+            methods::LIST_ORGANIZATIONS => {
                 let organizations = self
                     .auth
                     .list_organizations()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                if method == methods::LEGACY_LIST_ORGANIZATIONS {
-                    RpcReply::value(&serde_json::json!({ "orgs": organizations }))
-                } else {
-                    RpcReply::value(&serde_json::json!({ "organizations": organizations }))
-                }
+                RpcReply::value(&serde_json::json!({ "organizations": organizations }))
             }
-            methods::CREATE_ORGANIZATION | methods::LEGACY_CREATE_ORGANIZATION => {
+            methods::CREATE_ORGANIZATION => {
                 #[derive(Deserialize)]
                 struct P {
                     name: String,
@@ -1158,7 +1149,7 @@ impl RpcService for AuthRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "organizationId": organization_id }))
             }
-            methods::SELECT_ORGANIZATION | methods::LEGACY_SELECT_ORGANIZATION => {
+            methods::SELECT_ORGANIZATION => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
                 struct P {
@@ -1235,7 +1226,7 @@ impl RpcService for AuthRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            methods::DELETE_ORGANIZATION | methods::LEGACY_DELETE_ORGANIZATION => {
+            methods::DELETE_ORGANIZATION => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
                 struct P {
@@ -1461,7 +1452,7 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&status)
             }
-            methods::IMPORT_LOCAL_PROFILE | methods::LEGACY_IMPORT_LOCAL_PROFILE => {
+            methods::IMPORT_LOCAL_PROFILE => {
                 let importer = self.local_importer()?.clone();
                 // Progress rides an unbounded channel: the importer is
                 // blocking (sqlite + fs) and must never wedge on a slow
@@ -1859,7 +1850,7 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
             }
-            methods::READ_WORKING_DIRECTORY_FILE | methods::LEGACY_READ_WORKSPACE_FILE => {
+            methods::READ_WORKING_DIRECTORY_FILE => {
                 let p: ReadWorkingDirectoryFileParams = parse_params(params)?;
                 // Same root resolution + ownership checks as SearchFiles; the
                 // repos layer then jails the read to that checkout.
@@ -2186,60 +2177,5 @@ mod tests {
             panic!("create Organization must be a unary reply");
         };
         assert_eq!(value, serde_json::json!({"organizationId": ""}));
-    }
-
-    #[tokio::test]
-    async fn legacy_organization_methods_are_exact_server_dispatch_aliases() {
-        let data_dir = tempfile::tempdir().expect("temp auth dir");
-        let rpc = AuthRpc::new(Auth::new(crate::auth::AuthConfig::new(
-            "http://127.0.0.1:9",
-            data_dir.path(),
-        )));
-
-        for (method, params) in [
-            (methods::LEGACY_LIST_ORGANIZATIONS, serde_json::json!({})),
-            (
-                methods::LEGACY_CREATE_ORGANIZATION,
-                serde_json::json!({"name": "Organization"}),
-            ),
-            (
-                methods::LEGACY_SELECT_ORGANIZATION,
-                serde_json::json!({"organizationId": "org-1"}),
-            ),
-            (
-                methods::LEGACY_DELETE_ORGANIZATION,
-                serde_json::json!({"organizationId": "org-1"}),
-            ),
-        ] {
-            assert!(AuthRpc::handles(method));
-            assert!(
-                !matches!(
-                    rpc.handle(method, params).await,
-                    Err(RpcError::UnknownMethod(_))
-                ),
-                "legacy method {method} must reach its canonical handler"
-            );
-        }
-
-        let canonical = rpc
-            .handle(methods::LIST_ORGANIZATIONS, serde_json::json!({}))
-            .await
-            .expect("canonical list");
-        let legacy = rpc
-            .handle(methods::LEGACY_LIST_ORGANIZATIONS, serde_json::json!({}))
-            .await
-            .expect("legacy list");
-        assert!(
-            matches!(canonical, RpcReply::Value(value) if value == serde_json::json!({"organizations": []}))
-        );
-        assert!(
-            matches!(legacy, RpcReply::Value(value) if value == serde_json::json!({"orgs": []}))
-        );
-
-        assert!(!AuthRpc::handles("ListOrg"));
-        assert!(matches!(
-            rpc.handle("ListOrg", serde_json::json!({})).await,
-            Err(RpcError::UnknownMethod(method)) if method == "ListOrg"
-        ));
     }
 }

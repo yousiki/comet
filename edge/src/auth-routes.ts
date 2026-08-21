@@ -10,7 +10,6 @@
  *  - POST /auth/organizations/:id/members/:mid   — set role admin|member (admin).
  *  - DELETE /auth/organizations/:id/members/:mid — remove member (admin).
  *  - DELETE /auth/organizations/:id              — delete the Organization (admin).
- *  - /auth/orgs[...] — complete legacy alias; its list response remains `{ orgs }`.
  *  - GET  /auth/cli/callback — headless sign-in: shows a paste-able code.
  *
  * Exchange/refresh/callback run BEFORE the bearer gate (the caller has no
@@ -104,9 +103,7 @@ export const handleAuthRoute = async (
   const parts = url.pathname.split("/").filter(Boolean);
   if (parts[0] !== "auth") return undefined;
   const apiKey = env.WORKOS_API_KEY;
-  const canonicalOrganizationRoute = parts[1] === "organizations";
-  const legacyOrganizationRoute = parts[1] === "orgs";
-  const organizationRoute = canonicalOrganizationRoute || legacyOrganizationRoute;
+  const organizationRoute = parts[1] === "organizations";
 
   if (parts[1] === "exchange" && parts.length === 2 && request.method === "POST") {
     if (!apiKey) return notConfigured();
@@ -152,9 +149,7 @@ export const handleAuthRoute = async (
     if (request.method === "GET") {
       try {
         const organizations = await listOrganizations(apiKey, caller.userId);
-        return json(
-          legacyOrganizationRoute ? { orgs: organizations } : { organizations }
-        );
+        return json({ organizations });
       } catch (e) {
         return authFailed(e);
       }

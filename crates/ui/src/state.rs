@@ -34,9 +34,7 @@ use zeron_proto::{
     AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
     EngineInfo, HarnessId, ProfileIdentity, ProfileScope, Session, Space,
 };
-use zeron_rpc::{
-    RpcClient, RpcError, RpcReply, RpcService, RpcSubscription, connect_ws, memory_client, methods,
-};
+use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
 use crate::change_requests::{
     ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
@@ -567,46 +565,6 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
     }
 }
 
-/// Call a canonical RPC method, retrying its legacy spelling only when the
-/// connected engine explicitly reports that the canonical method is unknown.
-///
-/// In particular, transport, timeout, and application failures must not replay
-/// mutations whose first attempt may already have committed.
-pub(crate) async fn call_with_legacy_method(
-    client: &RpcClient,
-    canonical_method: &'static str,
-    legacy_method: &'static str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value, RpcError> {
-    match client.call(canonical_method, params.clone()).await {
-        Err(RpcError::UnknownMethod(method)) if method == canonical_method => {
-            client.call(legacy_method, params).await
-        }
-        result => result,
-    }
-}
-
-/// Subscribe through a renamed RPC method with the same UnknownMethod-only
-/// fallback contract as [`call_with_legacy_method`]. A checked subscription is
-/// required so an old engine's rejection is observable before the stream is
-/// handed to the caller.
-pub(crate) async fn subscribe_with_legacy_method(
-    client: &RpcClient,
-    canonical_method: &'static str,
-    legacy_method: &'static str,
-    params: serde_json::Value,
-) -> Result<RpcSubscription, RpcError> {
-    match client
-        .subscribe_checked(canonical_method, params.clone())
-        .await
-    {
-        Err(RpcError::UnknownMethod(method)) if method == canonical_method => {
-            client.subscribe_checked(legacy_method, params).await
-        }
-        result => result,
-    }
-}
-
 /// Translate an RPC failure for user-facing error slots. `UnknownMethod` is
 /// the version-skew case — the target device runs an older zeron than this
 /// UI — and the raw "unknown method: X" wire string reads like a bug instead
@@ -655,14 +613,12 @@ fn default_member_role() -> String {
     "member".into()
 }
 
-/// Parse a canonical `ListOrganizations` reply, with read compatibility for
-/// the legacy `{orgs: [...]}` envelope and the oldest bare-array response.
+/// Parse a `ListOrganizations` reply (`{organizations: [...]}`).
 pub fn parse_organizations(value: &serde_json::Value) -> Vec<OrganizationRow> {
-    let organizations = value
+    value
         .get("organizations")
-        .or_else(|| value.get("orgs"))
-        .unwrap_or(value);
-    serde_json::from_value(organizations.clone()).unwrap_or_default()
+        .and_then(|organizations| serde_json::from_value(organizations.clone()).ok())
+        .unwrap_or_default()
 }
 
 /// Organization names must be non-empty (trimmed) and reasonably short.
@@ -2437,33 +2393,6 @@ mod tests {
 
     struct LegacyIdentityRpc;
 
-    struct RenamedMethodRpc {
-        calls: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
-    }
-
-    #[async_trait]
-    impl RpcService for RenamedMethodRpc {
-        async fn handle(
-            &self,
-            method: &str,
-            params: serde_json::Value,
-        ) -> Result<RpcReply, RpcError> {
-            self.calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((method.to_string(), params));
-            match method {
-                "Canonical" | "CanonicalStream" => Err(RpcError::UnknownMethod(method.into())),
-                "Legacy" => RpcReply::value(&serde_json::json!({ "source": "legacy" })),
-                "LegacyStream" => Ok(RpcReply::Stream(
-                    futures::stream::iter([serde_json::json!({ "done": 1 })]).boxed(),
-                )),
-                "RejectedMutation" => Err(RpcError::Failed("rejected".into())),
-                other => Err(RpcError::UnknownMethod(other.into())),
-            }
-        }
-    }
-
     #[async_trait]
     impl RpcService for LegacyIdentityRpc {
         async fn handle(
@@ -2528,80 +2457,6 @@ mod tests {
                 Some(&AuthState::SignedOut),
             ),
             GatePhase::SignIn
-        );
-    }
-
-    #[tokio::test]
-    async fn renamed_unary_method_retries_only_an_explicit_unknown_method() {
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = memory_client(Arc::new(RenamedMethodRpc {
-            calls: calls.clone(),
-        }));
-        let params = serde_json::json!({ "organizationId": "org-target" });
-
-        let value = call_with_legacy_method(&client, "Canonical", "Legacy", params.clone())
-            .await
-            .expect("legacy spelling succeeds");
-        assert_eq!(value, serde_json::json!({ "source": "legacy" }));
-        assert_eq!(
-            *calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![
-                ("Canonical".into(), params.clone()),
-                ("Legacy".into(), params.clone()),
-            ]
-        );
-
-        calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        let error = call_with_legacy_method(&client, "RejectedMutation", "Legacy", params)
-            .await
-            .expect_err("application rejection must be returned");
-        assert!(matches!(error, RpcError::Failed(message) if message == "rejected"));
-        assert_eq!(
-            calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_slice(),
-            &[(
-                "RejectedMutation".into(),
-                serde_json::json!({ "organizationId": "org-target" })
-            )],
-            "a non-UnknownMethod mutation error must never replay the legacy RPC"
-        );
-    }
-
-    #[tokio::test]
-    async fn renamed_stream_method_uses_checked_unknown_method_fallback() {
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = memory_client(Arc::new(RenamedMethodRpc {
-            calls: calls.clone(),
-        }));
-
-        let mut subscription = subscribe_with_legacy_method(
-            &client,
-            "CanonicalStream",
-            "LegacyStream",
-            serde_json::json!({}),
-        )
-        .await
-        .expect("legacy stream spelling succeeds");
-        assert_eq!(
-            subscription.recv().await,
-            Some(serde_json::json!({ "done": 1 }))
-        );
-        assert_eq!(subscription.recv().await, None);
-        assert_eq!(
-            calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .map(|(method, _)| method.as_str())
-                .collect::<Vec<_>>(),
-            ["CanonicalStream", "LegacyStream"]
         );
     }
 
@@ -4127,34 +3982,14 @@ mod tests {
             ["Alpha", "beta"],
             "case-insensitive sort + dedupe by organization id"
         );
-        assert_eq!(
+        assert!(parse_organizations(&serde_json::json!("nope")).is_empty());
+        assert!(
             parse_organizations(&serde_json::json!({ "orgs": [
                 { "id": "legacy", "organizationId": "legacy-org", "name": "Legacy" }
-            ]}))[0]
-                .organization_id,
-            "legacy-org"
+            ]}))
+            .is_empty(),
+            "the retired legacy envelope is no longer read"
         );
-        assert_eq!(
-            parse_organizations(&serde_json::json!([
-                { "id": "bare", "organizationId": "bare-org", "name": "Bare" }
-            ]))[0]
-                .organization_id,
-            "bare-org"
-        );
-        assert_eq!(
-            parse_organizations(&serde_json::json!({
-                "organizations": [
-                    { "id": "canonical", "organizationId": "canonical-org", "name": "Canonical" }
-                ],
-                "orgs": [
-                    { "id": "legacy", "organizationId": "legacy-org", "name": "Legacy" }
-                ]
-            }))[0]
-                .organization_id,
-            "canonical-org",
-            "the canonical envelope wins when both spellings are present"
-        );
-        assert!(parse_organizations(&serde_json::json!("nope")).is_empty());
     }
 
     #[test]

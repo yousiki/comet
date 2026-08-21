@@ -242,27 +242,6 @@ async fn import_without_local_profile_is_a_clean_no_op() {
     synced.shutdown().await;
 }
 
-#[tokio::test]
-async fn previous_import_local_workspace_wire_method_remains_accepted() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
-    let client = zeron_rpc::memory_client(synced.rpc_service());
-    let mut events = client
-        .subscribe(
-            zeron_rpc::methods::LEGACY_IMPORT_LOCAL_PROFILE,
-            serde_json::json!({}),
-        )
-        .await
-        .expect("legacy import stream");
-
-    let mut last = None;
-    while let Some(event) = events.recv().await {
-        last = Some(event);
-    }
-    assert_eq!(last.expect("summary")["kind"], "summary");
-    synced.shutdown().await;
-}
-
 /// Read the summary WITHOUT asserting a clean run (the failure-injection tests
 /// need the errors).
 fn raw_summary(events: &[ImportEvent]) -> (usize, usize, Vec<String>) {
