@@ -3297,6 +3297,7 @@ fn mention_error_message(err: &RpcError) -> SharedString {
             "The session's device runs an older zeron — update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
+        RpcError::AccessDenied(_) => "Not authorized to access the session's device".into(),
         RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
     }
 }
@@ -3308,6 +3309,7 @@ fn slash_error_message(err: &RpcError) -> SharedString {
             "The session's device runs an older zeron — update it to list commands".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
+        RpcError::AccessDenied(_) => "Not authorized to access the session's device".into(),
         RpcError::BadParams(_) | RpcError::Failed(_) => {
             "Couldn't load this agent's commands".into()
         }

@@ -183,6 +183,10 @@ pub enum RpcError {
     Failed(String),
     #[error("transport: {0}")]
     Transport(String),
+    /// An authorization verdict (edge HTTP 403), not a reachability problem:
+    /// retrying cannot succeed, so dial retry/backoff must not engage.
+    #[error("access denied: {0}")]
+    AccessDenied(String),
     #[error("connection closed")]
     Closed,
 }

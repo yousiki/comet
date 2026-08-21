@@ -50,6 +50,14 @@ struct RelayState {
     /// Zombie-path simulation: the host stays "connected" (no bounce) but
     /// client→host frames vanish — the 2026-08-19 dead edge↔host leg.
     blackhole_host_bound: bool,
+    /// Authorization simulation: refuse client-role handshakes with HTTP 403
+    /// (the DO's owner/Organization admission gate).
+    reject_clients_403: bool,
+    /// Client-role handshake attempts, accepted or refused — proves how many
+    /// dials actually reached the relay.
+    client_handshakes: usize,
+    /// The most recent host-role join URI (declaration assertions).
+    last_host_uri: Option<String>,
 }
 
 struct FakeRelay {
@@ -99,6 +107,19 @@ impl FakeRelay {
         self.state.lock().expect("lock").blackhole_host_bound = on;
     }
 
+    /// Refuse client-role handshakes with HTTP 403 (the DO's admission gate).
+    fn set_reject_clients_403(&self, on: bool) {
+        self.state.lock().expect("lock").reject_clients_403 = on;
+    }
+
+    fn client_handshakes(&self) -> usize {
+        self.state.lock().expect("lock").client_handshakes
+    }
+
+    fn last_host_uri(&self) -> Option<String> {
+        self.state.lock().expect("lock").last_host_uri.clone()
+    }
+
     /// Deliver a nudge frame to the connected host (the DO's /nudge live path).
     fn nudge(&self, chat_id: &str) {
         let header = DeviceFrameHeader::new(chat_id, NUDGE_KIND);
@@ -122,9 +143,25 @@ fn relay_error(code: &str) -> Vec<u8> {
 
 async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayState>>) {
     let mut uri = String::new();
+    let gate_state = state.clone();
     let ws =
         match tokio_tungstenite::accept_hdr_async(stream, |req: &WsRequest, res: WsResponse| {
             uri = req.uri().to_string();
+            let mut st = gate_state.lock().expect("lock");
+            if uri.contains("role=host") {
+                st.last_host_uri = Some(uri.clone());
+            } else {
+                st.client_handshakes += 1;
+                if st.reject_clients_403 {
+                    let mut forbidden =
+                        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
+                            Some("forbidden".into()),
+                        );
+                    *forbidden.status_mut() =
+                        tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+                    return Err(forbidden);
+                }
+            }
             Ok(res)
         })
         .await
@@ -763,4 +800,69 @@ async fn zombie_relay_path_trips_the_echo_deadline() {
     );
     // Restore the production clocks for the rest of the process's tests.
     zeron_rpc::device_room::set_client_liveness_for_tests(Duration::ZERO, Duration::ZERO);
+}
+
+/// The DO's admission gate answers the handshake with HTTP 403 (non-owner,
+/// non-member, or unshared device). That verdict is terminal: it must surface
+/// as AccessDenied, burn exactly ONE handshake per call (no in-call retries),
+/// and never poison the cooldown curve — the next call must dial again and
+/// report the same verdict, not "unreachable (backing off)".
+#[tokio::test]
+async fn client_handshake_403_is_access_denied_and_skips_backoff() {
+    let relay = FakeRelay::start().await;
+    let service = TestService::new("host-a");
+    let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
+    relay.wait_host_connected().await;
+    relay.set_reject_clients_403(true);
+
+    let links = cache(&relay.edge_url());
+    let Err(err) = links.client("dev-a").await else {
+        panic!("gate refuses")
+    };
+    assert!(matches!(err, RpcError::AccessDenied(_)), "got: {err:?}");
+    assert_eq!(
+        relay.client_handshakes(),
+        1,
+        "an authorization verdict must not be redialed within the call"
+    );
+
+    let Err(err) = links.client("dev-a").await else {
+        panic!("still refused")
+    };
+    assert!(
+        matches!(err, RpcError::AccessDenied(_)),
+        "no cooldown may masquerade the verdict as unreachable: {err:?}"
+    );
+    assert_eq!(relay.client_handshakes(), 2, "the next call dials again");
+
+    // The gate opening (edge deploy / device shared) recovers without restart.
+    relay.set_reject_clients_403(false);
+    let client = links.client("dev-a").await.expect("admitted now");
+    assert!(client.call("Echo", serde_json::json!({})).await.is_ok());
+}
+
+/// The host join URL carries the device-sharing declaration, and a flip
+/// redials so the DO's stored declaration never goes stale.
+#[tokio::test]
+async fn host_join_declares_sharing_and_redeclares_on_flip() {
+    let relay = FakeRelay::start().await;
+    let (shared_tx, shared_rx) = tokio::sync::watch::channel(true);
+    let mut config = relay_config(&relay.edge_url(), 100);
+    config.shared = Some(shared_rx);
+    let service = TestService::new("host-a");
+    let _host = HostRelay::spawn(config, service, noop_nudge());
+
+    relay.wait_host_connected().await;
+    assert!(
+        relay.last_host_uri().expect("host joined").contains("shared=1"),
+        "join must declare sharing"
+    );
+
+    shared_tx.send(false).expect("flip");
+    wait_until(|| {
+        relay
+            .last_host_uri()
+            .is_some_and(|uri| uri.contains("shared=0"))
+    })
+    .await;
 }

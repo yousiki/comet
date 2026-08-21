@@ -23,7 +23,8 @@ use std::time::Duration;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::error::{Error as WsError, UrlError};
+use tokio_tungstenite::tungstenite::error::UrlError;
+pub use tokio_tungstenite::tungstenite::error::Error as WsError;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// Delay before starting the next address attempt while one is still pending

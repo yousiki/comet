@@ -322,10 +322,15 @@ async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: Se
 }
 
 fn wire_error(error: String) -> RpcError {
-    error
-        .strip_prefix("unknown method: ")
-        .map(|method| RpcError::UnknownMethod(method.to_owned()))
-        .unwrap_or(RpcError::Failed(error))
+    if let Some(method) = error.strip_prefix("unknown method: ") {
+        return RpcError::UnknownMethod(method.to_owned());
+    }
+    // Forwarded dial verdicts survive the engine hop so the UI can word
+    // "no access" differently from "unreachable".
+    if let Some(reason) = error.strip_prefix("access denied: ") {
+        return RpcError::AccessDenied(reason.to_owned());
+    }
+    RpcError::Failed(error)
 }
 
 /// How long a dial may take before we give up.
@@ -372,4 +377,32 @@ pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
         }
     });
     Ok(RpcClient::new(out_tx, in_rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The engine→UI hop serializes errors as `err.to_string()`; the wire
+    /// prefixes must round-trip the variants the UI words differently, or an
+    /// authorization verdict degrades back into a generic failure.
+    #[test]
+    fn wire_error_round_trips_typed_variants() {
+        let denied = RpcError::AccessDenied("device room refused the connection".into());
+        assert!(matches!(
+            wire_error(denied.to_string()),
+            RpcError::AccessDenied(reason) if reason == "device room refused the connection"
+        ));
+
+        let unknown = RpcError::UnknownMethod("OpenTerminal".into());
+        assert!(matches!(
+            wire_error(unknown.to_string()),
+            RpcError::UnknownMethod(method) if method == "OpenTerminal"
+        ));
+
+        assert!(matches!(
+            wire_error("something else broke".into()),
+            RpcError::Failed(text) if text == "something else broke"
+        ));
+    }
 }

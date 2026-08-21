@@ -267,14 +267,19 @@ export default {
         const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
         // `d2/` is the retained identity namespace. The Organization claim
         // rides along so the room can record its owner's Organization for the
-        // nudge authorization gate.
+        // nudge authorization gate. Hosts also declare device sharing, which
+        // gates member (client-role) admission — forward it or the DO never
+        // learns it.
+        const shared = url.searchParams.get("shared");
+        const sharedParam =
+          role === "host" && (shared === "0" || shared === "1") ? `&shared=${shared}` : "";
         return forward(
           env.DEVICE_ROOMS,
           `d2/${deviceId}`,
           request,
           auth.userId,
           "/ws",
-          `?role=${role}&connId=${encodeURIComponent(connId)}`,
+          `?role=${role}&connId=${encodeURIComponent(connId)}${sharedParam}`,
           undefined,
           auth.organizationId
         );

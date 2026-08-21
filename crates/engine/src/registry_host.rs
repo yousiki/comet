@@ -179,6 +179,10 @@ struct RegistryHostInner {
     /// user's writes but cannot address this machine. Arc: the HTTP registry
     /// transport holds a clone to gate its `?beat=1` presence side effect.
     shared: Arc<std::sync::atomic::AtomicBool>,
+    /// Watch mirror of `shared` for the device-room host relay, which
+    /// redeclares sharing to the edge DO on every flip (the DO's client
+    /// admission gate reads the declaration, so it must never go stale).
+    shared_tx: watch::Sender<bool>,
     /// Epoch ms of the registry room's most recent (re)join — the dial gate's
     /// warm-up clock (`peer_liveness`): a just-joined room hasn't heard
     /// anyone's heartbeat yet, and that silence must not read as "offline".
@@ -247,6 +251,7 @@ impl RegistryHost {
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 synced_once: std::sync::atomic::AtomicBool::new(false),
                 shared: Arc::new(std::sync::atomic::AtomicBool::new(shared)),
+                shared_tx: watch::channel(shared).0,
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
             }),
         };
@@ -1120,6 +1125,11 @@ impl RegistryHost {
         self.inner.shared.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Sharing as a watch, for the device-room host relay's join-URL declaration.
+    pub fn shared_watch(&self) -> watch::Receiver<bool> {
+        self.inner.shared_tx.subscribe()
+    }
+
     /// Flip device sharing for this profile: persist the choice, then register
     /// (upsert our row) or withdraw (tombstone our row — spaces and chats stay;
     /// only registry presence and host addressability are withdrawn).
@@ -1136,6 +1146,8 @@ impl RegistryHost {
         if shared == was {
             return Ok(());
         }
+        // Wake the device-room host relay: it redials with the new declaration.
+        let _ = self.inner.shared_tx.send(shared);
         let device_id = self.inner.config.device_id.clone();
         if shared {
             let existing = self
