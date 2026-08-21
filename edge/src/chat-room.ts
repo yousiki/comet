@@ -226,21 +226,35 @@ export class ChatRoom implements DurableObject {
             checkpointSeq: stats.checkpointSeq,
             checkpointSize: stats.checkpointSize,
             rowCount: stats.rowCount,
-            rowBytes: stats.rowBytes
+            rowBytes: stats.rowBytes,
+            epoch: Number(getMeta(sql, "epoch") ?? "0")
           },
           frontier
         )
       ];
+      // Response cap: the WS path streams; this buffers, so bound the body.
+      // Past the cap the response ends WITHOUT rowsDone — clients apply what
+      // arrived, their cursor advances per row, and the next pull resumes
+      // from there (pagination by truncation).
+      const ROWS_BODY_CAP = 4 * 1024 * 1024;
+      let bodyBytes = 0;
+      let truncated = false;
       for (const row of rowsAfter(sql, after, undefined)) {
-        frames.push(
-          encodeFrame(
-            FRAME.row,
-            { seq: row.seq, device: row.device, batchId: row.batchId },
-            row.bytes
-          )
+        const frame = encodeFrame(
+          FRAME.row,
+          { seq: row.seq, device: row.device, batchId: row.batchId },
+          row.bytes
         );
+        bodyBytes += 4 + frame.length;
+        if (bodyBytes > ROWS_BODY_CAP) {
+          truncated = true;
+          break;
+        }
+        frames.push(frame);
       }
-      frames.push(encodeFrame(FRAME.rowsDone, { headSeq: headSeq(sql) }));
+      if (!truncated) {
+        frames.push(encodeFrame(FRAME.rowsDone, { headSeq: headSeq(sql) }));
+      }
       const total = frames.reduce((n, f) => n + 4 + f.length, 0);
       const body = new Uint8Array(total);
       const view = new DataView(body.buffer);
@@ -271,6 +285,13 @@ export class ChatRoom implements DurableObject {
       if (batchId === "" || batchId.length > 128) {
         this.recordPush(attribution, false);
         return json({ error: "bad_push" }, 400);
+      }
+      // Pre-read cap (the WS runtime closes 1 MiB messages before the DO
+      // runs; HTTP needs the explicit twin). appendRow re-checks post-read.
+      const declared = Number(request.headers.get("content-length") ?? "0");
+      if (declared > MAX_ROW_BYTES + 4096) {
+        this.recordPush(attribution, false);
+        return deny(json({ error: "too_large" }, 413));
       }
       const payload = new Uint8Array(await request.arrayBuffer());
       if (!this.admitQuota(attribution, payload.byteLength)) {
@@ -344,10 +365,15 @@ export class ChatRoom implements DurableObject {
       if (denied) return deny(denied);
       // Operator wipe. Recovery is host-driven: the host detects
       // `headSeq < cursor` on its next hello and re-seeds via checkpoint —
-      // same shape as the registry reset recipe.
+      // same shape as the registry reset recipe. The epoch survives the wipe
+      // incremented: it is the incarnation fence clients compare across
+      // paginated pulls (a reset between pages must not let two log
+      // histories stitch into one numerically-contiguous response).
+      const epoch = Number(getMeta(sql, "epoch") ?? "0");
       sql.exec("DELETE FROM rows");
       sql.exec("DELETE FROM meta");
       sql.exec("DELETE FROM blobs");
+      setMeta(sql, "epoch", String(epoch + 1));
       for (const ws of this.ctx.getWebSockets()) {
         try {
           ws.close(4410, "chat room reset");
@@ -430,7 +456,8 @@ export class ChatRoom implements DurableObject {
         checkpointSeq: stats.checkpointSeq,
         checkpointSize: stats.checkpointSize,
         rowCount: stats.rowCount,
-        rowBytes: stats.rowBytes
+        rowBytes: stats.rowBytes,
+        epoch: Number(getMeta(sql, "epoch") ?? "0")
       },
       frontier
     );

@@ -1315,6 +1315,7 @@ fn catch_up_plan_covers_the_decision_table() {
         checkpoint_size: if ckpt > 0 { 1000 } else { 0 },
         row_count: 0,
         row_bytes: 0,
+        epoch: 0,
     };
     // Seeded-at-zero room (M1): checkpointSeq 0 but a real blob — the
     // presence test is SIZE; a fresh reader must fetch the seed.
@@ -1325,6 +1326,7 @@ fn catch_up_plan_covers_the_decision_table() {
         checkpoint_size: 276_000,
         row_count: 0,
         row_bytes: 0,
+        epoch: 0,
     };
     assert_eq!(
         plan_catch_up(0, &seeded, false),
@@ -2182,6 +2184,7 @@ fn empty_frontier_with_real_checkpoint_is_not_contained() {
         checkpoint_size: 2728,
         row_count: 70,
         row_bytes: 17150,
+        epoch: 0,
     };
     // The sink cannot vouch for a frontier it cannot read — an empty payload
     // must plan a checkpoint fetch for a cursor-0 reader.

@@ -277,6 +277,12 @@ struct DocHostInner {
     /// publishes the edge posture on change (see `watch_connectivity`).
     connectivity: OnceLock<watch::Sender<zeron_proto::Connectivity>>,
     connectivity_started: AtomicBool,
+    /// In-flight queued-attachment transfers, published per landed chunk
+    /// (see `watch_transfers`). Entries live exactly as long as bytes are
+    /// moving: added when a file's push starts, removed on commit or failure
+    /// (a retry re-adds), so consumers can render a real percent while the
+    /// relay leg runs and fall back to indeterminate otherwise.
+    transfers: watch::Sender<Vec<zeron_proto::TransferProgress>>,
     connectivity_grace: Mutex<DegradeGrace>,
     /// Command ids currently BETWEEN mark-processed and their resolution in a
     /// drain. Distinguishes "executing right now" from "consumed by the
@@ -324,6 +330,20 @@ fn command_transfers(entry: &SessionCommandEntry) -> Vec<crate::uploads::Attachm
             },
         )
         .collect()
+}
+
+/// Retires a transfer's progress entry on drop — the one exit point for
+/// `push_attachments`' many returns (commit landed, chunk timeout, host
+/// refusal), so no failure path can leave a phantom ring behind.
+struct TransferProgressGuard<'a> {
+    host: &'a DocHost,
+    upload_id: &'a str,
+}
+
+impl Drop for TransferProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.host.transfer_progress_clear(self.upload_id);
+    }
 }
 
 /// How long raw degradation must persist before connectivity reports it.
@@ -691,6 +711,7 @@ impl DocHost {
                 uploads: OnceLock::new(),
                 connectivity: OnceLock::new(),
                 connectivity_started: AtomicBool::new(false),
+                transfers: watch::channel(Vec::new()).0,
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
                 executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
@@ -2283,6 +2304,38 @@ impl DocHost {
         });
     }
 
+    /// The in-flight queued-attachment transfer set: current entries first,
+    /// then a fresh snapshot per landed chunk (see `push_attachments`).
+    pub fn watch_transfers(&self) -> watch::Receiver<Vec<zeron_proto::TransferProgress>> {
+        self.inner.transfers.subscribe()
+    }
+
+    /// Publish one transfer's progress (upserted by uploadId).
+    fn transfer_progress_set(&self, upload_id: &str, file_name: &str, done: u64, total: u64) {
+        self.inner.transfers.send_modify(|list| {
+            match list.iter_mut().find(|t| t.upload_id == upload_id) {
+                Some(t) => {
+                    t.done = done;
+                    t.total = total;
+                }
+                None => list.push(zeron_proto::TransferProgress {
+                    upload_id: upload_id.to_string(),
+                    file_name: file_name.to_string(),
+                    done,
+                    total,
+                }),
+            }
+        });
+    }
+
+    /// Retire a transfer's progress entry (commit landed, or the attempt
+    /// failed and the retry will re-publish).
+    fn transfer_progress_clear(&self, upload_id: &str) {
+        self.inner.transfers.send_modify(|list| {
+            list.retain(|t| t.upload_id != upload_id);
+        });
+    }
+
     /// The connectivity stream: current posture first, then every change.
     /// Lazily starts a monitor — a 1s recompute over in-memory stats
     /// (atomics + small locks), published only when the value changes. The
@@ -3102,6 +3155,16 @@ impl DocHost {
             let bytes = tokio::fs::read(&source)
                 .await
                 .map_err(|e| Permanent(format!("staged attachment missing: {e}")))?;
+            // Progress entry for the sender's thumbnail ring, updated per
+            // landed chunk. The guard retires it on EVERY exit — commit,
+            // timeout, refusal — so a dead attempt falls back to the
+            // indeterminate spinner and the retry re-publishes from 0.
+            let total = bytes.len() as u64;
+            self.transfer_progress_set(&transfer.upload_id, &transfer.file_name, 0, total);
+            let _progress = TransferProgressGuard {
+                host: self,
+                upload_id: &transfer.upload_id,
+            };
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             let mut start = 0usize;
             let mut seq = 0u64;
@@ -3127,6 +3190,10 @@ impl DocHost {
                 }
                 start = end;
                 seq += 1;
+                // b64 → raw: 4 chars carry 3 bytes; min-clamp absorbs the
+                // final chunk's padding overshoot.
+                let done = ((start as u64) * 3 / 4).min(total);
+                self.transfer_progress_set(&transfer.upload_id, &transfer.file_name, done, total);
                 if start >= b64.len() {
                     break;
                 }
@@ -3978,6 +4045,77 @@ fn encode_part_segment(part_id: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod transfer_progress_tests {
+    use super::{DocHost, DocHostConfig, TransferProgressGuard};
+    use std::sync::Arc;
+
+    fn host() -> (tempfile::TempDir, DocHost) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).expect("store opens"));
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-test".into(),
+                user_id: String::new(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        (dir, host)
+    }
+
+    #[test]
+    fn set_upserts_by_upload_id_and_clear_retires_only_its_entry() {
+        let (_dir, host) = host();
+        let rx = host.watch_transfers();
+        assert!(rx.borrow().is_empty());
+
+        host.transfer_progress_set("u1", "a.png", 0, 1_000);
+        host.transfer_progress_set("u2", "b.png", 0, 400);
+        host.transfer_progress_set("u1", "a.png", 300, 1_000);
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.len(), 2, "upsert must not duplicate u1");
+        let u1 = snapshot.iter().find(|t| t.upload_id == "u1").unwrap();
+        assert_eq!((u1.done, u1.total), (300, 1_000));
+
+        host.transfer_progress_clear("u1");
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.len(), 1, "u2 must survive u1's retirement");
+        assert_eq!(snapshot[0].upload_id, "u2");
+    }
+
+    #[test]
+    fn guard_retires_the_entry_on_every_exit_path() {
+        let (_dir, host) = host();
+        let rx = host.watch_transfers();
+        host.transfer_progress_set("u1", "a.png", 0, 9);
+        {
+            let _guard = TransferProgressGuard {
+                host: &host,
+                upload_id: "u1",
+            };
+            assert_eq!(rx.borrow().len(), 1);
+            // An early return / error propagation drops the guard here.
+        }
+        assert!(
+            rx.borrow().is_empty(),
+            "a failed attempt must not leave a phantom ring behind"
+        );
+    }
+
+    #[test]
+    fn late_subscriber_sees_current_set_first() {
+        let (_dir, host) = host();
+        host.transfer_progress_set("u1", "a.png", 750, 1_000);
+        // watch_stream's contract: current value first, then changes — a UI
+        // attaching mid-transfer must render the ring immediately.
+        let rx = host.watch_transfers();
+        assert_eq!(rx.borrow().len(), 1);
+        assert_eq!(rx.borrow()[0].done, 750);
+    }
 }
 
 #[cfg(test)]

@@ -73,6 +73,10 @@ struct ChatStateHeader: Equatable {
     var checkpointSize: UInt64
     var rowCount: UInt64
     var rowBytes: UInt64
+    /// Room incarnation counter: +1 on every /reset, stable otherwise.
+    /// Rooms predating the meta record send nothing — absent decodes as 0
+    /// (same as the edge's serde default).
+    var epoch: UInt64
 
     init?(_ header: [String: Any]) {
         func u64(_ key: String) -> UInt64 { (header[key] as? NSNumber)?.uint64Value ?? 0 }
@@ -83,6 +87,7 @@ struct ChatStateHeader: Equatable {
         checkpointSize = u64("checkpointSize")
         rowCount = u64("rowCount")
         rowBytes = u64("rowBytes")
+        epoch = u64("epoch")
     }
 }
 
@@ -136,6 +141,8 @@ private struct ChatHTTPStateBody: Decodable {
     var checkpointSize: UInt64
     var rowCount: UInt64?
     var rowBytes: UInt64?
+    /// Absent on pre-meta rooms — treat as 0 (edge-side serde default).
+    var epoch: UInt64?
 }
 
 private struct ChatHTTPRowBody: Decodable {
@@ -155,11 +162,14 @@ private func chatDecodeHeader<T: Decodable>(_ header: [String: Any], as: T.Type)
     return decoded
 }
 
-/// Decode the u32-LE length-prefixed HTTP response and require the exact
-/// `state, row*, rowsDone` grammar. Rows must be non-empty and strictly
+/// Decode the u32-LE length-prefixed HTTP response. Grammar: `state, row*,
+/// rowsDone` for a complete page, or `state, row+` for one truncated by the
+/// edge's ROWS_BODY_CAP (the cap breaks before the frame that would cross it
+/// and MAX_ROW_BYTES < cap, so a truncated page always carries at least one
+/// row — a bare `state` with no done is malformed). Rows must be strictly
 /// increasing; completeness relative to the request cursor is checked by
-/// `chatHTTPPullCoversFrontier` below.
-func chatDecodeHTTPPull(_ body: Data) -> ChatHTTPPullBatch? {
+/// `chatHTTPPullCoversFrontier` after truncated pages are stitched.
+func chatDecodeHTTPPullPage(_ body: Data) -> (batch: ChatHTTPPullBatch, truncated: Bool)? {
     var frames: [ChatWireFrame] = []
     var offset = 0
     while offset < body.count {
@@ -178,29 +188,42 @@ func chatDecodeHTTPPull(_ body: Data) -> ChatHTTPPullBatch? {
 
     guard frames.count >= 2,
           frames[0].kind == ChatFrameType.state,
-          frames[frames.count - 1].kind == ChatFrameType.rowsDone,
           let strictState = chatDecodeHeader(frames[0].header, as: ChatHTTPStateBody.self),
           let state = ChatStateHeader(frames[0].header),
-          let done = chatDecodeHeader(frames[frames.count - 1].header,
-                                      as: ChatHTTPRowsDoneBody.self),
           strictState.seqFloor <= strictState.checkpointSeq,
           strictState.checkpointSeq <= strictState.headSeq,
-          state.headSeq == strictState.headSeq,
-          done.headSeq == strictState.headSeq else { return nil }
+          state.headSeq == strictState.headSeq else { return nil }
+
+    let truncated = frames[frames.count - 1].kind != ChatFrameType.rowsDone
+    var rowFrames = frames.dropFirst()
+    if !truncated {
+        guard let done = chatDecodeHeader(frames[frames.count - 1].header,
+                                          as: ChatHTTPRowsDoneBody.self),
+              done.headSeq == strictState.headSeq else { return nil }
+        rowFrames = rowFrames.dropLast()
+    }
 
     var rows: [ChatHTTPPullRow] = []
     var previousSeq: UInt64 = 0
-    for frame in frames.dropFirst().dropLast() {
+    for frame in rowFrames {
         guard frame.kind == ChatFrameType.row,
               let header = chatDecodeHeader(frame.header, as: ChatHTTPRowBody.self),
-              header.seq > previousSeq, header.seq <= done.headSeq,
+              header.seq > previousSeq, header.seq <= strictState.headSeq,
               !header.batchId.isEmpty, !frame.payload.isEmpty else { return nil }
         previousSeq = header.seq
         rows.append(ChatHTTPPullRow(frame: frame, seq: header.seq,
                                     batchId: header.batchId))
     }
-    return ChatHTTPPullBatch(stateFrame: frames[0], state: state,
-                             rows: rows, headSeq: done.headSeq)
+    return (ChatHTTPPullBatch(stateFrame: frames[0], state: state,
+                              rows: rows, headSeq: strictState.headSeq),
+            truncated)
+}
+
+/// A complete (non-truncated) pull body — the single-page fast path and the
+/// shape every existing test exercises.
+func chatDecodeHTTPPull(_ body: Data) -> ChatHTTPPullBatch? {
+    guard let (batch, truncated) = chatDecodeHTTPPullPage(body), !truncated else { return nil }
+    return batch
 }
 
 /// The cursor represented by a checkpoint-confirmed local doc before the

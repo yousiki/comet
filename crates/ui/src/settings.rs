@@ -26,10 +26,13 @@ pub const SIDEBAR_MIN: f32 = 208.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
 pub const SIDEBAR_DEFAULT: f32 = 256.0;
 
-/// Right ("Changes") pane drag-resize bounds (px).
+/// Right ("Changes") pane drag-resize floor and default (px). Its runtime
+/// maximum is the window space remaining after the left sidebar and the
+/// conversation's [`CHAT_PANEL_MIN`] reservation.
 pub const RIGHT_PANE_MIN: f32 = 360.0;
-pub const RIGHT_PANE_MAX: f32 = 760.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
+/// Minimum width retained for the conversation when the right pane is open.
+pub const CHAT_PANEL_MIN: f32 = 300.0;
 
 /// Terminal panel height bounds: 160px … 55% of the viewport (§1.10). The
 /// viewport-relative cap applies at runtime; the absolute cap here only heals
@@ -95,6 +98,8 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Changes pane: side-by-side diffs instead of the unified stack.
+    pub diff_split: bool,
 }
 
 impl Default for UiSettings {
@@ -117,6 +122,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            diff_split: false,
         }
     }
 }
@@ -304,12 +310,9 @@ impl UiSettings {
             SIDEBAR_MAX,
             SIDEBAR_DEFAULT,
         );
-        self.right_pane_width = clamp_or(
-            self.right_pane_width,
-            RIGHT_PANE_MIN,
-            RIGHT_PANE_MAX,
-            RIGHT_PANE_DEFAULT,
-        );
+        // The right pane has no persisted upper bound: its live drag clamps
+        // against the current window, which is unavailable while loading.
+        self.right_pane_width = min_or(self.right_pane_width, RIGHT_PANE_MIN, RIGHT_PANE_DEFAULT);
         self.terminal_height = clamp_or(
             self.terminal_height,
             TERMINAL_MIN_HEIGHT,
@@ -357,6 +360,14 @@ fn clamp_or(value: f32, min: f32, max: f32, default: f32) -> f32 {
     }
 }
 
+fn min_or(value: f32, min: f32, default: f32) -> f32 {
+    if value.is_finite() {
+        value.max(min)
+    } else {
+        default
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +399,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            diff_split: true,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -437,6 +449,16 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.sidebar_width, SIDEBAR_MAX);
         assert_eq!(loaded.right_pane_width, RIGHT_PANE_MIN);
+    }
+
+    #[test]
+    fn large_right_pane_width_is_preserved() {
+        let loaded = UiSettings {
+            right_pane_width: 2400.0,
+            ..Default::default()
+        }
+        .clamped();
+        assert_eq!(loaded.right_pane_width, 2400.0);
     }
 
     #[test]

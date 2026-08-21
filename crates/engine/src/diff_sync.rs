@@ -16,6 +16,14 @@
 //! slow 2-minute repair tick because native watchers may coalesce or drop events.
 //! Snapshots carry a sha256 checksum; an unchanged checksum publishes nothing.
 //!
+//! Reconcile is deliberately damped, because it runs on *every* registry chat
+//! row change — including the `branch`/`checkoutId` writes `sync_entry` itself
+//! makes. Checkout identities are memoized per cwd (chat-watch reconciles spawn
+//! no git; the repair tick revalidates), and an entry whose chats vanish is torn
+//! down only after [`REPAIR_INTERVAL`] of continuous absence rather than on the
+//! first pass that misses it. See [`resolve_identity`] for the incident this
+//! guards against.
+//!
 //! Beyond the working-tree watch, the service also answers one-shot
 //! `GetCheckoutDiff` captures for the Changes pane's scopes: *branch changes*
 //! (vs `merge-base(baseRef, HEAD)`, same capture path with the base overridden)
@@ -82,10 +90,20 @@ struct CheckoutEntry {
     chats: Mutex<Vec<Chat>>,
     /// Last published checksum — unchanged snapshots publish nothing.
     checksum: Mutex<Option<String>>,
+    /// Set when a reconcile pass finds no chats for this checkout; cleared the
+    /// moment chats reappear. The entry (watchers, checksum state, published
+    /// diff) is only torn down after `orphan_grace` of *continuous* absence:
+    /// tearing down and re-adding restarts a full capture, which costs seconds
+    /// of CPU on a big checkout, so a single flapping chat-watch emission or
+    /// transient identity failure must never destroy a live entry.
+    orphaned_since: Mutex<Option<std::time::Instant>>,
     /// Kick channel into the entry's debounce/sync task.
     kick_tx: mpsc::UnboundedSender<()>,
-    /// Keeps the recursive fs watchers alive; dropped on entry close.
-    _watchers: Vec<notify::RecommendedWatcher>,
+    /// Keeps the recursive fs watchers alive; dropped on entry close. Filled
+    /// asynchronously — watcher setup (budget walk + FSEvents registration) can
+    /// block for seconds, so [`add_entry`] does it off the runtime and attaches
+    /// the result here once ready.
+    watchers: Mutex<Vec<notify::RecommendedWatcher>>,
 }
 
 /// Working-tree snapshot recorded when a chat's turn dispatches — the diff
@@ -105,6 +123,15 @@ struct DiffSyncInner {
     registry: RegistryHost,
     device_id: String,
     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
+    /// Serializes [`reconcile`] passes. Concurrent passes (chat-watch task vs.
+    /// `reconcile_now`) can both observe a checkout as missing and both
+    /// `add_entry` it — the second insert silently replaces the first entry,
+    /// discarding its checksum state and kicking a redundant full capture.
+    reconcile_gate: tokio::sync::Mutex<()>,
+    /// cwd → resolved checkout identity. See [`resolve_identity`].
+    identities: Mutex<HashMap<String, CheckoutIdentity>>,
+    /// How long an entry may sit chat-less before reconcile removes it.
+    orphan_grace: Duration,
     diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
     /// chat_id → turn-start tree (see [`TurnSnapshot`]).
     turn_trees: Mutex<HashMap<String, TurnSnapshot>>,
@@ -127,6 +154,20 @@ impl CheckoutDiffSync {
     /// Build and start the sync loop: follows the registry chat watch and runs the
     /// 2-minute repair tick. Requires a tokio runtime.
     pub fn start(repos: Repos, registry: RegistryHost, device_id: &str) -> Self {
+        // Grace = one repair interval: an entry must survive at least one full
+        // fresh revalidation pass before reconcile may tear it down.
+        Self::start_with_orphan_grace(repos, registry, device_id, REPAIR_INTERVAL)
+    }
+
+    /// [`CheckoutDiffSync::start`] with an explicit orphan grace — test hook so
+    /// removal-after-grace is exercisable without waiting out [`REPAIR_INTERVAL`].
+    #[doc(hidden)]
+    pub fn start_with_orphan_grace(
+        repos: Repos,
+        registry: RegistryHost,
+        device_id: &str,
+        orphan_grace: Duration,
+    ) -> Self {
         let (diffs_tx, _) = watch::channel(Vec::new());
         let sync = Self {
             inner: Arc::new(DiffSyncInner {
@@ -134,6 +175,9 @@ impl CheckoutDiffSync {
                 registry: registry.clone(),
                 device_id: device_id.to_string(),
                 entries: Mutex::new(HashMap::new()),
+                reconcile_gate: tokio::sync::Mutex::new(()),
+                identities: Mutex::new(HashMap::new()),
+                orphan_grace,
                 diffs_tx,
                 turn_trees: Mutex::new(HashMap::new()),
                 cancel: CancellationToken::new(),
@@ -168,7 +212,16 @@ impl CheckoutDiffSync {
     /// Public for tests (the background task calls it on every chat change).
     pub async fn reconcile_now(&self) {
         let chats = self.inner.registry.watch_chats().borrow().clone();
-        reconcile(&self.inner, chats).await;
+        reconcile(&self.inner, chats, false).await;
+    }
+
+    /// Repair-tick path for tests: fresh identity revalidation, then kick every
+    /// tracked checkout.
+    #[doc(hidden)]
+    pub async fn repair_now(&self) {
+        let chats = self.inner.registry.watch_chats().borrow().clone();
+        reconcile(&self.inner, chats, true).await;
+        self.sync_all();
     }
 
     /// Kick an immediate sync of every tracked checkout (repair-tick path).
@@ -221,9 +274,60 @@ impl CheckoutDiffSync {
 // Reconcile: chats ⇄ checkout entries
 // ---------------------------------------------------------------------------
 
-async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
+/// Resolve `cwd` to its canonical checkout identity, preferring the memo.
+///
+/// [`Repos::checkout_identity`] spawns `git rev-parse` twice, and reconcile
+/// runs on *every* registry chat row change — including the `branch` and
+/// `checkoutId` writes [`sync_entry`] itself makes. Resolving fresh on every
+/// pass had two failure modes that combined into a runaway loop on a checkout
+/// whose captures cost seconds of CPU:
+///
+/// 1. every publish fanned out into a storm of `git` spawns (fd pressure);
+/// 2. one transient spawn failure (e.g. EMFILE) made the chat ungroupable, so
+///    reconcile tore its entry down and re-added it on the next pass — and
+///    every re-add kicks a full capture, whose row writes trigger the next
+///    reconcile. Back-to-back `git diff` forever, on an idle tree.
+///
+/// So: chat-watch reconciles reuse the memo (no git at all), the repair tick
+/// revalidates (`fresh`), and a failed fresh resolve keeps the memo unless the
+/// directory is actually gone.
+async fn resolve_identity(
+    inner: &Arc<DiffSyncInner>,
+    cwd: &str,
+    fresh: bool,
+) -> Option<CheckoutIdentity> {
+    if !fresh && let Some(identity) = lock(&inner.identities).get(cwd).cloned() {
+        return Some(identity);
+    }
+    match inner.repos.checkout_identity(Path::new(cwd)).await {
+        Ok(identity) => {
+            lock(&inner.identities).insert(cwd.to_string(), identity.clone());
+            Some(identity)
+        }
+        Err(err) => {
+            if !Path::new(cwd).exists() {
+                lock(&inner.identities).remove(cwd);
+                tracing::debug!(cwd = %cwd, error = %err, "diff-sync: checkout gone");
+                return None;
+            }
+            let cached = lock(&inner.identities).get(cwd).cloned();
+            match &cached {
+                Some(_) => tracing::debug!(cwd = %cwd, error = %err,
+                    "diff-sync: identity resolve failed; keeping memoized identity"),
+                None => tracing::debug!(cwd = %cwd, error = %err, "diff-sync: not a checkout"),
+            }
+            cached
+        }
+    }
+}
+
+async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>, fresh: bool) {
+    // One pass at a time — see `reconcile_gate`.
+    let _gate = inner.reconcile_gate.lock().await;
     // Group this device's cwd-bearing chats by canonical checkout identity.
     let mut groups: HashMap<String, (CheckoutIdentity, Vec<Chat>)> = HashMap::new();
+    // Dedupe resolution within this pass — many chats share one checkout.
+    let mut resolved: HashMap<String, Option<CheckoutIdentity>> = HashMap::new();
     for chat in chats {
         if chat.device_id != inner.device_id {
             continue;
@@ -231,12 +335,16 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
         let Some(cwd) = chat.cwd.clone() else {
             continue;
         };
-        let identity = match inner.repos.checkout_identity(Path::new(&cwd)).await {
-            Ok(identity) => identity,
-            Err(err) => {
-                tracing::debug!(cwd = %cwd, error = %err, "diff-sync: not a checkout");
-                continue;
+        let identity = match resolved.get(&cwd) {
+            Some(identity) => identity.clone(),
+            None => {
+                let identity = resolve_identity(inner, &cwd, fresh).await;
+                resolved.insert(cwd.clone(), identity.clone());
+                identity
             }
+        };
+        let Some(identity) = identity else {
+            continue;
         };
         // Stamp the row's checkoutId so every device groups this chat correctly.
         if chat.checkout_id.as_deref() != Some(identity.id.as_str())
@@ -251,14 +359,28 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
             .push(chat);
     }
 
-    // Close entries whose checkout no longer has chats; drop their published diff.
+    // Close entries whose checkout has had no chats for a full grace period;
+    // drop their published diff. A single pass that misses a checkout only
+    // *marks* it — teardown is expensive to undo (re-add kicks a capture), so
+    // absence must be sustained before we act on it.
     let removed: Vec<String> = {
+        let now = std::time::Instant::now();
         let mut entries = lock(&inner.entries);
-        let removed: Vec<String> = entries
-            .keys()
-            .filter(|id| !groups.contains_key(*id))
-            .cloned()
-            .collect();
+        let mut removed = Vec::new();
+        for (id, entry) in entries.iter() {
+            if groups.contains_key(id) {
+                *lock(&entry.orphaned_since) = None;
+                continue;
+            }
+            let mut orphaned = lock(&entry.orphaned_since);
+            match *orphaned {
+                None => *orphaned = Some(now),
+                Some(since) if now.duration_since(since) >= inner.orphan_grace => {
+                    removed.push(id.clone());
+                }
+                Some(_) => {}
+            }
+        }
         for id in &removed {
             entries.remove(id); // dropping the entry drops watchers + ends its task
         }
@@ -281,7 +403,7 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
                     has_new
                 };
                 if has_new {
-                    let _ = entry.kick_tx.send(()); // new chat needs a sidecar now
+                    let _ = entry.kick_tx.send(()); // new chat needs a snapshot now
                 }
             }
             None => add_entry(inner, identity, chats),
@@ -355,12 +477,51 @@ fn watch_targets(identity: &CheckoutIdentity) -> Vec<PathBuf> {
 
 fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<Chat>) {
     let (kick_tx, kick_rx) = mpsc::unbounded_channel();
+    let entry = Arc::new(CheckoutEntry {
+        identity,
+        chats: Mutex::new(chats),
+        checksum: Mutex::new(None),
+        orphaned_since: Mutex::new(None),
+        kick_tx: kick_tx.clone(),
+        watchers: Mutex::new(Vec::new()),
+    });
+    lock(&inner.entries).insert(entry.identity.id.clone(), entry.clone());
+    tokio::spawn(entry_task(
+        Arc::downgrade(inner),
+        Arc::downgrade(&entry),
+        kick_rx,
+        inner.cancel.clone(),
+    ));
+    let _ = kick_tx.send(()); // initial snapshot — must not wait for watchers
 
-    // Recursive watchers on the worktree root (budget permitting) and the git
-    // dir — HEAD/index churn and file edits both land here. Failures are fine:
-    // the initial + repair sync still keep the snapshot correct.
+    // Watcher setup is genuinely blocking: the budget walk reads up to
+    // MAX_WATCH_DIRS directory entries and FSEvents stream registration stalls
+    // for seconds when fseventsd is contended. Doing it inline starved the whole
+    // runtime (registry watches, presence) whenever entries were (re)built, so
+    // it runs on the blocking pool and attaches to the entry when ready. Events
+    // occurring before attachment are covered by the initial sync; one extra
+    // kick after attachment closes the capture→attach gap.
+    let weak = Arc::downgrade(&entry);
+    tokio::task::spawn_blocking(move || {
+        let Some(entry) = weak.upgrade() else {
+            return; // entry removed before watchers were ready
+        };
+        let watchers = build_watchers(&entry.identity, &kick_tx);
+        *lock(&entry.watchers) = watchers;
+        let _ = kick_tx.send(());
+    });
+}
+
+/// Recursive watchers on the worktree root (budget permitting) and the git
+/// dir — HEAD/index churn and file edits both land here. Failures are fine:
+/// the initial + repair sync still keep the snapshot correct. Blocking — call
+/// from the blocking pool.
+fn build_watchers(
+    identity: &CheckoutIdentity,
+    kick_tx: &mpsc::UnboundedSender<()>,
+) -> Vec<notify::RecommendedWatcher> {
     let mut watchers = Vec::new();
-    for target in watch_targets(&identity) {
+    for target in watch_targets(identity) {
         let tx = kick_tx.clone();
         let watcher =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
@@ -381,22 +542,7 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
             Err(err) => tracing::debug!(error = %err, "diff-sync: watcher create failed"),
         }
     }
-
-    let entry = Arc::new(CheckoutEntry {
-        identity,
-        chats: Mutex::new(chats),
-        checksum: Mutex::new(None),
-        kick_tx: kick_tx.clone(),
-        _watchers: watchers,
-    });
-    lock(&inner.entries).insert(entry.identity.id.clone(), entry.clone());
-    tokio::spawn(entry_task(
-        Arc::downgrade(inner),
-        Arc::downgrade(&entry),
-        kick_rx,
-        inner.cancel.clone(),
-    ));
-    let _ = kick_tx.send(()); // initial snapshot
+    watchers
 }
 
 /// Per-checkout task: trailing-debounce fs kicks, then compute + publish. Runs
@@ -420,7 +566,7 @@ async fn entry_task(
             return;
         };
         // The upgraded Arc would let a sync outlive shutdown — race the token
-        // so an in-flight sidecar POST is dropped, not completed.
+        // so an in-flight sync is dropped, not completed.
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = sync_entry(&inner, &entry) => {}
@@ -521,12 +667,15 @@ async fn diff_sync_task(
                 }
                 let Some(inner) = inner.upgrade() else { break };
                 let chats = chats_rx.borrow_and_update().clone();
-                reconcile(&inner, chats).await;
+                // Memoized identities only: chat rows change constantly (the
+                // sync itself writes them) and must never fan out into git.
+                reconcile(&inner, chats, false).await;
             }
             _ = repair.tick() => {
                 let Some(inner) = inner.upgrade() else { break };
                 let chats = chats_rx.borrow().clone();
-                reconcile(&inner, chats).await;
+                // Fresh: revalidate every memoized identity against git.
+                reconcile(&inner, chats, true).await;
                 for entry in lock(&inner.entries).values() {
                     let _ = entry.kick_tx.send(());
                 }

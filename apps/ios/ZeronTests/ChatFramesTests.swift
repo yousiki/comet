@@ -148,6 +148,26 @@ final class ChatFramesTests: XCTestCase {
                                                                   header: [:]), done(1)])))
     }
 
+    func testHTTPPullPageAcceptsTruncationButDemandsProgress() {
+        // A page cut by the edge's ROWS_BODY_CAP: state + rows, no done frame.
+        let (page, truncated) = chatDecodeHTTPPullPage(
+            httpBody([state(5), row(1, batchId: "b1"), row(2, batchId: "b2")]))!
+        XCTAssertTrue(truncated)
+        XCTAssertEqual(page.rows.map(\.seq), [1, 2])
+        XCTAssertEqual(page.headSeq, 5)
+        // The strict decoder refuses a truncated page outright.
+        XCTAssertNil(chatDecodeHTTPPull(
+            httpBody([state(5), row(1, batchId: "b1"), row(2, batchId: "b2")])))
+        // A bare state with neither rows nor done is malformed, not truncated —
+        // the cap always leaves at least one row, so this shape can't advance.
+        XCTAssertNil(chatDecodeHTTPPullPage(httpBody([state(5)])))
+        // A complete page reports truncated=false through the page decoder too.
+        let (full, fullTruncated) = chatDecodeHTTPPullPage(
+            httpBody([state(2), row(1, batchId: "b1"), row(2, batchId: "b2"), done(2)]))!
+        XCTAssertFalse(fullTruncated)
+        XCTAssertEqual(full.rows.map(\.seq), [1, 2])
+    }
+
     func testHTTPFrontierCoverageAccountsForCheckpoint() {
         let body = httpBody([state(8, checkpointSeq: 5, checkpointSize: 500),
                              row(6, batchId: "b6"), row(7, batchId: "b7"),
