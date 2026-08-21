@@ -12,34 +12,23 @@
 //! Liveness: `lastSeenAt` is a row write on boot/shutdown ONLY — the periodic 15s
 //! heartbeat rides the room's presence frames (memory-only on the DO), so staying
 //! online never grows server state.
-//!
-//! Migration: first boot after the update finds no `registry1` snapshot, reads
-//! the legacy `workspace2` Loro snapshot, and seeds the registry from it as
-//! pending upserts (historical HLCs — live writes always win). The overlay
-//! serves the full sidebar before any server contact; the old `ws4` rooms are
-//! simply never joined again. The legacy snapshot is kept for rollback.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use chrono::Utc;
 use tokio::sync::watch;
 
-use zeron_doc::{DeletedDevice, DeletedSpace, LegacyWorkspaceDoc, REGISTRY_DOC_ID, RegistryDoc};
+use zeron_doc::{DeletedDevice, DeletedSpace, REGISTRY_DOC_ID, RegistryDoc};
 use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
 use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
 use crate::{EngineError, now_ms};
 
-/// Legacy Loro workspace snapshot row — now only read once, as the migration
-/// source for the registry seed. Kept on disk for rollback.
-pub const LEGACY_WORKSPACE_V2_DOC_ID: &str = "workspace2";
 /// Per-profile device-share opt-out marker (DocsStore row, value `b"0"`).
 /// Present = this device must NOT register itself in this profile's registry:
 /// no device row, no presence beats, never a host. Absent = shared (default).
 const DEVICE_SHARE_DOC_ID: &str = "device-share1";
-/// Legacy (pre-spaces) snapshot row — best-effort deleted on open.
-const LEGACY_WORKSPACE_DOC_ID: &str = "workspace";
 /// Organization used when none is configured (matches dev-mode bearers).
 pub const DEFAULT_ORGANIZATION_ID: &str = "dev-org";
 /// User used when none is configured (dev mode without a bearer).
@@ -215,52 +204,8 @@ impl RegistryHost {
         let mut doc = match store.load_snapshot(REGISTRY_DOC_ID)? {
             Some(bytes) => RegistryDoc::from_bytes(&bytes, &config.device_id)
                 .map_err(|e| EngineError::Other(format!("registry snapshot load failed: {e}")))?,
-            None => {
-                // MIGRATION (instant, one-time): seed from the legacy Loro
-                // legacy workspace snapshot when one exists. Seeds are pending upserts
-                // with historical HLCs — the overlay serves the full sidebar
-                // immediately, the room converges on first join, and any live
-                // write beats a migrated value. The legacy snapshot stays on
-                // disk for rollback.
-                let mut doc = RegistryDoc::new(&config.device_id);
-                match store.load_snapshot(LEGACY_WORKSPACE_V2_DOC_ID) {
-                    Ok(Some(bytes)) => {
-                        let raw = loro::LoroDoc::new();
-                        match raw.import(&bytes) {
-                            Ok(_) => {
-                                let legacy = LegacyWorkspaceDoc::from_doc(raw);
-                                match legacy.read_all() {
-                                    Ok(state) => match doc.seed_from_legacy_workspace(&state) {
-                                        Ok(rows) => {
-                                            tracing::info!(
-                                                rows,
-                                                "migrated legacy workspace doc into the registry"
-                                            );
-                                        }
-                                        Err(err) => {
-                                            tracing::warn!(error = %err, "legacy workspace migration seed failed");
-                                        }
-                                    },
-                                    Err(err) => {
-                                        tracing::warn!(error = %err, "legacy workspace read failed; starting empty");
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                tracing::warn!(error = %err, "legacy workspace import failed; starting empty");
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(error = %err, "legacy workspace snapshot load failed; starting empty");
-                    }
-                }
-                doc
-            }
+            None => RegistryDoc::new(&config.device_id),
         };
-        // Destructive-break hygiene: the pre-spaces row stays unreachable.
-        store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
 
         // Boot: upsert our own device row — unless sharing is opted out for
         // this profile, in which case any row a previously-shared boot left

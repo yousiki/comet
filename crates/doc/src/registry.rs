@@ -11,7 +11,7 @@
 //!
 //! The merge function [`apply_op`] mirrors `edge/src/registry-core.ts` 1:1 —
 //! the shared test vectors live in both files; change them together. The
-//! typed API mirrors the old `LegacyWorkspaceDoc` surface so `RegistryHost` is a
+//! typed API keeps the original entity-mutation surface so `RegistryHost` is a
 //! drop-in swap.
 
 use std::collections::{BTreeMap, HashMap};
@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
 
-use crate::legacy_workspace::{DeletedDevice, DeletedSpace, LegacyWorkspaceState};
+use crate::rows::{DeletedDevice, DeletedSpace, RegistryRows};
 use crate::schema::DocError;
 
 /// Row kinds — the four sidebar tables.
@@ -675,7 +675,7 @@ impl RegistryDoc {
         self.overlay_row(kind, id).is_some()
     }
 
-    // ── typed API (the LegacyWorkspaceDoc surface) ────────────────────────────────
+    // ── typed API (entity reads and mutations) ──────────────────────────────
 
     /// Upsert a full device row (writer discipline: callers pass their OWN device).
     pub fn upsert_device(&mut self, device: &Device) -> Result<(), DocError> {
@@ -771,7 +771,7 @@ impl RegistryDoc {
 
     pub fn read_devices(&self) -> Result<Vec<Device>, DocError> {
         let mut devices: Vec<Device> = self
-            .read_kind::<crate::legacy_workspace::RawDevice>(KIND_DEVICES)
+            .read_kind::<crate::rows::RawDevice>(KIND_DEVICES)
             .into_iter()
             .map(Device::from)
             .collect();
@@ -799,13 +799,13 @@ impl RegistryDoc {
     pub fn space(&self, space_id: &str) -> Result<Option<Space>, DocError> {
         Ok(self
             .overlay_row(KIND_SPACES, space_id)
-            .and_then(|row| row_to::<crate::legacy_workspace::RawSpace>(&row))
+            .and_then(|row| row_to::<crate::rows::RawSpace>(&row))
             .map(Space::from))
     }
 
     pub fn read_spaces(&self) -> Result<Vec<Space>, DocError> {
         let mut spaces: Vec<Space> = self
-            .read_kind::<crate::legacy_workspace::RawSpace>(KIND_SPACES)
+            .read_kind::<crate::rows::RawSpace>(KIND_SPACES)
             .into_iter()
             .map(Space::from)
             .collect();
@@ -974,13 +974,13 @@ impl RegistryDoc {
     pub fn chat(&self, chat_id: &str) -> Result<Option<Chat>, DocError> {
         Ok(self
             .overlay_row(KIND_CHATS, chat_id)
-            .and_then(|row| row_to::<crate::legacy_workspace::RawChat>(&row))
+            .and_then(|row| row_to::<crate::rows::RawChat>(&row))
             .map(Chat::from))
     }
 
     pub fn read_chats(&self) -> Result<Vec<Chat>, DocError> {
         let mut chats: Vec<Chat> = self
-            .read_kind::<crate::legacy_workspace::RawChat>(KIND_CHATS)
+            .read_kind::<crate::rows::RawChat>(KIND_CHATS)
             .into_iter()
             .map(Chat::from)
             .collect();
@@ -1166,7 +1166,7 @@ impl RegistryDoc {
 
     pub fn read_sessions(&self) -> Result<Vec<Session>, DocError> {
         let mut sessions: Vec<Session> = self
-            .read_kind::<crate::legacy_workspace::RawSession>(KIND_SESSIONS)
+            .read_kind::<crate::rows::RawSession>(KIND_SESSIONS)
             .into_iter()
             .map(Session::from)
             .collect();
@@ -1176,135 +1176,13 @@ impl RegistryDoc {
 
     // ── whole-doc read ──────────────────────────────────────────────────────
 
-    pub fn read_all(&self) -> Result<LegacyWorkspaceState, DocError> {
-        Ok(LegacyWorkspaceState {
+    pub fn read_all(&self) -> Result<RegistryRows, DocError> {
+        Ok(RegistryRows {
             devices: self.read_devices()?,
             spaces: self.read_spaces()?,
             chats: self.read_chats()?,
             sessions: self.read_sessions()?,
         })
-    }
-
-    // ── migration ───────────────────────────────────────────────────────────
-
-    /// Seed from the legacy Loro workspace doc's materialized state (first
-    /// boot after the update). Every row becomes a pending upsert whose HLC
-    /// derives from the row's own newest timestamp — historical, so any
-    /// genuinely newer live write beats the migrated value; identical across
-    /// devices, so N devices seeding the same converged doc is idempotent
-    /// (equal values, deterministic device tie-break).
-    pub fn seed_from_legacy_workspace(
-        &mut self,
-        state: &LegacyWorkspaceState,
-    ) -> Result<usize, DocError> {
-        let mut ops: Vec<RowOp> = Vec::new();
-        let mut seed = |kind: &str, id: &str, ms: i64, set: BTreeMap<String, Value>| {
-            ops.push(RowOp {
-                kind: kind.to_string(),
-                id: id.to_string(),
-                op: OpKind::Upsert,
-                set: Some(set),
-                hlc: encode_hlc(ms.max(1), 0, "migration"),
-                clocks: None,
-            });
-        };
-        for device in &state.devices {
-            let ms = newest(&[device.last_seen_at, device.created_at]);
-            seed(
-                KIND_DEVICES,
-                &device.id,
-                ms,
-                fields([
-                    ("id", json!(device.id)),
-                    ("name", json!(device.name)),
-                    ("platform", json!(device.platform)),
-                    ("lastSeenAt", opt_ms(device.last_seen_at)),
-                    ("createdAt", opt_ms(device.created_at)),
-                    ("version", opt_str(device.version.as_deref())),
-                ]),
-            );
-        }
-        for space in &state.spaces {
-            let ms = newest(&[space.git_checked_at, Some(space.created_at)]);
-            seed(
-                KIND_SPACES,
-                &space.id,
-                ms,
-                fields([
-                    ("id", json!(space.id)),
-                    ("deviceId", json!(space.device_id)),
-                    ("path", json!(space.path)),
-                    ("name", opt_str(space.name.as_deref())),
-                    ("gitDetected", json!(space.git_detected)),
-                    ("gitCheckedAt", opt_ms(space.git_checked_at)),
-                    ("checkoutId", opt_str(space.checkout_id.as_deref())),
-                    ("createdAt", json!(space.created_at.timestamp_millis())),
-                ]),
-            );
-        }
-        for chat in &state.chats {
-            let ms = newest(&[
-                chat.last_message_at,
-                chat.last_seen_at,
-                Some(chat.created_at),
-            ]);
-            let config = match &chat.config {
-                Some(config) => serde_json::to_value(config)?,
-                None => Value::Null,
-            };
-            seed(
-                KIND_CHATS,
-                &chat.id,
-                ms,
-                fields([
-                    ("id", json!(chat.id)),
-                    ("deviceId", json!(chat.device_id)),
-                    ("title", opt_str(chat.title.as_deref())),
-                    ("archived", json!(chat.archived)),
-                    ("cwd", opt_str(chat.cwd.as_deref())),
-                    ("branch", opt_str(chat.branch.as_deref())),
-                    ("checkoutId", opt_str(chat.checkout_id.as_deref())),
-                    ("config", config),
-                    (
-                        "lastMessagePreview",
-                        opt_str(chat.last_message_preview.as_deref()),
-                    ),
-                    ("lastMessageAt", opt_ms(chat.last_message_at)),
-                    ("createdAt", json!(chat.created_at.timestamp_millis())),
-                    (
-                        "harnessSessionId",
-                        opt_str(chat.harness_session_id.as_deref()),
-                    ),
-                    (
-                        "harnessSessionCwd",
-                        opt_str(chat.harness_session_cwd.as_deref()),
-                    ),
-                    ("spaceId", opt_str(chat.space_id.as_deref())),
-                    ("lastSeenAt", opt_ms(chat.last_seen_at)),
-                ]),
-            );
-        }
-        for session in &state.sessions {
-            let ms = newest(&[Some(session.updated_at), session.started_at]);
-            seed(
-                KIND_SESSIONS,
-                &session.chat_id,
-                ms,
-                fields([
-                    ("chatId", json!(session.chat_id)),
-                    ("deviceId", json!(session.device_id)),
-                    ("status", serde_json::to_value(session.status)?),
-                    ("startedAt", opt_ms(session.started_at)),
-                    ("updatedAt", json!(session.updated_at.timestamp_millis())),
-                ]),
-            );
-        }
-        let count = ops.len();
-        // Chunk so a huge legacy workspace never exceeds the server's batch cap.
-        for chunk in ops.chunks(400) {
-            self.enqueue_ops(chunk.to_vec());
-        }
-        Ok(count)
     }
 }
 

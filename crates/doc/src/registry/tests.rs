@@ -1,7 +1,5 @@
 //! RegistryDoc unit tests. The merge cases mirror
 //! `edge/src/registry-core.test.ts` — shared vectors; change both together.
-//! The typed-API cases mirror `legacy_workspace.rs`'s tests so the migration claim is
-//! tested, not asserted.
 
 use super::*;
 use zeron_proto::{HarnessId, SandboxLevel, SessionStatus};
@@ -837,50 +835,4 @@ fn reconnect_replay_is_idempotent() {
             assert!(!changed, "replayed op must be a no-op");
         }
     }
-}
-
-#[test]
-fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
-    // Build a legacy loro workspace doc, materialize, seed.
-    let legacy = crate::legacy_workspace::LegacyWorkspaceDoc::new();
-    legacy.upsert_device(&device("dev-a", "laptop")).unwrap();
-    legacy
-        .upsert_space(&space("sp-1", "dev-a", "/tmp/one"))
-        .unwrap();
-    let mut legacy_chat = chat("chat-1", "dev-a");
-    legacy_chat.space_id = Some("sp-1".into());
-    legacy_chat.title = Some("migrated title".into());
-    legacy_chat.last_message_at = Some(ts(400_000));
-    legacy.upsert_chat(&legacy_chat).unwrap();
-    legacy
-        .upsert_session(&session("chat-1", "dev-a", SessionStatus::Idle))
-        .unwrap();
-
-    let mut doc = RegistryDoc::new("dev-a");
-    let seeded = doc
-        .seed_from_legacy_workspace(&legacy.read_all().unwrap())
-        .unwrap();
-    assert_eq!(seeded, 4);
-    // Instant: the overlay serves the full state before any server contact.
-    let state = doc.read_all().unwrap();
-    assert_eq!(state, legacy.read_all().unwrap());
-
-    // Two devices seeding the same converged doc = identical result.
-    let mut other = RegistryDoc::new("dev-b");
-    other
-        .seed_from_legacy_workspace(&legacy.read_all().unwrap())
-        .unwrap();
-    let mut server = HashMap::new();
-    let mut seq = 0u64;
-    server_round(&mut server, &mut seq, &mut [&mut doc, &mut other]);
-    assert_eq!(doc.read_all().unwrap(), other.read_all().unwrap());
-    assert_eq!(doc.read_all().unwrap(), legacy.read_all().unwrap());
-
-    // A live rename (now-clock) beats the migrated title everywhere.
-    other.rename_chat("chat-1", "live rename").unwrap();
-    server_round(&mut server, &mut seq, &mut [&mut doc, &mut other]);
-    assert_eq!(
-        doc.chat("chat-1").unwrap().unwrap().title.as_deref(),
-        Some("live rename")
-    );
 }

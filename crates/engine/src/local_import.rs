@@ -14,8 +14,7 @@
 //!    `import_space_row` (live upserts: persisted, pushed, watched).
 //!  - attachments are NOT copied or rewritten. Transcripts embed absolute
 //!    paths under the local profile's uploads root, so that root becomes a
-//!    read-only jail root of the synced profile — the exact mechanism the
-//!    legacy-uploads adoption already uses (`EngineProfile::claim_legacy_uploads_root`).
+//!    read-only jail root of the synced profile (`Uploads::add_read_only_root`).
 //!    The marker file re-arms the root on every later synced boot.
 //!
 //! Idempotence is structural: a chat/space whose row already exists in the

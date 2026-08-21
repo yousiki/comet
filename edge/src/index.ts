@@ -360,14 +360,12 @@ export default {
       if (partId === undefined || !PART_RE.test(partId)) {
         return json({ error: "bad part id" }, 400);
       }
-      // Organization-scoped legacy `blob3/` keyspace lets every member of a
-      // shared session resolve the same tool outputs. Organization-less development callers keep
-      // the per-user prefix. Reads fall back to the caller's own legacy
-      // per-user key so pre-migration outputs keep resolving (miss-path only).
-      const legacyKey = `blob/${auth.userId}/${parts[1]}/${partId}`;
+      // Organization-scoped `blob3/` keyspace lets every member of a shared
+      // session resolve the same tool outputs. Organization-less development
+      // callers keep the per-user prefix.
       const key = auth.organizationId
         ? `blob3/${auth.organizationId}/${parts[1]}/${partId}`
-        : legacyKey;
+        : `blob/${auth.userId}/${parts[1]}/${partId}`;
       if (request.method === "PUT") {
         const body = await request.arrayBuffer();
         // Outputs are 4KiB-capped at the harness boundary; diffs can run
@@ -381,14 +379,8 @@ export default {
         return json({ ok: true, bytes: body.byteLength });
       }
       if (request.method === "GET" || request.method === "HEAD") {
-        let object =
+        const object =
           request.method === "GET" ? await env.BLOBS.get(key) : await env.BLOBS.head(key);
-        if (!object && key !== legacyKey) {
-          object =
-            request.method === "GET"
-              ? await env.BLOBS.get(legacyKey)
-              : await env.BLOBS.head(legacyKey);
-        }
         if (!object) return json({ error: "not_found" }, 404);
         const headers = new Headers();
         object.writeHttpMetadata(headers);

@@ -50,8 +50,7 @@ pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use registry_host::{
-    DEFAULT_ORGANIZATION_ID, DEFAULT_USER_ID, LEGACY_WORKSPACE_V2_DOC_ID, RegistryHost,
-    RegistryHostConfig,
+    DEFAULT_ORGANIZATION_ID, DEFAULT_USER_ID, RegistryHost, RegistryHostConfig,
 };
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
@@ -281,7 +280,6 @@ impl EngineCore {
         };
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
-        let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         let device_id = load_or_create_device_id(data_dir)?;
         // This device's harness enablement (Settings → Agents) rides the
         // engine data dir — per-device, like the CLI installs it gates.
@@ -323,13 +321,10 @@ impl EngineCore {
         doc_host.set_repos(repos.clone());
         let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
         let terminals = Terminals::new();
-        let uploads = Uploads::from_root_with_fallback(
-            profile.uploads_root(),
-            legacy_uploads_root.as_deref(),
-        );
+        let uploads = Uploads::from_root(profile.uploads_root());
         // A recorded local→synced import grants this account the local
         // profile's uploads root read-only — transcripts imported earlier
-        // embed absolute paths under it (same shape as the legacy adoption).
+        // embed absolute paths under it.
         if profile.scope() != ProfileScope::Local
             && let Some(root) = local_import::marker_grants_read_root(
                 data_dir,
